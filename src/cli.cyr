@@ -1,0 +1,278 @@
+# cli.cyr — dig CLI surface (BIND-shape arg parsing).
+#
+# BIND's `dig` grammar doesn't fit lib/flags.cyr's `--long` / `-short`
+# model: tokens like `@8.8.8.8`, `+short`, `+timeout=5`, and bare
+# `MX` (record type) live on the same command line in any order. So
+# we hand-roll a single-pass tokenizer.
+#
+# Per-token classification (first match wins):
+#   '@<addr>'           → server override (dotted-quad IPv4 only for 0.3.x)
+#   '+<opt>[=<val>]'    → option flag
+#   '-h' or '--help'    → help
+#   'A' / 'AAAA' / ...  → record type (case-insensitive, matched against table)
+#   else                → query name (first wins; later names ignored)
+#
+# Recognized `+` options for 0.3.x:
+#   +short / +noshort       boolean
+#   +tcp   / +notcp         boolean (force TCP — not implemented in 0.3.x, accepted)
+#   +timeout=N              per-query timeout, seconds (default 5)
+#   +retry=N                tries before give-up (default 3)
+#   +nodnssec               boolean (DNSSEC not implemented yet, accepted)
+#
+# Defaults per roadmap.md § 0.3.x.
+
+var DIG_DEFAULT_TIMEOUT_S = 5;
+var DIG_DEFAULT_RETRY     = 3;
+var DIG_DEFAULT_TYPE      = 1;    # A — DNS_TYPE_A
+
+enum DigCliResult {
+    DIG_CLI_OK              = 0;
+    DIG_CLI_HELP            = 1;
+    DIG_CLI_ERR_PARSE       = 2;
+    DIG_CLI_ERR_BAD_SERVER  = 3;
+    DIG_CLI_ERR_BAD_TYPE    = 4;
+}
+
+# Registry layout (96 B):
+#   +0   name_ptr   : cstr (first positional non-type non-@ token)
+#   +8   server_ptr : cstr ('@' arg verbatim, including '@', or 0)
+#   +16  qtype      : i64
+#   +24  timeout_s  : i64
+#   +32  retry      : i64
+#   +40  short      : i64 (0/1)
+#   +48  tcp        : i64 (0/1)
+#   +56  nodnssec   : i64 (0/1)
+#   +64  help       : i64 (0/1)
+#   +72  type_seen  : i64 (0 → no type token; we use default A)
+#   +80  server_addr: i64 (parsed IPv4, 0 if none)
+#   +88  reserved   : i64
+
+var DIG_CLI_SIZE = 96;
+
+fn dig_cli_new(): i64 {
+    var r = alloc(DIG_CLI_SIZE);
+    memset(r, 0, DIG_CLI_SIZE);
+    store64(r + 16, DIG_DEFAULT_TYPE);
+    store64(r + 24, DIG_DEFAULT_TIMEOUT_S);
+    store64(r + 32, DIG_DEFAULT_RETRY);
+    return r;
+}
+
+fn dig_cli_name(r):       i64 { return load64(r); }
+fn dig_cli_server_str(r): i64 { return load64(r + 8); }
+fn dig_cli_qtype(r):      i64 { return load64(r + 16); }
+fn dig_cli_timeout_s(r):  i64 { return load64(r + 24); }
+fn dig_cli_retry(r):      i64 { return load64(r + 32); }
+fn dig_cli_short(r):      i64 { return load64(r + 40); }
+fn dig_cli_tcp(r):        i64 { return load64(r + 48); }
+fn dig_cli_nodnssec(r):   i64 { return load64(r + 56); }
+fn dig_cli_help(r):       i64 { return load64(r + 64); }
+fn dig_cli_server_addr(r):i64 { return load64(r + 80); }
+
+# Lowercase a single ASCII byte. Non-ASCII passes through.
+fn _dig_lc(c): i64 {
+    if (c >= 65) {
+        if (c <= 90) { return c + 32; }
+    }
+    return c;
+}
+
+# Case-insensitive cstr equality.
+fn _dig_streq_ci(a, b): i64 {
+    var i = 0;
+    while (1) {
+        var ca = _dig_lc(load8(a + i));
+        var cb = _dig_lc(load8(b + i));
+        if (ca != cb) { return 0; }
+        if (ca == 0) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+# Compare a cstr against a literal, bounded by lit_len. Token must
+# be exactly that many chars then NUL.
+fn _dig_streq_bounded_ci(tok, lit, lit_len): i64 {
+    var k = 0;
+    while (k < lit_len) {
+        var ca = _dig_lc(load8(tok + k));
+        var cb = _dig_lc(load8(lit + k));
+        if (ca != cb) { return 0; }
+        k = k + 1;
+    }
+    if (load8(tok + lit_len) != 0) { return 0; }
+    return 1;
+}
+
+# Recognize a type token. Returns the DNS_TYPE_* code (1..50), or 0
+# if unrecognized. Caller decides whether to flag an error or treat
+# the token as a name.
+fn _dig_match_type(tok): i64 {
+    if (_dig_streq_bounded_ci(tok, "A", 1) == 1)     { return DNS_TYPE_A; }
+    if (_dig_streq_bounded_ci(tok, "AAAA", 4) == 1)  { return DNS_TYPE_AAAA; }
+    if (_dig_streq_bounded_ci(tok, "MX", 2) == 1)    { return DNS_TYPE_MX; }
+    if (_dig_streq_bounded_ci(tok, "NS", 2) == 1)    { return DNS_TYPE_NS; }
+    if (_dig_streq_bounded_ci(tok, "CNAME", 5) == 1) { return DNS_TYPE_CNAME; }
+    if (_dig_streq_bounded_ci(tok, "SOA", 3) == 1)   { return DNS_TYPE_SOA; }
+    if (_dig_streq_bounded_ci(tok, "PTR", 3) == 1)   { return DNS_TYPE_PTR; }
+    if (_dig_streq_bounded_ci(tok, "TXT", 3) == 1)   { return DNS_TYPE_TXT; }
+    if (_dig_streq_bounded_ci(tok, "SRV", 3) == 1)   { return DNS_TYPE_SRV; }
+    return 0;
+}
+
+# Parse a non-negative ASCII integer in `s` up to NUL or non-digit.
+# Returns the value (or -1 on no digits / overflow into negative i64
+# territory). Stops at first non-digit; doesn't require full consumption.
+fn _dig_parse_uint(s): i64 {
+    var i = 0;
+    var v = 0;
+    var any = 0;
+    while (1) {
+        var c = load8(s + i);
+        if (c < 48) { break; }
+        if (c > 57) { break; }
+        v = v * 10 + (c - 48);
+        if (v < 0) { return 0 - 1; }     # overflow guard
+        any = 1;
+        i = i + 1;
+    }
+    if (any == 0) { return 0 - 1; }
+    return v;
+}
+
+# Handle a `+option[=value]` token. Returns 0 on accepted, 1 on
+# unknown option (we still accept and continue — BIND just warns;
+# this matches that posture), 2 on a recognized option with a bad
+# value.
+fn _dig_apply_plus(reg, tok): i64 {
+    # tok[0] is '+'. Find '=' if present.
+    var eq_off = 1;
+    while (1) {
+        var c = load8(tok + eq_off);
+        if (c == 0) { eq_off = 0 - 1; break; }
+        if (c == 61) { break; }      # '='
+        eq_off = eq_off + 1;
+    }
+    var name_len = 0;
+    if (eq_off < 0) {
+        # No '=', name runs to end. Compute its length.
+        name_len = 1;
+        while (load8(tok + name_len) != 0) { name_len = name_len + 1; }
+        name_len = name_len - 1;     # excluding the '+'
+    } else {
+        name_len = eq_off - 1;
+    }
+
+    # Match against known options. Use bounded match against the
+    # part after '+' (i.e. tok + 1, name_len bytes).
+    var n = tok + 1;
+    if (_dig_streq_n(n, "short", 5, name_len) == 1)    { store64(reg + 40, 1); return 0; }
+    if (_dig_streq_n(n, "noshort", 7, name_len) == 1)  { store64(reg + 40, 0); return 0; }
+    if (_dig_streq_n(n, "tcp", 3, name_len) == 1)      { store64(reg + 48, 1); return 0; }
+    if (_dig_streq_n(n, "notcp", 5, name_len) == 1)    { store64(reg + 48, 0); return 0; }
+    if (_dig_streq_n(n, "nodnssec", 8, name_len) == 1) { store64(reg + 56, 1); return 0; }
+    if (_dig_streq_n(n, "dnssec", 6, name_len) == 1)   { store64(reg + 56, 0); return 0; }
+    if (_dig_streq_n(n, "timeout", 7, name_len) == 1) {
+        if (eq_off < 0) { return 2; }
+        var v = _dig_parse_uint(tok + eq_off + 1);
+        if (v < 0) { return 2; }
+        store64(reg + 24, v);
+        return 0;
+    }
+    if (_dig_streq_n(n, "retry", 5, name_len) == 1) {
+        if (eq_off < 0) { return 2; }
+        var v2 = _dig_parse_uint(tok + eq_off + 1);
+        if (v2 < 0) { return 2; }
+        store64(reg + 32, v2);
+        return 0;
+    }
+    return 1;      # unknown option — soft-accept
+}
+
+# Bounded case-insensitive equality: tok[0..n) == lit[0..lit_len)?
+# Both must be the same length (n must equal lit_len).
+fn _dig_streq_n(tok, lit, lit_len, n): i64 {
+    if (n != lit_len) { return 0; }
+    var k = 0;
+    while (k < lit_len) {
+        if (_dig_lc(load8(tok + k)) != _dig_lc(load8(lit + k))) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+# Parse all tokens. argv is a contiguous cstr-pointer array
+# (`argv + i*8`), same shape as yo's _materialize_argv produces.
+# Returns a DigCliResult code.
+fn dig_cli_parse_argv(reg, ac, av): i64 {
+    var i = 1;     # skip argv[0]
+    while (i < ac) {
+        var tok = load64(av + i * 8);
+        if (tok == 0) { i = i + 1; continue; }
+        var c0 = load8(tok);
+        if (c0 == 0) { i = i + 1; continue; }
+
+        if (c0 == 45) {        # '-' — only support -h / --help
+            if (streq(tok, "-h") == 1) { store64(reg + 64, 1); return DIG_CLI_HELP; }
+            if (streq(tok, "--help") == 1) { store64(reg + 64, 1); return DIG_CLI_HELP; }
+            return DIG_CLI_ERR_PARSE;
+        }
+        elif (c0 == 64) {      # '@' — server override (dotted-quad only for 0.3.x)
+            store64(reg + 8, tok);
+            var addr = ipv4_parse(tok + 1);
+            if (addr < 0) { return DIG_CLI_ERR_BAD_SERVER; }
+            store64(reg + 80, addr);
+        }
+        elif (c0 == 43) {      # '+' — option
+            var rc = _dig_apply_plus(reg, tok);
+            if (rc == 2) { return DIG_CLI_ERR_PARSE; }
+            # rc == 1 (unknown) → soft-accept, keep going.
+        }
+        else {
+            # Type or name. Try type first; if it matches, set qtype.
+            # If we haven't seen a type yet AND this token doesn't
+            # look like a record-type literal, treat as name.
+            var t = _dig_match_type(tok);
+            if (t != 0) {
+                store64(reg + 16, t);
+                store64(reg + 72, 1);
+            } else {
+                if (load64(reg) == 0) { store64(reg, tok); }
+            }
+        }
+        i = i + 1;
+    }
+
+    if (load64(reg + 64) == 1) { return DIG_CLI_HELP; }
+    return DIG_CLI_OK;
+}
+
+# Print "Usage: ..." line.
+fn dig_cli_print_usage(fd): i64 {
+    var u = "Usage: dig [@server] [+flag...] <name> [type]\n";
+    syscall(1, fd, u, strlen(u));
+    return 0;
+}
+
+# Full help — wired into main when -h/--help is passed.
+fn dig_cli_print_help(): i64 {
+    println("dig — DNS resolver (sovereign Cyrius reimplementation of BIND dig)");
+    println("");
+    dig_cli_print_usage(1);
+    println("");
+    println("Arguments:");
+    println("  @server     resolver to query (dotted-quad IPv4, e.g. @8.8.8.8)");
+    println("  name        domain to look up (e.g. example.com)");
+    println("  type        record type: A, AAAA, MX, NS, CNAME, SOA, PTR, TXT, SRV (default: A)");
+    println("");
+    println("Options (+flag form, BIND-compatible):");
+    println("  +short                bare answer values, one per line");
+    println("  +noshort              full BIND-shape output (default)");
+    println("  +tcp / +notcp         force/avoid TCP transport (accepted; UDP only in 0.3.x)");
+    println("  +timeout=N            per-query timeout, seconds (default 5)");
+    println("  +retry=N              tries before give-up (default 3)");
+    println("  +nodnssec / +dnssec   accepted, no validation yet (roadmap § 0.4.x)");
+    println("");
+    println("  -h, --help            show this help");
+    return 0;
+}

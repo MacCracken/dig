@@ -1,0 +1,124 @@
+# resolv.cyr — resolver discovery (/etc/resolv.conf parser).
+#
+# Pure code (no syscalls in here — the file-read is in platform.cyr).
+# Caller hands us the byte buffer + length; we return the first
+# `nameserver X.X.X.X` IPv4 we find, packed.
+#
+# Grammar fragment (RFC 1033 / resolver(5)):
+#   nameserver <SP+> <addr>
+# Lines starting with '#' or ';' are comments. Other directives
+# (search, options, sortlist) are skipped. We only care about
+# nameserver lines pointing at IPv4 — IPv6 nameservers wait for
+# roadmap § 0.4.x.
+#
+# Fallback chain (per roadmap.md § 0.3.x): /etc/resolv.conf → 192.168.1.1 → 8.8.8.8.
+
+var RESOLV_FALLBACK_GATEWAY = 0xC0A80101;   # 192.168.1.1
+var RESOLV_FALLBACK_PUBLIC  = 0x08080808;   # 8.8.8.8
+var RESOLV_NAMESERVER_LIT   = "nameserver";   # 10 bytes
+
+# Advance `i` past spaces and tabs. Returns new index.
+fn _resolv_skip_blank(buf, len, i): i64 {
+    while (i < len) {
+        var c = load8(buf + i);
+        if (c == 32) { i = i + 1; }
+        elif (c == 9) { i = i + 1; }
+        else { return i; }
+    }
+    return i;
+}
+
+# Advance `i` to the next newline (or end of buffer). Returns the
+# index of the newline (or len).
+fn _resolv_find_eol(buf, len, i): i64 {
+    while (i < len) {
+        if (load8(buf + i) == 10) { return i; }
+        i = i + 1;
+    }
+    return len;
+}
+
+# Bounded literal match: does buf[i..i+lit_len) == lit? Returns 1/0.
+fn _resolv_match(buf, len, i, lit, lit_len): i64 {
+    if (i + lit_len > len) { return 0; }
+    var k = 0;
+    while (k < lit_len) {
+        if (load8(buf + i + k) != load8(lit + k)) { return 0; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+# Parse `buf[0..len)` as resolv.conf. Returns the packed IPv4 of the
+# first valid `nameserver X.X.X.X` line, or 0 if none found / parse
+# fails. Caller dispatches the fallback.
+fn resolv_parse(buf, len): i64 {
+    if (buf == 0) { return 0; }
+    if (len <= 0) { return 0; }
+    var i = 0;
+    while (i < len) {
+        i = _resolv_skip_blank(buf, len, i);
+        if (i >= len) { return 0; }
+        var c = load8(buf + i);
+        # Comment / empty line — skip
+        if (c == 35) { i = _resolv_find_eol(buf, len, i) + 1; }
+        elif (c == 59) { i = _resolv_find_eol(buf, len, i) + 1; }
+        elif (c == 10) { i = i + 1; }
+        else {
+            # Try to match "nameserver"
+            if (_resolv_match(buf, len, i, RESOLV_NAMESERVER_LIT, 10) == 1) {
+                # Must be followed by whitespace (no `nameservers`).
+                var j = i + 10;
+                if (j < len) {
+                    var nc = load8(buf + j);
+                    if (nc == 32) { j = _resolv_skip_blank(buf, len, j); }
+                    elif (nc == 9) { j = _resolv_skip_blank(buf, len, j); }
+                    else { j = _resolv_find_eol(buf, len, i) + 1; i = j; continue; }
+                    # Extract the address token to a temp NUL-terminated
+                    # buffer ipv4_parse can consume.
+                    var eol = _resolv_find_eol(buf, len, j);
+                    # Address ends at first whitespace or eol.
+                    var end = j;
+                    while (end < eol) {
+                        var ec = load8(buf + end);
+                        if (ec == 32) { break; }
+                        if (ec == 9) { break; }
+                        end = end + 1;
+                    }
+                    var tlen = end - j;
+                    if (tlen > 0) {
+                        if (tlen <= 64) {
+                            var tmp[80];
+                            var k2 = 0;
+                            while (k2 < tlen) {
+                                store8(&tmp + k2, load8(buf + j + k2));
+                                k2 = k2 + 1;
+                            }
+                            store8(&tmp + tlen, 0);
+                            var addr = ipv4_parse(&tmp);
+                            if (addr >= 0) { return addr; }
+                        }
+                    }
+                    i = eol + 1;
+                } else { return 0; }
+            } else {
+                i = _resolv_find_eol(buf, len, i) + 1;
+            }
+        }
+    }
+    return 0;
+}
+
+# Top-level discovery wrapper. Reads /etc/resolv.conf via the platform
+# shim; on any failure (file missing, no nameserver line), falls back
+# to RESOLV_FALLBACK_GATEWAY then RESOLV_FALLBACK_PUBLIC. Caller can
+# override entirely via the `@server` CLI arg before this is called.
+fn resolv_discover(): i64 {
+    var buf = alloc(4096);
+    var n = platform_read_file("/etc/resolv.conf", buf, 4096);
+    if (n > 0) {
+        var addr = resolv_parse(buf, n);
+        if (addr > 0) { return addr; }
+    }
+    return RESOLV_FALLBACK_PUBLIC;
+}

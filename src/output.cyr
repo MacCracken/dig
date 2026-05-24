@@ -1,0 +1,232 @@
+# output.cyr — BIND-shape result printing.
+#
+# Two modes:
+#   Default: full BIND output —
+#       ; <<>> dig X.Y.Z <<>> name
+#       ;; QUESTION
+#       ;name.        IN    A
+#       ;; ANSWER
+#       name.   3600  IN    A    93.184.216.34
+#       ;; Query time: N ms · server: X · proto: udp
+#
+#   +short: bare answer values, one per line.
+#
+# Per-type formatting lives in `output_print_rdata` so adding a new
+# RR type is a single switch arm.
+
+var _DIG_VERSION_STR = "0.3.0";
+
+fn _out_puts(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
+fn _out_eputs(s): i64 { syscall(1, 2, s, strlen(s)); return 0; }
+
+# Type-code → "A" / "AAAA" / "MX" / ... mnemonic. Returns a cstr.
+fn output_type_str(t): i64 {
+    if (t == DNS_TYPE_A)     { return "A"; }
+    if (t == DNS_TYPE_AAAA)  { return "AAAA"; }
+    if (t == DNS_TYPE_MX)    { return "MX"; }
+    if (t == DNS_TYPE_NS)    { return "NS"; }
+    if (t == DNS_TYPE_CNAME) { return "CNAME"; }
+    if (t == DNS_TYPE_SOA)   { return "SOA"; }
+    if (t == DNS_TYPE_PTR)   { return "PTR"; }
+    if (t == DNS_TYPE_TXT)   { return "TXT"; }
+    if (t == DNS_TYPE_SRV)   { return "SRV"; }
+    if (t == DNS_TYPE_OPT)   { return "OPT"; }
+    if (t == DNS_TYPE_DS)    { return "DS"; }
+    if (t == DNS_TYPE_RRSIG) { return "RRSIG"; }
+    if (t == DNS_TYPE_NSEC)  { return "NSEC"; }
+    if (t == DNS_TYPE_DNSKEY){ return "DNSKEY"; }
+    if (t == DNS_TYPE_NSEC3) { return "NSEC3"; }
+    return "TYPE?";
+}
+
+fn output_rcode_str(r): i64 {
+    if (r == DNS_RCODE_NOERROR)  { return "NOERROR"; }
+    if (r == DNS_RCODE_FORMERR)  { return "FORMERR"; }
+    if (r == DNS_RCODE_SERVFAIL) { return "SERVFAIL"; }
+    if (r == DNS_RCODE_NXDOMAIN) { return "NXDOMAIN"; }
+    if (r == DNS_RCODE_NOTIMP)   { return "NOTIMP"; }
+    if (r == DNS_RCODE_REFUSED)  { return "REFUSED"; }
+    return "RCODE?";
+}
+
+# Print one RR's rdata in type-appropriate form. Returns 0 on success,
+# negative on parse error.
+fn output_print_rdata(msg, msg_len, rr, next_off): i64 {
+    var t = dns_rr_type(rr);
+    var rdoff = dns_rr_rdata_off(rr);
+    var rdlen = next_off - rdoff;
+
+    if (t == DNS_TYPE_A) {
+        if (rdlen != 4) { return 0 - 1; }
+        var buf[16];
+        var packed = (load8(msg + rdoff) << 24) | (load8(msg + rdoff + 1) << 16) | (load8(msg + rdoff + 2) << 8) | load8(msg + rdoff + 3);
+        var n = ipv4_format_to_buf(packed, &buf);
+        syscall(1, 1, &buf, n);
+        return 0;
+    }
+    if (t == DNS_TYPE_AAAA) {
+        if (rdlen != 16) { return 0 - 1; }
+        # Minimal AAAA print: 8 groups of 4 hex digits, no compression
+        # of zero runs. Functional for 0.3.x; the canonical RFC 5952
+        # rendering with "::" run-compression can come at 0.4.x.
+        # fmt_byte() prints 2-digit zero-padded hex (lib/fmt.cyr:86).
+        var i = 0;
+        while (i < 8) {
+            fmt_byte(load8(msg + rdoff + i * 2));
+            fmt_byte(load8(msg + rdoff + i * 2 + 1));
+            if (i < 7) { _out_puts(":"); }
+            i = i + 1;
+        }
+        return 0;
+    }
+    if (t == DNS_TYPE_MX) {
+        if (rdlen < 3) { return 0 - 1; }
+        var prio = _dns_load_u16(msg, rdoff);
+        fmt_int(prio);
+        _out_puts(" ");
+        var nbuf[256];
+        var nend = dns_decode_name(msg, msg_len, rdoff + 2, &nbuf);
+        if (nend == 0) { return 0 - 1; }
+        _out_puts(&nbuf);
+        _out_puts(".");
+        return 0;
+    }
+    if (t == DNS_TYPE_NS) {
+        var nb1[256];
+        var ne1 = dns_decode_name(msg, msg_len, rdoff, &nb1);
+        if (ne1 == 0) { return 0 - 1; }
+        _out_puts(&nb1);
+        _out_puts(".");
+        return 0;
+    }
+    if (t == DNS_TYPE_CNAME) {
+        var nb2[256];
+        var ne2 = dns_decode_name(msg, msg_len, rdoff, &nb2);
+        if (ne2 == 0) { return 0 - 1; }
+        _out_puts(&nb2);
+        _out_puts(".");
+        return 0;
+    }
+    if (t == DNS_TYPE_PTR) {
+        var nb3[256];
+        var ne3 = dns_decode_name(msg, msg_len, rdoff, &nb3);
+        if (ne3 == 0) { return 0 - 1; }
+        _out_puts(&nb3);
+        _out_puts(".");
+        return 0;
+    }
+    if (t == DNS_TYPE_TXT) {
+        # TXT is a sequence of length-prefixed strings within rdata.
+        # Print each as a quoted segment, space-separated.
+        var p = rdoff;
+        var end = rdoff + rdlen;
+        var first = 1;
+        while (p < end) {
+            var l = load8(msg + p);
+            if (p + 1 + l > end) { return 0 - 1; }
+            if (first == 0) { _out_puts(" "); }
+            _out_puts("\"");
+            syscall(1, 1, msg + p + 1, l);
+            _out_puts("\"");
+            p = p + 1 + l;
+            first = 0;
+        }
+        return 0;
+    }
+    if (t == DNS_TYPE_SOA) {
+        var nb4[256];
+        var ne4 = dns_decode_name(msg, msg_len, rdoff, &nb4);
+        if (ne4 == 0) { return 0 - 1; }
+        _out_puts(&nb4); _out_puts(". ");
+        var nb5[256];
+        var ne5 = dns_decode_name(msg, msg_len, ne4, &nb5);
+        if (ne5 == 0) { return 0 - 1; }
+        _out_puts(&nb5); _out_puts(". ");
+        if (ne5 + 20 > rdoff + rdlen) { return 0 - 1; }
+        fmt_int(_dns_load_u32(msg, ne5));       _out_puts(" ");
+        fmt_int(_dns_load_u32(msg, ne5 + 4));   _out_puts(" ");
+        fmt_int(_dns_load_u32(msg, ne5 + 8));   _out_puts(" ");
+        fmt_int(_dns_load_u32(msg, ne5 + 12));  _out_puts(" ");
+        fmt_int(_dns_load_u32(msg, ne5 + 16));
+        return 0;
+    }
+    if (t == DNS_TYPE_SRV) {
+        if (rdlen < 7) { return 0 - 1; }
+        var prio2 = _dns_load_u16(msg, rdoff);
+        var weight = _dns_load_u16(msg, rdoff + 2);
+        var port = _dns_load_u16(msg, rdoff + 4);
+        fmt_int(prio2);  _out_puts(" ");
+        fmt_int(weight); _out_puts(" ");
+        fmt_int(port);   _out_puts(" ");
+        var nb6[256];
+        var ne6 = dns_decode_name(msg, msg_len, rdoff + 6, &nb6);
+        if (ne6 == 0) { return 0 - 1; }
+        _out_puts(&nb6); _out_puts(".");
+        return 0;
+    }
+    # Unknown type — print raw bytes as a hex dump fallback.
+    var i2 = 0;
+    while (i2 < rdlen) {
+        fmt_hex(load8(msg + rdoff + i2));
+        i2 = i2 + 1;
+    }
+    return 0;
+}
+
+# Print the BIND-shape header (`; <<>> dig X.Y.Z <<>> name`).
+fn output_print_header(name): i64 {
+    _out_puts("; <<>> dig ");
+    _out_puts(_DIG_VERSION_STR);
+    _out_puts(" <<>> ");
+    _out_puts(name);
+    _out_puts("\n");
+    return 0;
+}
+
+# Print the QUESTION section line (BIND shape).
+fn output_print_question(name, qtype): i64 {
+    _out_puts(";; QUESTION\n;");
+    _out_puts(name);
+    _out_puts(".\t\tIN\t");
+    _out_puts(output_type_str(qtype));
+    _out_puts("\n");
+    return 0;
+}
+
+# Print one ANSWER RR line: `name. ttl IN TYPE rdata`.
+fn output_print_answer_rr(msg, msg_len, rr, next_off): i64 {
+    var nbuf[256];
+    var ne = dns_decode_name(msg, msg_len, dns_rr_name_off(rr), &nbuf);
+    if (ne == 0) { return 0 - 1; }
+    _out_puts(&nbuf);
+    _out_puts(".\t");
+    fmt_int(dns_rr_ttl(rr));
+    _out_puts("\tIN\t");
+    _out_puts(output_type_str(dns_rr_type(rr)));
+    _out_puts("\t");
+    output_print_rdata(msg, msg_len, rr, next_off);
+    _out_puts("\n");
+    return 0;
+}
+
+# +short mode: rdata only, one per line. Newline appended.
+fn output_print_short_rr(msg, msg_len, rr, next_off): i64 {
+    output_print_rdata(msg, msg_len, rr, next_off);
+    _out_puts("\n");
+    return 0;
+}
+
+# Footer line: `;; Query time: N ms · server: A.B.C.D · proto: udp`.
+fn output_print_footer(query_us, server_addr, tcp_used): i64 {
+    _out_puts(";; Query time: ");
+    fmt_int((query_us + 500) / 1000);   # us → ms, half-up
+    _out_puts(" ms · server: ");
+    var buf[16];
+    var n = ipv4_format_to_buf(server_addr, &buf);
+    syscall(1, 1, &buf, n);
+    _out_puts(" · proto: ");
+    if (tcp_used == 1) { _out_puts("tcp"); }
+    else { _out_puts("udp"); }
+    _out_puts("\n");
+    return 0;
+}

@@ -1,9 +1,163 @@
 # dig — main entry point
 # Stdlib auto-included via cyrius.cyml
 
+include "src/ipv4.cyr"
+include "src/dns.cyr"
+include "src/platform.cyr"
+include "src/resolv.cyr"
+include "src/cli.cyr"
+include "src/output.cyr"
+include "src/query.cyr"
+
+# Materialize args.cyr's argc/argv accessors into a contiguous
+# cstr-pointer array. Same shape yo uses.
+fn _materialize_argv(ac): i64 {
+    var av = alloc(ac * 8);
+    var i = 0;
+    while (i < ac) {
+        store64(av + i * 8, argv(i));
+        i = i + 1;
+    }
+    return av;
+}
+
+fn _eputs(s): i64 { syscall(1, 2, s, strlen(s)); return 0; }
+
 fn main() {
     alloc_init();
-    println("hello from dig");
+    args_init();
+
+    var reg = dig_cli_new();
+    var ac = argc();
+    var av = _materialize_argv(ac);
+    var rc = dig_cli_parse_argv(reg, ac, av);
+
+    if (rc == DIG_CLI_HELP)            { dig_cli_print_help(); return 0; }
+    if (rc == DIG_CLI_ERR_PARSE)       { _eputs("dig: parse error\n");           dig_cli_print_usage(2); return 2; }
+    if (rc == DIG_CLI_ERR_BAD_SERVER)  { _eputs("dig: bad @server (need dotted-quad IPv4)\n"); return 2; }
+    if (rc == DIG_CLI_ERR_BAD_TYPE)    { _eputs("dig: unknown record type\n");   return 2; }
+
+    var name = dig_cli_name(reg);
+    if (name == 0) {
+        _eputs("dig: missing query name\n");
+        dig_cli_print_usage(2);
+        return 2;
+    }
+
+    # Resolver: explicit @server beats /etc/resolv.conf beats fallback.
+    var server = dig_cli_server_addr(reg);
+    if (server == 0) {
+        if (dig_cli_server_str(reg) != 0) {
+            # User passed @ but it didn't parse — already returned above.
+            return 2;
+        }
+        server = resolv_discover();
+    }
+
+    var qtype = dig_cli_qtype(reg);
+
+    var rx = alloc(DNS_MAX_UDP_PAYLOAD);
+    var resp_len_slot = alloc(8);
+    var query_us_slot = alloc(8);
+    store64(resp_len_slot, 0);
+    store64(query_us_slot, 0);
+
+    var qr = query_send_recv(
+        server, name, qtype,
+        dig_cli_timeout_s(reg),
+        dig_cli_retry(reg),
+        rx, DNS_MAX_UDP_PAYLOAD,
+        resp_len_slot, query_us_slot
+    );
+
+    if (qr == QRY_SOCKET) {
+        _eputs("dig: cannot open UDP socket\n");
+        return 9;
+    }
+    if (qr == QRY_TIMEOUT) {
+        if (dig_cli_short(reg) == 0) {
+            output_print_header(name);
+            _out_eputs(";; connection timed out; no servers could be reached\n");
+        } else {
+            _out_eputs(";; connection timed out; no servers could be reached\n");
+        }
+        return 9;
+    }
+    if (qr == QRY_BAD) {
+        _eputs("dig: malformed response\n");
+        return 9;
+    }
+
+    var resp_len = load64(resp_len_slot);
+    var query_us = load64(query_us_slot);
+
+    var rcode = dns_hdr_rcode(rx);
+    var ancount = dns_hdr_ancount(rx);
+
+    # +short: just rdata. Skip everything else.
+    if (dig_cli_short(reg) == 1) {
+        if (rcode != DNS_RCODE_NOERROR) { return 9; }
+        var off = dns_answer_section_start(rx, resp_len);
+        if (off == 0) {
+            _eputs("dig: response section parse failure\n");
+            return 9;
+        }
+        var rr = alloc(DNS_RR_SIZE);
+        var k = 0;
+        while (k < ancount) {
+            var next = dns_parse_rr(rx, resp_len, off, rr);
+            if (next == 0) {
+                _eputs("dig: answer RR parse failure\n");
+                return 9;
+            }
+            # Only print rdata whose type matches the query type or
+            # CNAME chain (BIND prints the full chain in +short).
+            output_print_short_rr(rx, resp_len, rr, next);
+            off = next;
+            k = k + 1;
+        }
+        return 0;
+    }
+
+    # Full BIND-shape output.
+    output_print_header(name);
+    _out_puts(";; ->>HEADER<<- opcode: QUERY, status: ");
+    _out_puts(output_rcode_str(rcode));
+    _out_puts(", id: ");
+    fmt_int(dns_hdr_id(rx));
+    _out_puts("\n");
+    output_print_question(name, qtype);
+
+    if (dns_hdr_truncated(rx) == 1) {
+        _out_puts(";; WARNING: response truncated (TC=1) — retry over TCP (0.4.x: +tcp will do this automatically)\n");
+    }
+    if (ancount > 0) {
+        _out_puts(";; ANSWER\n");
+        var off2 = dns_answer_section_start(rx, resp_len);
+        if (off2 == 0) {
+            _eputs("dig: response section parse failure\n");
+            return 9;
+        }
+        var rr2 = alloc(DNS_RR_SIZE);
+        var k2 = 0;
+        while (k2 < ancount) {
+            var next2 = dns_parse_rr(rx, resp_len, off2, rr2);
+            if (next2 == 0) {
+                _eputs("dig: answer RR parse failure\n");
+                return 9;
+            }
+            output_print_answer_rr(rx, resp_len, rr2, next2);
+            off2 = next2;
+            k2 = k2 + 1;
+        }
+    } else {
+        _out_puts(";; (no answer)\n");
+    }
+
+    output_print_footer(query_us, server, dig_cli_tcp(reg));
+
+    if (rcode != DNS_RCODE_NOERROR) { return 9; }
+    if (ancount == 0)               { return 9; }
     return 0;
 }
 

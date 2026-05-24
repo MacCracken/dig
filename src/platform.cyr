@@ -1,0 +1,13 @@
+# platform.cyr — platform dispatch shim.
+#
+# Today: Linux only. The platform_* surface (platform_udp_open,
+# platform_udp_send_to, platform_udp_recv, platform_set_recv_timeout_ms,
+# platform_read_file, platform_random_u16, platform_now_us,
+# platform_sleep_ms, platform_close) is defined in src/platform_linux.cyr.
+#
+# Later: this file gains #ifdef CYRIUS_TARGET_AGNOS, _WINDOWS, _MACOS
+# branches. The AGNOS branch replaces the POSIX socket() path with the
+# sovereign udp_send / udp_recv kernel primitives once roadmap § 0.2.x
+# lands. Same posture as yo's src/platform.cyr.
+
+include "src/platform_linux.cyr"

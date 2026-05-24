@@ -13,6 +13,7 @@
 | Version | Landed | Items |
 |---|---|---|
 | **0.1.0** | 2026-05-23 | Initial `cyrius init` scaffold. README + CLAUDE.md + LICENSE + CHANGELOG + cyrius.cyml + tests/dig.{tcyr,bcyr,fcyr} + `.github/workflows/{ci,release}.yml`. Stub `main.cyr` prints `hello from dig`. Stdlib vendored in `lib/` (81 modules incl. `net.cyr`). |
+| **0.3.0** | 2026-05-23 | **dig MVP — first end-to-end resolution.** Real UDP queries against arbitrary resolvers; A / AAAA / MX / NS / CNAME / SOA / PTR / TXT / SRV parsed; BIND-shape + `+short` output. 8 src/ modules (cli, dns, ipv4, output, platform/platform_linux, query, resolv) totaling 1410 LOC. 70 test assertions including name-compression cycle detection. Per-backend sovereignty posture: pragmatic POSIX on Linux, AGNOS backend deferred to v1.0 gate (same as yo). 0.2.x kernel UDP-53 syscall exposure remains blocked on agnos r8169 RX-path Attempt 97 — the Linux-backend bypass keeps momentum. |
 
 ---
 
@@ -29,16 +30,16 @@ Ordered by dependency. Items further down depend on items earlier.
 - [ ] Optional: source-port randomization for DNS (RFC 5452) — security mitigation against off-path cache-poisoning. May land at v0.2.x or defer to v0.4.x.
 - [ ] QEMU-side smoke: `qemu-dns-smoke.sh` boots kernel + queries a local DNS resolver running on the host (or SLIRP's built-in DNS at 10.0.2.3) for `example.com`, asserts an A-record comes back.
 
-### 0.3.x — dig MVP (basic A-record resolution)
+### 0.3.x — dig MVP (basic A-record resolution) ✅ landed 2026-05-23
 
-**Blocked on**: 0.2.x kernel syscall exposure.
+**Unblocked via the per-backend sovereignty rule** — Linux backend uses POSIX `socket()` pragmatically, same posture as yo; AGNOS backend's no-POSIX requirement deferred to v1.0 gate. Original block on 0.2.x kernel syscall exposure stands for the AGNOS backend only.
 
-- [ ] `src/main.cyr` argument parsing via `lib/args.cyr` and `lib/flags.cyr`. Positional args: `dig [@server] [name] [type]`. Flags: `+short` (one-line output), `+tcp` (force TCP), `+timeout=N` (default 5s), `+retry=N` (default 3), `+nodnssec` (skip DNSSEC validation).
-- [ ] DNS query packet construction per RFC 1035 § 4.1 (header + question section). Random 16-bit query ID. Standard query, recursion-desired bit set.
-- [ ] DNS response parsing per RFC 1035 § 4.1: header, question section echo-back, answer section. RR types: A (1), NS (2), CNAME (5), SOA (6), PTR (12), MX (15), TXT (16), AAAA (28), SRV (33).
-- [ ] Name compression decoding (RFC 1035 § 4.1.4) — back-pointer chasing, with cycle-detection guard (kernel-mode security: a malicious response could otherwise lock the parser).
-- [ ] Default resolver discovery: read `/etc/resolv.conf` if present, else fall back to `192.168.1.1` (gateway) or `8.8.8.8` (public). User can override via `@server` arg.
-- [ ] BIND-shape output: `; <<>> dig X.Y.Z <<>> name`, `;; QUESTION`, `;; ANSWER`, `;; Query time: N ms · server: X · proto: udp/tcp`.
+- [x] `src/main.cyr` argument parsing — hand-rolled in `src/cli.cyr` (the BIND `@server` / `+flag` / positional shape doesn't fit `lib/flags.cyr`'s `--long` grammar). Flags: `+short` / `+noshort`, `+tcp` / `+notcp` (accepted, no-op until 0.4.x), `+timeout=N`, `+retry=N`, `+nodnssec` / `+dnssec` (accepted, no validation yet), `-h` / `--help`.
+- [x] DNS query packet construction per RFC 1035 § 4.1 — `src/dns.cyr:dns_build_query`. Random 16-bit query ID via `/dev/urandom`. RD bit set.
+- [x] DNS response parsing per RFC 1035 § 4.1 — header (`dns_hdr_*`), question skip (`dns_skip_question`), answer section walk (`dns_answer_section_start` + `dns_parse_rr`). RR types A / NS / CNAME / SOA / PTR / MX / TXT / AAAA / SRV all format end-to-end.
+- [x] Name compression decoding (RFC 1035 § 4.1.4) — `dns_decode_name` + `dns_skip_name`. **Cycle-detection guard**: pointers must aim backward + hop budget `NAME_DECODE_MAX_HOPS=32`. Self-pointer, forward-pointer, out-of-bounds-pointer, oversized-label all rejected (verified in `tests/dig.tcyr`).
+- [x] Default resolver discovery — `src/resolv.cyr` reads `/etc/resolv.conf`, falls back to `8.8.8.8`. User overrides via `@server`.
+- [x] BIND-shape output — `src/output.cyr`. Full header + `;; ->>HEADER<<-` + `;; QUESTION` + `;; ANSWER` + `;; Query time: N ms · server: X · proto: udp` footer. `+short` mode prints bare rdata.
 
 ### 0.4.x — Full record-type coverage + advanced flags
 

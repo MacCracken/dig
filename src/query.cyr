@@ -1,0 +1,71 @@
+# query.cyr — DNS query orchestration.
+#
+# Send a query, receive a response, retry on timeout. Tracks
+# wall-clock query time for the "Query time: N ms" footer.
+#
+# Returns:
+#   QRY_OK     0  — got a response (response in rx buf, length in *resp_len)
+#   QRY_TIMEOUT 1 — exhausted retries with no reply
+#   QRY_BAD    2  — got a reply but malformed (parse failed)
+#   QRY_SOCKET 3  — couldn't open the socket
+#
+# rx buf: caller provides ≥ DNS_MAX_UDP_PAYLOAD bytes.
+# resp_len: out param (8-byte slot the caller allocs); we store the
+#           response length there on success.
+# query_us: out param (8-byte slot); we store the round-trip latency
+#           in microseconds.
+
+var QRY_OK      = 0;
+var QRY_TIMEOUT = 1;
+var QRY_BAD     = 2;
+var QRY_SOCKET  = 3;
+
+var DNS_PORT = 53;
+
+fn query_send_recv(server_addr, name, qtype, timeout_s, retry, rx, rx_cap, resp_len, query_us): i64 {
+    var fd = platform_udp_open();
+    if (fd < 0) { return QRY_SOCKET; }
+    platform_set_recv_timeout_ms(fd, timeout_s * 1000);
+
+    var tx = alloc(DNS_MAX_UDP_PAYLOAD);
+    var id = platform_random_u16();
+    var tx_len = dns_build_query(tx, id, name, qtype);
+    if (tx_len == 0) {
+        platform_close(fd);
+        return QRY_BAD;
+    }
+
+    var tries = 0;
+    if (retry < 1) { retry = 1; }
+    while (tries < retry) {
+        var t0 = platform_now_us();
+        var sent = platform_udp_send_to(fd, server_addr, DNS_PORT, tx, tx_len);
+        if (sent < 0) {
+            tries = tries + 1;
+            continue;
+        }
+        var n = platform_udp_recv(fd, rx, rx_cap);
+        var t1 = platform_now_us();
+        if (n < DNS_HEADER_LEN) {
+            tries = tries + 1;
+            continue;
+        }
+        # Guard against off-path injection: query ID must echo.
+        if (dns_hdr_id(rx) != id) {
+            tries = tries + 1;
+            continue;
+        }
+        # QR bit must be set (it's a response, not a query).
+        if ((dns_hdr_flags(rx) & DNS_FLAG_QR) == 0) {
+            tries = tries + 1;
+            continue;
+        }
+        store64(resp_len, n);
+        store64(query_us, t1 - t0);
+        platform_close(fd);
+        return QRY_OK;
+    }
+
+    platform_close(fd);
+    return QRY_TIMEOUT;
+}

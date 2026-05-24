@@ -1,0 +1,130 @@
+# platform_linux.cyr — Linux backend (UDP + clock + /dev/urandom).
+#
+# Self-contained: raw syscalls only, no lib/net.cyr import. lib/net.cyr
+# wraps results in tagged unions that this thin backend doesn't need.
+#
+# Sovereignty posture (per-backend rule): this file uses POSIX
+# socket() pragmatically. The AGNOS backend (future) will use the
+# sovereign udp_send / udp_recv kernel primitives once the kernel
+# UDP-53 syscall exposure lands (roadmap § 0.2.x — blocked on agnos
+# r8169 RX-path iron-validation, Attempt 97 pending). The v1.0
+# release gate enforces no-POSIX on the AGNOS backend only. Same
+# posture as yo's src/platform_linux.cyr.
+
+var _LX_SYS_READ            = 0;
+var _LX_SYS_WRITE           = 1;
+var _LX_SYS_OPEN            = 2;
+var _LX_SYS_CLOSE           = 3;
+var _LX_SYS_NANOSLEEP       = 35;
+var _LX_SYS_SOCKET          = 41;
+var _LX_SYS_SENDTO          = 44;
+var _LX_SYS_RECVFROM        = 45;
+var _LX_SYS_SETSOCKOPT      = 54;
+var _LX_SYS_CLOCK_GETTIME   = 228;
+
+var _LX_AF_INET         = 2;
+var _LX_SOCK_DGRAM      = 2;
+var _LX_SOCK_STREAM     = 1;
+var _LX_IPPROTO_UDP     = 17;
+var _LX_IPPROTO_TCP     = 6;
+var _LX_SOL_SOCKET      = 1;
+var _LX_SO_RCVTIMEO     = 20;
+var _LX_CLOCK_MONOTONIC = 1;
+var _LX_O_RDONLY        = 0;
+
+# Open a UDP socket suitable for DNS (port 53). Returns fd ≥ 0 on
+# success, negative errno on failure. Unprivileged — no caps required.
+fn platform_udp_open(): i64 {
+    return syscall(_LX_SYS_SOCKET, _LX_AF_INET, _LX_SOCK_DGRAM, _LX_IPPROTO_UDP);
+}
+
+fn platform_close(fd): i64 {
+    return syscall(_LX_SYS_CLOSE, fd);
+}
+
+# SO_RCVTIMEO so blocking recvfrom returns -EAGAIN after timeout_ms
+# instead of waiting forever. Kernel's timeval struct is
+# {tv_sec: i64, tv_usec: i64} = 16 bytes on 64-bit Linux.
+fn platform_set_recv_timeout_ms(fd, timeout_ms): i64 {
+    var tv = alloc(16);
+    var secs  = timeout_ms / 1000;
+    var usecs = (timeout_ms % 1000) * 1000;
+    store64(tv,     secs);
+    store64(tv + 8, usecs);
+    return syscall(_LX_SYS_SETSOCKOPT, fd, _LX_SOL_SOCKET, _LX_SO_RCVTIMEO, tv, 16);
+}
+
+# Build a sockaddr_in for the given packed IPv4 (host-byte-order,
+# high byte = first octet — matches ipv4_parse output) and UDP/TCP
+# port. Port is written big-endian (network byte order, RFC 793 §3.1).
+fn _lx_sockaddr_in(packed_addr, port): i64 {
+    var sa = alloc(16);
+    memset(sa, 0, 16);
+    store16(sa, _LX_AF_INET);
+    store8(sa + 2, (port >> 8) & 0xFF);
+    store8(sa + 3, port & 0xFF);
+    store8(sa + 4, (packed_addr >> 24) & 0xFF);
+    store8(sa + 5, (packed_addr >> 16) & 0xFF);
+    store8(sa + 6, (packed_addr >> 8)  & 0xFF);
+    store8(sa + 7, packed_addr & 0xFF);
+    return sa;
+}
+
+# sendto(fd, pkt, pkt_len, 0, sa, 16). Returns bytes sent or
+# negative errno.
+fn platform_udp_send_to(fd, packed_addr, port, pkt, pkt_len): i64 {
+    var sa = _lx_sockaddr_in(packed_addr, port);
+    return syscall(_LX_SYS_SENDTO, fd, pkt, pkt_len, 0, sa, 16);
+}
+
+# recvfrom(fd, buf, maxlen, 0, NULL, NULL). Returns bytes received or
+# negative errno (notably -EAGAIN when SO_RCVTIMEO fires).
+fn platform_udp_recv(fd, buf, maxlen): i64 {
+    return syscall(_LX_SYS_RECVFROM, fd, buf, maxlen, 0, 0, 0);
+}
+
+# Read up to maxlen bytes from path into buf. Returns bytes read or
+# negative errno. Used by src/resolv.cyr to slurp /etc/resolv.conf —
+# always tiny on real systems, so a single read() is fine.
+fn platform_read_file(path, buf, maxlen): i64 {
+    var fd = syscall(_LX_SYS_OPEN, path, _LX_O_RDONLY, 0);
+    if (fd < 0) { return fd; }
+    var n = syscall(_LX_SYS_READ, fd, buf, maxlen);
+    syscall(_LX_SYS_CLOSE, fd);
+    return n;
+}
+
+# Read 2 bytes from /dev/urandom and return them as a u16. Used to
+# generate DNS query IDs — RFC 5452 calls for randomness here as a
+# cache-poisoning mitigation. Falls back to a clock-derived value if
+# /dev/urandom can't be opened (shouldn't happen on Linux).
+fn platform_random_u16(): i64 {
+    var buf[2];
+    var fd = syscall(_LX_SYS_OPEN, "/dev/urandom", _LX_O_RDONLY, 0);
+    if (fd < 0) {
+        var ts = alloc(16);
+        syscall(_LX_SYS_CLOCK_GETTIME, _LX_CLOCK_MONOTONIC, ts);
+        var n = load64(ts + 8);
+        return n & 0xFFFF;
+    }
+    syscall(_LX_SYS_READ, fd, &buf, 2);
+    syscall(_LX_SYS_CLOSE, fd);
+    return (load8(&buf) << 8) | load8(&buf + 1);
+}
+
+# CLOCK_MONOTONIC microseconds since boot.
+fn platform_now_us(): i64 {
+    var ts = alloc(16);
+    syscall(_LX_SYS_CLOCK_GETTIME, _LX_CLOCK_MONOTONIC, ts);
+    var secs = load64(ts);
+    var nsec = load64(ts + 8);
+    return secs * 1000000 + nsec / 1000;
+}
+
+fn platform_sleep_ms(ms): i64 {
+    if (ms <= 0) { return 0; }
+    var ts = alloc(16);
+    store64(ts,     ms / 1000);
+    store64(ts + 8, (ms % 1000) * 1000000);
+    return syscall(_LX_SYS_NANOSLEEP, ts, 0);
+}

@@ -1,0 +1,327 @@
+# dns.cyr — RFC 1035 DNS framing.
+#
+# Pure code. No syscalls. No kernel coupling. Caller hands us byte
+# buffers; we turn them into wire-format queries and back into parsed
+# answer records.
+#
+# Wire layout (RFC 1035 §4.1, all big-endian):
+#
+#   Header (12 bytes):
+#     +0   ID         u16    random per-query
+#     +2   FLAGS      u16    QR|Opcode|AA|TC|RD | RA|Z|RCODE
+#     +4   QDCOUNT    u16    # question records
+#     +6   ANCOUNT    u16    # answer records
+#     +8   NSCOUNT    u16    # authority records
+#     +10  ARCOUNT    u16    # additional records
+#
+#   Question section: <name> qtype:u16 qclass:u16
+#   Resource record:  <name> type:u16 class:u16 ttl:u32 rdlength:u16 rdata:rdlength
+#
+#   Names are sequences of length-prefixed labels terminated by a zero
+#   byte. RFC 1035 §4.1.4 lets any label slot be a "pointer" — the high
+#   two bits set (0xC0) and a 14-bit offset back into the message.
+#   Pointers can chain; a malicious response can craft a loop. We guard
+#   with a hop budget (NAME_DECODE_MAX_HOPS).
+
+# === Record type codes ===
+var DNS_TYPE_A     = 1;
+var DNS_TYPE_NS    = 2;
+var DNS_TYPE_CNAME = 5;
+var DNS_TYPE_SOA   = 6;
+var DNS_TYPE_PTR   = 12;
+var DNS_TYPE_MX    = 15;
+var DNS_TYPE_TXT   = 16;
+var DNS_TYPE_AAAA  = 28;
+var DNS_TYPE_SRV   = 33;
+var DNS_TYPE_OPT   = 41;
+var DNS_TYPE_DS    = 43;
+var DNS_TYPE_RRSIG = 46;
+var DNS_TYPE_NSEC  = 47;
+var DNS_TYPE_DNSKEY = 48;
+var DNS_TYPE_NSEC3 = 50;
+
+var DNS_CLASS_IN = 1;
+
+# === Header flag bits (in the FLAGS u16) ===
+var DNS_FLAG_QR = 0x8000;   # set on responses
+var DNS_FLAG_RD = 0x0100;   # recursion desired
+var DNS_FLAG_RA = 0x0080;   # recursion available
+var DNS_FLAG_TC = 0x0200;   # truncated — caller should retry over TCP
+
+# === RCODEs (low 4 bits of FLAGS) ===
+var DNS_RCODE_NOERROR  = 0;
+var DNS_RCODE_FORMERR  = 1;
+var DNS_RCODE_SERVFAIL = 2;
+var DNS_RCODE_NXDOMAIN = 3;
+var DNS_RCODE_NOTIMP   = 4;
+var DNS_RCODE_REFUSED  = 5;
+
+# === Limits ===
+var DNS_HEADER_LEN          = 12;
+var DNS_MAX_LABEL_LEN       = 63;     # RFC 1035 §2.3.4
+var DNS_MAX_NAME_LEN        = 255;    # RFC 1035 §2.3.4
+var DNS_MAX_UDP_PAYLOAD     = 512;    # RFC 1035 §2.3.4 (no EDNS yet)
+var NAME_DECODE_MAX_HOPS    = 32;     # cycle-detection budget
+
+# Encode a domain name (`example.com\0`) into wire-format qname at
+# `out`. Each dot-separated label becomes <len><bytes>; the encoding
+# terminates with a zero byte. Returns bytes written, or 0 on any
+# violation (label > 63, total > 255, trailing dot syntax error).
+fn dns_encode_name(name, out): i64 {
+    var src = 0;
+    var dst = 0;
+    var label_start = dst;
+    store8(out + dst, 0);
+    dst = dst + 1;
+    while (1) {
+        var c = load8(name + src);
+        if (c == 0) {
+            # End of name. If the last label had content, finalize it.
+            if (dst - label_start == 1) {
+                # No trailing label content — we just wrote the
+                # length byte. The root label is the terminator; we
+                # already have it as zero. Done.
+                return dst;
+            }
+            # Patch the length of the in-progress label.
+            var llen = dst - label_start - 1;
+            if (llen > DNS_MAX_LABEL_LEN) { return 0; }
+            store8(out + label_start, llen);
+            # Append the root-label terminator.
+            store8(out + dst, 0);
+            dst = dst + 1;
+            if (dst > DNS_MAX_NAME_LEN) { return 0; }
+            return dst;
+        }
+        if (c == 46) {     # '.'
+            var llen2 = dst - label_start - 1;
+            if (llen2 == 0) { return 0; }              # empty label
+            if (llen2 > DNS_MAX_LABEL_LEN) { return 0; }
+            store8(out + label_start, llen2);
+            label_start = dst;
+            store8(out + dst, 0);
+            dst = dst + 1;
+        } else {
+            store8(out + dst, c);
+            dst = dst + 1;
+        }
+        if (dst > DNS_MAX_NAME_LEN) { return 0; }
+        src = src + 1;
+    }
+    return 0;
+}
+
+# Decode a wire-format qname starting at offset `off` within `msg`
+# (total `msg_len` bytes). Writes a dotted ASCII representation to
+# `out` (null-terminated), out must hold at least DNS_MAX_NAME_LEN+1
+# bytes.
+#
+# Returns the offset immediately after the name in the message
+# (advancing past any pointer once it's been followed), or 0 on any
+# parse error (label too long, name too long, pointer cycle, pointer
+# out of bounds).
+#
+# Pointers (RFC 1035 §4.1.4) make this fiddly: when we follow a
+# pointer, the post-name offset must be the slot AFTER the pointer's
+# two bytes in the ORIGINAL section, not in whatever earlier slot the
+# pointer jumped to. We track `end_off` separately — it's set the
+# first time we follow a pointer and never advances thereafter.
+fn dns_decode_name(msg, msg_len, off, out): i64 {
+    var cur = off;
+    var dst = 0;
+    var end_off = 0;       # 0 = "haven't followed a pointer yet"
+    var hops = 0;
+    while (1) {
+        if (cur >= msg_len) { return 0; }
+        var b = load8(msg + cur);
+        if (b == 0) {
+            store8(out + dst, 0);
+            cur = cur + 1;
+            if (end_off == 0) { end_off = cur; }
+            return end_off;
+        }
+        if ((b & 0xC0) == 0xC0) {
+            # Pointer. Need a second byte.
+            if (cur + 1 >= msg_len) { return 0; }
+            var b2 = load8(msg + cur + 1);
+            var ptr = ((b & 0x3F) << 8) | b2;
+            if (ptr >= msg_len) { return 0; }
+            if (end_off == 0) { end_off = cur + 2; }
+            hops = hops + 1;
+            if (hops > NAME_DECODE_MAX_HOPS) { return 0; }
+            # RFC 1035 §4.1.4 also requires pointers to point BACKWARD
+            # (the destination must already have been parsed). A
+            # forward pointer is a sign of a crafted packet; reject.
+            if (ptr >= cur) { return 0; }
+            cur = ptr;
+        } else {
+            # Literal label.
+            if (b > DNS_MAX_LABEL_LEN) { return 0; }
+            if (cur + 1 + b > msg_len) { return 0; }
+            if (dst > 0) {
+                if (dst >= DNS_MAX_NAME_LEN) { return 0; }
+                store8(out + dst, 46);    # '.'
+                dst = dst + 1;
+            }
+            var i = 0;
+            while (i < b) {
+                if (dst >= DNS_MAX_NAME_LEN) { return 0; }
+                store8(out + dst, load8(msg + cur + 1 + i));
+                dst = dst + 1;
+                i = i + 1;
+            }
+            cur = cur + 1 + b;
+        }
+    }
+    return 0;
+}
+
+# Compute the encoded length of a wire name starting at `off` in
+# `msg`, WITHOUT decoding. Same pointer-handling discipline as
+# dns_decode_name (cycle-budget, must point backward). Returns the
+# offset immediately past the name, or 0 on error.
+fn dns_skip_name(msg, msg_len, off): i64 {
+    var cur = off;
+    var end_off = 0;
+    var hops = 0;
+    while (1) {
+        if (cur >= msg_len) { return 0; }
+        var b = load8(msg + cur);
+        if (b == 0) {
+            cur = cur + 1;
+            if (end_off == 0) { end_off = cur; }
+            return end_off;
+        }
+        if ((b & 0xC0) == 0xC0) {
+            if (cur + 1 >= msg_len) { return 0; }
+            var b2 = load8(msg + cur + 1);
+            var ptr = ((b & 0x3F) << 8) | b2;
+            if (ptr >= msg_len) { return 0; }
+            if (end_off == 0) { end_off = cur + 2; }
+            hops = hops + 1;
+            if (hops > NAME_DECODE_MAX_HOPS) { return 0; }
+            if (ptr >= cur) { return 0; }
+            cur = ptr;
+        } else {
+            if (b > DNS_MAX_LABEL_LEN) { return 0; }
+            cur = cur + 1 + b;
+        }
+    }
+    return 0;
+}
+
+# === Header accessors / mutators ===
+
+fn dns_hdr_id(msg):       i64 { return (load8(msg) << 8) | load8(msg + 1); }
+fn dns_hdr_flags(msg):    i64 { return (load8(msg + 2) << 8) | load8(msg + 3); }
+fn dns_hdr_qdcount(msg):  i64 { return (load8(msg + 4) << 8) | load8(msg + 5); }
+fn dns_hdr_ancount(msg):  i64 { return (load8(msg + 6) << 8) | load8(msg + 7); }
+fn dns_hdr_nscount(msg):  i64 { return (load8(msg + 8) << 8) | load8(msg + 9); }
+fn dns_hdr_arcount(msg):  i64 { return (load8(msg + 10) << 8) | load8(msg + 11); }
+fn dns_hdr_rcode(msg):    i64 { return dns_hdr_flags(msg) & 0x000F; }
+fn dns_hdr_truncated(msg):i64 { if ((dns_hdr_flags(msg) & DNS_FLAG_TC) != 0) { return 1; } return 0; }
+
+fn _dns_store_u16(buf, off, val): i64 {
+    store8(buf + off,     (val >> 8) & 0xFF);
+    store8(buf + off + 1, val & 0xFF);
+    return 0;
+}
+
+fn _dns_load_u16(buf, off): i64 {
+    return (load8(buf + off) << 8) | load8(buf + off + 1);
+}
+
+fn _dns_load_u32(buf, off): i64 {
+    return (load8(buf + off) << 24) | (load8(buf + off + 1) << 16) | (load8(buf + off + 2) << 8) | load8(buf + off + 3);
+}
+
+# Construct a DNS query. Writes the full message to `buf` and returns
+# bytes written, or 0 on encoding failure. Buf must hold at least
+# DNS_HEADER_LEN + DNS_MAX_NAME_LEN + 2 + 4 = ~273 bytes.
+#
+# Sets: ID = supplied (caller picks; we don't have a kernel RNG yet
+# so the platform layer reads /dev/urandom and passes it in). QR=0,
+# Opcode=0, AA=0, TC=0, RD=1, RA=0, Z=0, RCODE=0. QDCOUNT=1,
+# ANCOUNT=NSCOUNT=ARCOUNT=0.
+fn dns_build_query(buf, id, name, qtype): i64 {
+    _dns_store_u16(buf, 0, id);
+    _dns_store_u16(buf, 2, DNS_FLAG_RD);
+    _dns_store_u16(buf, 4, 1);    # QDCOUNT
+    _dns_store_u16(buf, 6, 0);
+    _dns_store_u16(buf, 8, 0);
+    _dns_store_u16(buf, 10, 0);
+    var n = dns_encode_name(name, buf + DNS_HEADER_LEN);
+    if (n == 0) { return 0; }
+    _dns_store_u16(buf, DNS_HEADER_LEN + n, qtype);
+    _dns_store_u16(buf, DNS_HEADER_LEN + n + 2, DNS_CLASS_IN);
+    return DNS_HEADER_LEN + n + 4;
+}
+
+# Walk past a single question section, return next offset (start of
+# answers). Returns 0 on parse error.
+fn dns_skip_question(msg, msg_len, off): i64 {
+    var p = dns_skip_name(msg, msg_len, off);
+    if (p == 0) { return 0; }
+    if (p + 4 > msg_len) { return 0; }
+    return p + 4;
+}
+
+# Walk to the start of the answer section. Handles arbitrary QDCOUNT
+# (it's almost always 1, but RFC doesn't forbid more). Returns 0 on
+# parse error.
+fn dns_answer_section_start(msg, msg_len): i64 {
+    if (msg_len < DNS_HEADER_LEN) { return 0; }
+    var qd = dns_hdr_qdcount(msg);
+    var off = DNS_HEADER_LEN;
+    var i = 0;
+    while (i < qd) {
+        off = dns_skip_question(msg, msg_len, off);
+        if (off == 0) { return 0; }
+        i = i + 1;
+    }
+    return off;
+}
+
+# Parse one resource record at `off`. Writes parsed fields into the
+# 40-byte `rr` struct (caller-allocated):
+#
+#   +0   name_ptr_in_msg  : i64   offset into msg of this RR's name (for re-decode)
+#   +8   type             : i64
+#   +16  class            : i64
+#   +24  ttl              : i64
+#   +32  rdata_off        : i64   offset into msg where rdata begins
+#   (rdlength inferred via next_off - rdata_off)
+#
+# Returns the offset immediately after this RR, or 0 on parse error.
+var DNS_RR_SIZE = 40;
+fn dns_rr_name_off(rr):   i64 { return load64(rr); }
+fn dns_rr_type(rr):       i64 { return load64(rr + 8); }
+fn dns_rr_class(rr):      i64 { return load64(rr + 16); }
+fn dns_rr_ttl(rr):        i64 { return load64(rr + 24); }
+fn dns_rr_rdata_off(rr):  i64 { return load64(rr + 32); }
+
+fn dns_parse_rr(msg, msg_len, off, rr): i64 {
+    if (off >= msg_len) { return 0; }
+    var name_off = off;
+    var p = dns_skip_name(msg, msg_len, off);
+    if (p == 0) { return 0; }
+    if (p + 10 > msg_len) { return 0; }
+    var rtype = _dns_load_u16(msg, p);
+    var rclass = _dns_load_u16(msg, p + 2);
+    var ttl = _dns_load_u32(msg, p + 4);
+    var rdlen = _dns_load_u16(msg, p + 8);
+    var rdata = p + 10;
+    if (rdata + rdlen > msg_len) { return 0; }
+    store64(rr,      name_off);
+    store64(rr + 8,  rtype);
+    store64(rr + 16, rclass);
+    store64(rr + 24, ttl);
+    store64(rr + 32, rdata);
+    return rdata + rdlen;
+}
+
+# Helper: rdlength of the RR just parsed (recomputes from next_off
+# the caller already has). Provided as a sanity-helper for callers.
+fn dns_rr_rdlength(rr, next_off): i64 {
+    return next_off - dns_rr_rdata_off(rr);
+}

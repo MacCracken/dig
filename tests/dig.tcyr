@@ -1,11 +1,303 @@
-# dig test suite
-# Stdlib auto-included via cyrius.cyml
+# dig test suite — pure-code coverage of the parser surface.
+#
+# Stdlib auto-included via cyrius.cyml.
+#
+# Network paths (UDP send/recv) are exercised by the real binary
+# rather than this suite — too much variance vs. a live resolver to
+# make for reliable CI. Everything else lives here: ipv4 parsing,
+# DNS query construction, name encoding/decoding, name-compression
+# cycle detection (security-critical: malicious responses must NOT
+# lock the parser), resolv.conf line parsing, RR parsing.
+
+include "src/ipv4.cyr"
+include "src/dns.cyr"
+include "src/platform.cyr"
+include "src/resolv.cyr"
+include "src/cli.cyr"
+include "src/output.cyr"
+include "src/query.cyr"
+
+# === IPv4 parser ===
+fn test_ipv4() {
+    test_group("ipv4");
+    assert_eq(ipv4_parse("0.0.0.0"),         0x00000000, "ipv4 zeros");
+    assert_eq(ipv4_parse("127.0.0.1"),       0x7F000001, "ipv4 loopback");
+    assert_eq(ipv4_parse("8.8.8.8"),         0x08080808, "ipv4 google");
+    assert_eq(ipv4_parse("192.168.1.1"),     0xC0A80101, "ipv4 gateway");
+    assert_eq(ipv4_parse("255.255.255.255"), 0xFFFFFFFF, "ipv4 broadcast");
+
+    # Rejection cases.
+    assert_eq(ipv4_parse("256.0.0.0"),     IPV4_PARSE_FAIL, "ipv4 octet > 255");
+    assert_eq(ipv4_parse("1.2.3"),         IPV4_PARSE_FAIL, "ipv4 only 3 octets");
+    assert_eq(ipv4_parse("1.2.3.4.5"),     IPV4_PARSE_FAIL, "ipv4 5 octets");
+    assert_eq(ipv4_parse("1.2..4"),        IPV4_PARSE_FAIL, "ipv4 empty segment");
+    assert_eq(ipv4_parse(""),              IPV4_PARSE_FAIL, "ipv4 empty string");
+    assert_eq(ipv4_parse("1.2.3.4 "),      IPV4_PARSE_FAIL, "ipv4 trailing space");
+    return 0;
+}
+
+# === DNS query construction ===
+fn test_dns_query_build() {
+    test_group("dns_query_build");
+    var buf[300];
+    var n = dns_build_query(&buf, 0x1234, "example.com", DNS_TYPE_A);
+    # Header(12) + qname(13 = 7+5+1) + qtype(2) + qclass(2) = 29 bytes
+    # qname encoding of "example.com": 07 'example' 03 'com' 00
+    assert_eq(n, 29, "query length");
+    assert_eq(load8(&buf),     0x12, "id hi byte");
+    assert_eq(load8(&buf + 1), 0x34, "id lo byte");
+    assert_eq(load8(&buf + 2), 0x01, "flags hi = RD bit");
+    assert_eq(load8(&buf + 3), 0x00, "flags lo");
+    assert_eq(load8(&buf + 4), 0x00, "qdcount hi");
+    assert_eq(load8(&buf + 5), 0x01, "qdcount lo = 1");
+    assert_eq(load8(&buf + 6), 0x00, "ancount hi");
+    assert_eq(load8(&buf + 7), 0x00, "ancount lo");
+    assert_eq(load8(&buf + 12), 7,   "first label length");
+    assert_eq(load8(&buf + 13), 101, "first label byte = 'e'");
+    assert_eq(load8(&buf + 20), 3,   "second label length = 3");
+    assert_eq(load8(&buf + 21), 99,  "second label byte = 'c'");
+    assert_eq(load8(&buf + 24), 0,   "root label terminator");
+    assert_eq(load8(&buf + 25), 0,   "qtype hi");
+    assert_eq(load8(&buf + 26), 1,   "qtype lo = A");
+    assert_eq(load8(&buf + 27), 0,   "qclass hi");
+    assert_eq(load8(&buf + 28), 1,   "qclass lo = IN");
+    return 0;
+}
+
+fn test_dns_name_encode() {
+    test_group("dns_name_encode");
+    var b[64];
+    var n = dns_encode_name("a.bc.def", &b);
+    # 01 'a' 02 'bc' 03 'def' 00 → 10 bytes
+    assert_eq(n, 10, "encoded length");
+    assert_eq(load8(&b),     1,    "label 1 len");
+    assert_eq(load8(&b + 1), 97,   "label 1 = 'a'");
+    assert_eq(load8(&b + 2), 2,    "label 2 len");
+    assert_eq(load8(&b + 5), 3,    "label 3 len");
+    assert_eq(load8(&b + 9), 0,    "root terminator");
+
+    # Reject empty label
+    var b2[64];
+    assert_eq(dns_encode_name("a..b", &b2), 0, "reject empty label");
+    return 0;
+}
+
+# === DNS name decoder (no compression) ===
+fn test_dns_name_decode_simple() {
+    test_group("dns_name_decode_simple");
+    # Hand-craft a minimal DNS message containing the encoded name
+    # at offset 12. Header bytes are zeroed.
+    var msg[64];
+    memset(&msg, 0, 64);
+    # "example.com" at off 12: 07 'example' 03 'com' 00 = 13 bytes
+    store8(&msg + 12, 7);
+    store8(&msg + 13, 101); store8(&msg + 14, 120); store8(&msg + 15, 97);
+    store8(&msg + 16, 109); store8(&msg + 17, 112); store8(&msg + 18, 108);
+    store8(&msg + 19, 101);
+    store8(&msg + 20, 3);
+    store8(&msg + 21, 99); store8(&msg + 22, 111); store8(&msg + 23, 109);
+    store8(&msg + 24, 0);
+
+    var out[256];
+    var next = dns_decode_name(&msg, 64, 12, &out);
+    assert_eq(next, 25, "next offset past name");
+    assert_eq(load8(&out),     101, "decoded[0] = 'e'");
+    assert_eq(load8(&out + 7), 46,  "decoded[7] = '.'");
+    assert_eq(load8(&out + 8), 99,  "decoded[8] = 'c'");
+    assert_eq(load8(&out + 11), 0,  "decoded NUL");
+    return 0;
+}
+
+# === Name compression with pointer (legitimate, backward) ===
+fn test_dns_name_decode_pointer() {
+    test_group("dns_name_decode_pointer");
+    # Encode "com" at off 12 (4 bytes: 03 c o m 00).
+    # Encode "www" + ptr-to-12 at off 17 (1+3 + 2 = 6 bytes).
+    var msg[64];
+    memset(&msg, 0, 64);
+    store8(&msg + 12, 3);
+    store8(&msg + 13, 99); store8(&msg + 14, 111); store8(&msg + 15, 109);
+    store8(&msg + 16, 0);
+    store8(&msg + 17, 3);
+    store8(&msg + 18, 119); store8(&msg + 19, 119); store8(&msg + 20, 119);
+    store8(&msg + 21, 0xC0);    # pointer high byte
+    store8(&msg + 22, 12);      # offset 12
+
+    var out[256];
+    var next = dns_decode_name(&msg, 64, 17, &out);
+    assert_eq(next, 23, "next offset past pointer");
+    # "www.com" = 119 119 119 46 99 111 109 0
+    assert_eq(load8(&out),     119, "decoded[0] = 'w'");
+    assert_eq(load8(&out + 3), 46,  "decoded[3] = '.'");
+    assert_eq(load8(&out + 4), 99,  "decoded[4] = 'c'");
+    assert_eq(load8(&out + 7), 0,   "decoded[7] = NUL");
+    return 0;
+}
+
+# === Name compression CYCLE — SECURITY-CRITICAL ===
+# A pointer pointing forward to itself (or back to itself) would
+# loop forever. We require: pointer must aim BACKWARD, and we
+# bound hops at NAME_DECODE_MAX_HOPS.
+fn test_dns_name_decode_pointer_cycle() {
+    test_group("dns_name_decode_cycle");
+    var msg[64];
+    memset(&msg, 0, 64);
+    # Pointer at off 12 pointing at offset 12 (itself).
+    store8(&msg + 12, 0xC0);
+    store8(&msg + 13, 12);
+
+    var out[256];
+    var next = dns_decode_name(&msg, 64, 12, &out);
+    assert_eq(next, 0, "self-pointer rejected (no hang, returns 0)");
+
+    # Forward pointer (off 20 → off 30): must also be rejected since
+    # RFC says pointers go backward only.
+    memset(&msg, 0, 64);
+    store8(&msg + 20, 0xC0);
+    store8(&msg + 21, 30);
+    var next2 = dns_decode_name(&msg, 64, 20, &out);
+    assert_eq(next2, 0, "forward pointer rejected");
+
+    return 0;
+}
+
+# === Pointer offset out of bounds ===
+fn test_dns_name_decode_pointer_oob() {
+    test_group("dns_name_decode_oob");
+    var msg[32];
+    memset(&msg, 0, 32);
+    store8(&msg + 12, 0xC0);
+    store8(&msg + 13, 200);    # offset 200 is past msg_len 32
+    var out[256];
+    var next = dns_decode_name(&msg, 32, 12, &out);
+    assert_eq(next, 0, "out-of-bounds pointer rejected");
+    return 0;
+}
+
+# === Label too long ===
+fn test_dns_name_decode_oversized_label() {
+    test_group("dns_name_decode_oversize");
+    var msg[128];
+    memset(&msg, 0, 128);
+    store8(&msg + 12, 64);    # > 63 — but not a pointer (top bits clear)
+    var out[256];
+    var next = dns_decode_name(&msg, 128, 12, &out);
+    assert_eq(next, 0, "label > 63 rejected");
+    return 0;
+}
+
+# === Header accessors ===
+fn test_dns_header_accessors() {
+    test_group("dns_header");
+    var msg[12];
+    store8(&msg,     0xAB); store8(&msg + 1, 0xCD);    # ID = 0xABCD
+    store8(&msg + 2, 0x81); store8(&msg + 3, 0x83);    # flags = QR+RD+RA+NXDOMAIN
+    store8(&msg + 4, 0x00); store8(&msg + 5, 0x01);
+    store8(&msg + 6, 0x00); store8(&msg + 7, 0x05);
+    store8(&msg + 8, 0x00); store8(&msg + 9, 0x02);
+    store8(&msg + 10, 0x00); store8(&msg + 11, 0x07);
+
+    assert_eq(dns_hdr_id(&msg),      0xABCD, "id");
+    assert_eq(dns_hdr_flags(&msg),   0x8183, "flags");
+    assert_eq(dns_hdr_qdcount(&msg), 1,      "qd");
+    assert_eq(dns_hdr_ancount(&msg), 5,      "an");
+    assert_eq(dns_hdr_nscount(&msg), 2,      "ns");
+    assert_eq(dns_hdr_arcount(&msg), 7,      "ar");
+    assert_eq(dns_hdr_rcode(&msg),   3,      "rcode = NXDOMAIN");
+    return 0;
+}
+
+# === resolv.conf parsing ===
+fn test_resolv() {
+    test_group("resolv");
+    var c1 = "nameserver 8.8.8.8\n";
+    var a1 = resolv_parse(c1, strlen(c1));
+    assert_eq(a1, 0x08080808, "single nameserver");
+
+    var c2 = "# a comment\nnameserver 1.1.1.1\n";
+    var a2 = resolv_parse(c2, strlen(c2));
+    assert_eq(a2, 0x01010101, "comment then nameserver");
+
+    var c3 = "search example.com\nnameserver 9.9.9.9\nnameserver 8.8.8.8\n";
+    var a3 = resolv_parse(c3, strlen(c3));
+    assert_eq(a3, 0x09090909, "first nameserver wins");
+
+    var c4 = "# nothing\nsearch example.com\n";
+    var a4 = resolv_parse(c4, strlen(c4));
+    assert_eq(a4, 0, "no nameserver returns 0");
+
+    var c5 = "nameserver 999.999.999.999\n";
+    var a5 = resolv_parse(c5, strlen(c5));
+    assert_eq(a5, 0, "bad IPv4 returns 0");
+
+    return 0;
+}
+
+# === RR parsing: build a fake A-record response and parse it ===
+fn test_dns_parse_a_response() {
+    test_group("dns_parse_a");
+    var msg[64];
+    memset(&msg, 0, 64);
+    # Header: id 0x1234, flags QR+RD+RA, qd=1, an=1
+    store8(&msg,     0x12); store8(&msg + 1, 0x34);
+    store8(&msg + 2, 0x81); store8(&msg + 3, 0x80);
+    store8(&msg + 4, 0); store8(&msg + 5, 1);
+    store8(&msg + 6, 0); store8(&msg + 7, 1);
+    # Question at off 12: "a.com" + qtype A + qclass IN = 1+1 + 1+3 + 1 + 2 + 2 = 11
+    store8(&msg + 12, 1); store8(&msg + 13, 97);
+    store8(&msg + 14, 3); store8(&msg + 15, 99); store8(&msg + 16, 111); store8(&msg + 17, 109);
+    store8(&msg + 18, 0);
+    store8(&msg + 19, 0); store8(&msg + 20, 1);
+    store8(&msg + 21, 0); store8(&msg + 22, 1);
+    # Answer at off 23: pointer to off 12 + type A + class IN + ttl 300 + rdlen 4 + 1.2.3.4
+    store8(&msg + 23, 0xC0); store8(&msg + 24, 12);    # ptr to "a.com"
+    store8(&msg + 25, 0);    store8(&msg + 26, 1);     # type A
+    store8(&msg + 27, 0);    store8(&msg + 28, 1);     # class IN
+    store8(&msg + 29, 0); store8(&msg + 30, 0); store8(&msg + 31, 1); store8(&msg + 32, 44);    # ttl 300
+    store8(&msg + 33, 0); store8(&msg + 34, 4);        # rdlen 4
+    store8(&msg + 35, 1); store8(&msg + 36, 2); store8(&msg + 37, 3); store8(&msg + 38, 4);
+
+    var start = dns_answer_section_start(&msg, 64);
+    assert_eq(start, 23, "answer section starts after Q");
+    var rr = alloc(DNS_RR_SIZE);
+    var next = dns_parse_rr(&msg, 64, start, rr);
+    assert_eq(next, 39, "parsed RR ends at off 39");
+    assert_eq(dns_rr_type(rr),  1,   "rr type A");
+    assert_eq(dns_rr_class(rr), 1,   "rr class IN");
+    assert_eq(dns_rr_ttl(rr),   300, "rr ttl");
+    assert_eq(dns_rr_rdata_off(rr), 35, "rr rdata offset");
+    return 0;
+}
+
+# === Truncated response (TC=1) detection ===
+fn test_dns_truncated() {
+    test_group("dns_truncated");
+    var msg[12];
+    memset(&msg, 0, 12);
+    store8(&msg + 2, 0x83); store8(&msg + 3, 0x80);    # TC=1, QR=1, RD=1, RA=1
+    assert_eq(dns_hdr_truncated(&msg), 1, "TC bit detected");
+
+    var msg2[12];
+    memset(&msg2, 0, 12);
+    store8(&msg2 + 2, 0x81); store8(&msg2 + 3, 0x80);    # TC=0
+    assert_eq(dns_hdr_truncated(&msg2), 0, "TC bit absent");
+    return 0;
+}
 
 fn main() {
     alloc_init();
-    test_group("smoke");
-    assert(1, "true is true");
-    assert_eq(1 + 1, 2, "math works");
+    test_ipv4();
+    test_dns_query_build();
+    test_dns_name_encode();
+    test_dns_name_decode_simple();
+    test_dns_name_decode_pointer();
+    test_dns_name_decode_pointer_cycle();
+    test_dns_name_decode_pointer_oob();
+    test_dns_name_decode_oversized_label();
+    test_dns_header_accessors();
+    test_resolv();
+    test_dns_parse_a_response();
+    test_dns_truncated();
     return assert_summary();
 }
 

@@ -1,7 +1,7 @@
 [package]
 name = "dig"
-version = "0.1.0"
-description = "dig — TODO"
+version = "0.3.0"
+description = "dig — DNS resolver (sovereign Cyrius reimplementation of BIND dig)"
 license = "GPL-3.0-only"
 language = "cyrius"
 cyrius = "6.0.1"
@@ -12,5 +12,5 @@ test = "src/test.cyr"
 output = "dig"
 
 [deps]
-stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench"]
+stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "args", "flags"]
 ---
