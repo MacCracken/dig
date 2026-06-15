@@ -4,6 +4,18 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-06-14 (pin → 6.2.6; drop the chrono workaround)
+
+### Changed
+- **Toolchain pin 6.2.5 → 6.2.6.** cyrius 6.2.6 bound chrono's agnos monotonic clock + sleep to the real kernel
+  syscalls and added `sys_uptime_ms`(#40) / `sys_sleep_ms`(#41) peer wrappers (the fix for the gap `dig`/`yo`
+  surfaced — cyrius issue `2026-06-14-chrono-agnos-monotonic-sleep-stale-stubs.md`).
+- **`src/platform_agnos.cyr` drops the direct `syscall(40)/(41)` workaround** → uses the `sys_uptime_ms`/
+  `sys_sleep_ms` wrappers. Still validated end-to-end (`agnos/scripts/net-tool-smoke.sh` 2/2 — dig resolves
+  `example.com` over the #51-54 UDP syscalls in ring 3, with the chrono fix now in the path).
+- Dropped the regenerated stale `lib/` again (a 6.2.5-era vendored snapshot was shadowing the 6.2.6 stdlib —
+  that's why the new wrappers looked "undefined"); the build uses the version-pinned snapshot.
+
 ## [0.3.1] — 2026-06-14 (AGNOS breakout — dig builds for the sovereign kernel)
 
 ### Added

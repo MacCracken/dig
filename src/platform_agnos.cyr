@@ -2,9 +2,9 @@
 #
 # The agnos breakout (2026-06-14): replaces platform_linux.cyr's POSIX socket()
 # path with the AGNOS kernel's sovereign ring-3 syscalls via the
-# CYRIUS_TARGET_AGNOS peer (cyrius >= 6.2.3): udp_bind/send/recv/unbind (#51-54)
-# + getrandom (#45) + the FS open/read/close syscalls, plus uptime_ms (#40) /
-# sleep_ms (#41) called directly. Same per-backend raw-syscall posture as
+# CYRIUS_TARGET_AGNOS peer (cyrius >= 6.2.6): udp_bind/send/recv/unbind (#51-54)
+# + getrandom (#45) + the FS open/read/close syscalls + the sys_uptime_ms (#40) /
+# sys_sleep_ms (#41) wrappers. Same per-backend raw-syscall posture as
 # platform_linux.cyr — no POSIX, no lib/net.cyr tagged unions.
 #
 # Two model bridges the POSIX surface needs on AGNOS:
@@ -14,13 +14,11 @@
 #   2. AGNOS udp_recv is *non-blocking* (no SO_RCVTIMEO analog): platform_udp_recv
 #      polls it against an uptime_ms deadline, sleeping briefly between polls.
 #
-# NOTE (cyrius-side): chrono's agnos clock_now_ms/sleep_ms are stale stubs (return
-# 0 / no-op, per the old "frozen 0-33 surface" note) — they do NOT use uptime_ms
-# #40 / sleep_ms #41, which have existed since agnos 1.43.x. This backend calls
-# those syscalls directly until chrono's agnos branch is updated to bind them.
+# Monotonic time + sleep use the cyrius >= 6.2.6 peer wrappers sys_uptime_ms()
+# (#40) / sys_sleep_ms() (#41). (Earlier 0.3.1 called syscall(40)/(41) directly
+# because chrono's agnos clock/sleep were stale stubs; 6.2.6 bound chrono + added
+# these wrappers — see cyrius issue 2026-06-14-chrono-agnos-monotonic-sleep-stale-stubs.)
 
-var _AG_SYS_UPTIME_MS = 40;        # uptime_ms() -> monotonic ms since boot
-var _AG_SYS_SLEEP_MS  = 41;        # sleep_ms(ms)
 var _AG_O_RDONLY      = 0;
 
 var _ag_src_port   = 0;            # the bound source port (dig is single-query-at-a-time)
@@ -60,12 +58,12 @@ fn platform_udp_send_to(fd, packed_addr, port, pkt, pkt_len): i64 {
 # received (>0), -11 (-EAGAIN-ish on timeout, mirroring Linux SO_RCVTIMEO), or a
 # kernel error (<0). The 5ms inter-poll sleep keeps us off a busy-spin.
 fn platform_udp_recv(fd, buf, maxlen): i64 {
-    var deadline = syscall(_AG_SYS_UPTIME_MS) + _ag_timeout_ms;
-    while (syscall(_AG_SYS_UPTIME_MS) < deadline) {
+    var deadline = sys_uptime_ms() + _ag_timeout_ms;
+    while (sys_uptime_ms() < deadline) {
         var n = sys_udp_recv(fd, buf, maxlen, 0);
         if (n > 0) { return n; }
         if (n < 0) { return n; }
-        syscall(_AG_SYS_SLEEP_MS, 5);
+        sys_sleep_ms(5);
     }
     return 0 - 11;
 }
@@ -94,10 +92,10 @@ fn platform_random_u16(): i64 {
 # Monotonic microseconds (uptime_ms #40 × 1000 — 10ms-tick resolution; fine for
 # DNS RTT display + the recv-timeout deadline).
 fn platform_now_us(): i64 {
-    return syscall(_AG_SYS_UPTIME_MS) * 1000;
+    return sys_uptime_ms() * 1000;
 }
 
 fn platform_sleep_ms(ms): i64 {
     if (ms <= 0) { return 0; }
-    return syscall(_AG_SYS_SLEEP_MS, ms);
+    return sys_sleep_ms(ms);
 }

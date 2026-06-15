@@ -14,7 +14,7 @@
 # Per-type formatting lives in `output_print_rdata` so adding a new
 # RR type is a single switch arm.
 
-var _DIG_VERSION_STR = "0.3.1";
+var _DIG_VERSION_STR = "0.3.2";
 
 fn _out_puts(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
 fn _out_eputs(s): i64 { syscall(1, 2, s, strlen(s)); return 0; }
