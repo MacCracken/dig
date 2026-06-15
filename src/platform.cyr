@@ -5,9 +5,14 @@
 # platform_read_file, platform_random_u16, platform_now_us,
 # platform_sleep_ms, platform_close) is defined in src/platform_linux.cyr.
 #
-# Later: this file gains #ifdef CYRIUS_TARGET_AGNOS, _WINDOWS, _MACOS
-# branches. The AGNOS branch replaces the POSIX socket() path with the
-# sovereign udp_send / udp_recv kernel primitives once roadmap § 0.2.x
-# lands. Same posture as yo's src/platform.cyr.
+# AGNOS branch landed 2026-06-14: src/platform_agnos.cyr replaces the POSIX
+# socket() path with the sovereign udp_bind/send/recv/unbind (#51-54) + getrandom
+# (#45) + FS syscalls via the CYRIUS_TARGET_AGNOS peer (cyrius >= 6.2.3). Windows
+# / macOS branches still TODO. Same dispatch posture as yo's src/platform.cyr.
 
+#ifdef CYRIUS_TARGET_AGNOS
+include "src/platform_agnos.cyr"
+#endif
+#ifndef CYRIUS_TARGET_AGNOS
 include "src/platform_linux.cyr"
+#endif

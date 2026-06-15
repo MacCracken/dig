@@ -1,0 +1,103 @@
+# platform_agnos.cyr — AGNOS backend (sovereign UDP / clock / entropy).
+#
+# The agnos breakout (2026-06-14): replaces platform_linux.cyr's POSIX socket()
+# path with the AGNOS kernel's sovereign ring-3 syscalls via the
+# CYRIUS_TARGET_AGNOS peer (cyrius >= 6.2.3): udp_bind/send/recv/unbind (#51-54)
+# + getrandom (#45) + the FS open/read/close syscalls, plus uptime_ms (#40) /
+# sleep_ms (#41) called directly. Same per-backend raw-syscall posture as
+# platform_linux.cyr — no POSIX, no lib/net.cyr tagged unions.
+#
+# Two model bridges the POSIX surface needs on AGNOS:
+#   1. AGNOS UDP is *listener-id* based, not fd: platform_udp_open binds an
+#      ephemeral source port (so the DNS reply routes back to it) and returns the
+#      listener_id as the "fd". udp_send packs (src_port<<16)|dst_port.
+#   2. AGNOS udp_recv is *non-blocking* (no SO_RCVTIMEO analog): platform_udp_recv
+#      polls it against an uptime_ms deadline, sleeping briefly between polls.
+#
+# NOTE (cyrius-side): chrono's agnos clock_now_ms/sleep_ms are stale stubs (return
+# 0 / no-op, per the old "frozen 0-33 surface" note) — they do NOT use uptime_ms
+# #40 / sleep_ms #41, which have existed since agnos 1.43.x. This backend calls
+# those syscalls directly until chrono's agnos branch is updated to bind them.
+
+var _AG_SYS_UPTIME_MS = 40;        # uptime_ms() -> monotonic ms since boot
+var _AG_SYS_SLEEP_MS  = 41;        # sleep_ms(ms)
+var _AG_O_RDONLY      = 0;
+
+var _ag_src_port   = 0;            # the bound source port (dig is single-query-at-a-time)
+var _ag_timeout_ms = 5000;        # recv timeout, set by platform_set_recv_timeout_ms
+
+# Bind an ephemeral UDP source port (49152..65535) so the DNS reply routes back.
+# Returns the listener_id (0..7) as the fd, or the kernel's -1 (table full).
+fn platform_udp_open(): i64 {
+    var rb[2];
+    sys_getrandom(&rb, 2, 0);
+    var port = 49152 + (((load8(&rb) << 8) | load8(&rb + 1)) & 0x3FFF);
+    var lid = sys_udp_bind(port);
+    if (lid < 0) { return lid; }
+    _ag_src_port = port;
+    return lid;
+}
+
+fn platform_close(fd): i64 {
+    return sys_udp_unbind(fd);
+}
+
+# No SO_RCVTIMEO on AGNOS — just remember the timeout for the recv poll loop.
+fn platform_set_recv_timeout_ms(fd, timeout_ms): i64 {
+    _ag_timeout_ms = timeout_ms;
+    return 0;
+}
+
+# udp_send(dst_ip, (src_port<<16)|dst_port, pkt, len). packed_addr is the ip4()
+# packed form (high byte = first octet) — matches ipv4_parse output, which is
+# exactly what the kernel expects. Returns bytes sent or -1.
+fn platform_udp_send_to(fd, packed_addr, port, pkt, pkt_len): i64 {
+    var packed_ports = (_ag_src_port << 16) | (port & 0xFFFF);
+    return sys_udp_send(packed_addr, packed_ports, pkt, pkt_len);
+}
+
+# Non-blocking kernel recv polled against an uptime_ms deadline. Returns bytes
+# received (>0), -11 (-EAGAIN-ish on timeout, mirroring Linux SO_RCVTIMEO), or a
+# kernel error (<0). The 5ms inter-poll sleep keeps us off a busy-spin.
+fn platform_udp_recv(fd, buf, maxlen): i64 {
+    var deadline = syscall(_AG_SYS_UPTIME_MS) + _ag_timeout_ms;
+    while (syscall(_AG_SYS_UPTIME_MS) < deadline) {
+        var n = sys_udp_recv(fd, buf, maxlen, 0);
+        if (n > 0) { return n; }
+        if (n < 0) { return n; }
+        syscall(_AG_SYS_SLEEP_MS, 5);
+    }
+    return 0 - 11;
+}
+
+# open(path,O_RDONLY)+read+close via the AGNOS FS syscalls. AGNOS sys_open takes
+# (name, namelen, flags) — compute the cstring length inline. Used to slurp
+# /etc/resolv.conf; on agnos that file is typically absent → sys_open returns <0
+# and dig falls back to its CLI @resolver / default.
+fn platform_read_file(path, buf, maxlen): i64 {
+    var nl = 0;
+    while (load8(path + nl) != 0) { nl = nl + 1; }
+    var fd = sys_open(path, nl, _AG_O_RDONLY);
+    if (fd < 0) { return fd; }
+    var n = sys_read(fd, buf, maxlen);
+    sys_close(fd);
+    return n;
+}
+
+# 2 bytes of hardware entropy (RDRAND) for the DNS query ID (RFC 5452).
+fn platform_random_u16(): i64 {
+    var rb[2];
+    sys_getrandom(&rb, 2, 0);
+    return (load8(&rb) << 8) | load8(&rb + 1);
+}
+
+# Monotonic microseconds (uptime_ms #40 × 1000 — 10ms-tick resolution; fine for
+# DNS RTT display + the recv-timeout deadline).
+fn platform_now_us(): i64 {
+    return syscall(_AG_SYS_UPTIME_MS) * 1000;
+}
+
+fn platform_sleep_ms(ms): i64 {
+    if (ms <= 0) { return 0; }
+    return syscall(_AG_SYS_SLEEP_MS, ms);
+}
