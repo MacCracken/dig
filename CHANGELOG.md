@@ -4,6 +4,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-06-14 (AGNOS breakout — dig builds for the sovereign kernel)
+
+### Added
+- **`src/platform_agnos.cyr` — the AGNOS backend.** Replaces the POSIX `socket()` path with the sovereign ring-3
+  syscalls via the `CYRIUS_TARGET_AGNOS` peer (cyrius ≥ 6.2.3): UDP over `udp_bind`/`send`/`recv`/`unbind`
+  (#51-54), DNS query IDs from `getrandom` (#45), `/etc/resolv.conf` via the FS `open`/`read`/`close` syscalls,
+  and timing via `uptime_ms`(#40) / `sleep_ms`(#41) called directly. Two model bridges: AGNOS UDP is listener-id
+  based (open binds an ephemeral source port, returns the listener_id as the fd; send packs `(src<<16)|dst`), and
+  AGNOS `udp_recv` is non-blocking (the backend polls it against an `uptime_ms` deadline since there's no
+  `SO_RCVTIMEO` analog). `src/platform.cyr` now dispatches `#ifdef CYRIUS_TARGET_AGNOS`. **dig now builds for
+  AGNOS** (`cyrius build --agnos`).
+
+### Changed
+- **Toolchain pin 6.0.1 → 6.2.5** (the cyrius release carrying the AGNOS net peer).
+- **Dropped the stale committed `lib/`** (an 81-file vendored stdlib snapshot from the 6.0.1 era that shadowed the
+  6.2.5 snapshot — the reference tools `owl`/`kriya`/`agnoshi` don't vendor `lib/` at all). dig now uses the
+  version-pinned stdlib snapshot.
+
+### Notes
+- Known cyrius-side gap worked around: chrono's agnos `clock_now_ms`/`sleep_ms` are stale stubs (return 0 / no-op)
+  — the backend calls `uptime_ms`#40 / `sleep_ms`#41 directly until chrono's agnos branch binds them.
+
 ## [0.3.0] — 2026-05-23
 
 ### Added
