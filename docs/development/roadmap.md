@@ -58,15 +58,15 @@ Ordered by dependency. Items further down depend on items earlier.
 - [ ] First DNSSEC run: `dig +dnssec example.com`. Expected: chain validates against the root KSK.
 - [ ] Parity benchmark vs BIND's `dig` on the same host — query latency + memory footprint + binary size. Target: ≤ 25 ms median, ≤ 5 MB RSS, ≤ 40 KB binary.
 
-### 0.6.x — `taar` EXTRACTION (the trigger fires)
+### 0.6.x — `taar` EXTRACTION (trigger FIRED 2026-06-15, ahead of slot — partially done)
 
 **This is the load-bearing milestone — dig completion is the second-consumer-trigger that shapes the network-probe substrate library.**
 
-- [ ] Open `/home/macro/Repos/taar/` via `cyrius init taar`. Per-protocol submodule layout: `taar/src/icmp.cyr` (from yo) + `taar/src/dns.cyr` (from dig) + `taar/src/socket.cyr` (the union of UDP + TCP primitives) + `taar/src/kernel.cyr` (the syscall shim).
-- [ ] Move yo's local ICMP framing + DNS shim (if any) into `taar`. Move dig's local DNS framing into `taar/src/dns.cyr`.
-- [ ] Refactor `yo/cyrius.cyml` + `dig/cyrius.cyml` to depend on `taar`. CLI surfaces of both tools stay byte-stable across the refactor (verifiable via `scripts/test.sh` regression + the `+short` output diff against BIND).
-- [ ] Bump yo + dig to consume `taar` without API change.
-- [ ] Per [[feedback_dep_lockin_sandhi_unlock]] — extraction trigger fires NOW; don't let the lib stay private just because dig is "almost done." This IS the moment.
+- [x] `taar` repo created (0.1.0). Per-protocol submodule layout planned (`icmp`/`dns`/`socket`/`kernel`); **`src/ipv4.cyr` shipped first** (the byte-identical yo/dig codec) → `dist/taar.cyr`. The other modules fold in as consumers need them.
+- [ ] Move yo's local ICMP framing + dig's DNS framing into `taar` (`icmp.cyr` / `dns.cyr`) — not yet done; only `ipv4` has moved so far.
+- [x] `yo/cyrius.cyml` + `dig/cyrius.cyml` depend on `taar` (`[deps.taar]` git+path, tag 0.1.0, `modules = ["dist/taar.cyr"]`). CLI surfaces stayed byte-stable.
+- [x] yo 0.5.5 + dig 0.3.3 consume `taar` without API change.
+- [x] Per [[feedback_dep_lockin_sandhi_unlock]] — extraction fired at the duplication point (2026-06-15), not deferred to dig 1.0. The `ipv4` fold was the moment.
 - [ ] When `whirl` arrives (post-taar-extraction), it adds `taar/src/tcp.cyr` + `taar/src/tls.cyr` + `taar/src/http.cyr` as additive submodules — no refactor of the icmp/dns/socket modules.
 
 ---
@@ -89,7 +89,7 @@ Lower priority. Item shape pinned for orientation; specific versions TBD.
 Ship 1.0 when all of these are true. Pre-1.0 minor cycles can land partial subsets; the v1.0 tag is the all-of-these gate.
 
 - [ ] **Feature parity with BIND `dig`**: A / AAAA / MX / TXT / NS / CNAME / SOA / SRV / PTR / DNSKEY / RRSIG / DS / NSEC / NSEC3, `+short` / `+trace` / `+tcp` / `+dnssec` / `+timeout` / `+retry`, IPv4 + IPv6 transport, EDNS(0).
-- [ ] **`taar` extracted** as a separate repo. `dig` depends on `taar`; the kernel network primitives are not vendored back into `dig`.
+- [ ] **`taar` extracted** as a separate repo — STARTED (taar 0.1.0; `dig` depends on it via `[deps.taar]`; the `ipv4` codec is lifted out, not vendored). Remaining for v1.0: dig's `dns`/socket primitives also live in `taar` rather than locally.
 - [ ] **LAN-on-iron validated** on archaemenid against the home gateway resolver (`192.168.1.1`) and at least one public resolver (`8.8.8.8`, `1.1.1.1`).
 - [ ] **QEMU validated** via `scripts/qemu-smoke.sh` — boots a kernel with dig in the initrd, queries SLIRP's built-in DNS at `10.0.2.3` for `example.com`, asserts an A-record comes back.
 - [ ] **No POSIX `socket()`** anywhere in `dig` or `taar`. Sovereign kernel primitives only. Audit pass per [first-party-standards § Security Hardening](https://github.com/MacCracken/agnosticos/blob/main/docs/development/first-party/first-party-standards.md#security-hardening-required-before-every-release).
@@ -112,8 +112,8 @@ Deliberate exclusions — keeps future contributors from adding to v1.0 by accid
 
 ## Cross-references
 
-- **Substrate (extracted via dig)**: [taar (planned, dig is extraction trigger)](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/shared-crates.md).
-- **Sibling tools**: [yo (already scaffolded)](https://github.com/MacCracken/yo), [whirl (planned, post-taar-extraction)](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/shared-crates.md).
+- **Substrate (extracted via dig)**: [taar — 0.1.0 scaffolded 2026-06-15; dig consumes it (ipv4 module)](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/shared-crates.md).
+- **Sibling tools**: [yo (scaffolded, consumes taar)](https://github.com/MacCracken/yo), [whirl (planned — third taar consumer)](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/shared-crates.md).
 - **Iron dependency**: [agnos r8169 RX-path 5-part bundle](https://github.com/MacCracken/agnosticos/blob/main/docs/development/r8169-rx-path-audit.md) — **cleared** (r8169 RX solved 2026-05-25, 1.32.7, iron-validated). The LAN-on-iron path is unblocked; what remains is the actual archaemenid dig run.
 - **Kernel-growth posture**: AGNOS `state.md` + memory [[project_agnos_kernel_growth_rules]].
 - **Naming lane**: English-wordplay / trickster lane (cultural-reference path: Cyrus from The Warriors → Cyrius the language) per [[feedback_naming_lanes]] memory. Family: cmdrs, bnrmr, iam, hapi, kii, yo, **dig**, whirl.

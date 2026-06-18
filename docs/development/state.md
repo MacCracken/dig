@@ -17,7 +17,7 @@
 | Cyrius pin | 6.0.1 |
 | Tests | 70 assertions in `tests/dig.tcyr` covering ipv4, query construction byte layout, name encode/decode, **name-compression cycle detection** (security-critical), header accessors, resolv.conf parsing, RR parsing, TC-bit detection |
 | Iron-validation host | archaemenid (Beelink SER, AMD) — same machine as the agnosticos iron-burn surface |
-| Family position | Second entry in network-tools family (after yo) — **`taar` extraction trigger pending dig 1.0** |
+| Family position | Second entry in network-tools family (after yo) — **`taar` extraction trigger FIRED 2026-06-15** (shared `ipv4` codec folded at dig 0.3.3 / yo 0.5.5) |
 
 ## In-flight work
 
@@ -34,7 +34,7 @@ string fmt alloc io vec str syscalls assert bench args flags
 `args` + `flags` added at 0.3.0 (CLI parsing). Will grow:
 
 - **0.4.x**: + DNSSEC validation primitives (RRSIG / DNSKEY / DS / NSEC / NSEC3), EDNS(0) OPT pseudo-RR handling. May vendor a chunk of `sigil` for the crypto primitives or add it as an explicit dep.
-- **0.6.x**: **`taar` extraction trigger fires.** Network primitives (`src/dns.cyr`, `src/ipv4.cyr`, `src/platform_linux.cyr` UDP/TCP surface, `src/resolv.cyr`) move OUT of `dig` INTO the new `taar` repo. `cyrius.cyml [deps]` gains `taar = { path = "../taar" }` or registry equivalent. yo + dig + whirl all consume taar from there forward.
+- **0.6.x**: **`taar` extraction — IN PROGRESS** (trigger fired 2026-06-15, ahead of the 0.6.x slot). `taar` 0.1.0 is scaffolded and the shared **`ipv4` codec already moved OUT** of `dig` into `taar` (consumed via `cyrius.cyml [deps.taar]` → `dist/taar.cyr`). The remaining primitives (`src/dns.cyr`, the `platform_*` UDP/TCP socket surface, `src/resolv.cyr`) fold in incrementally as the per-protocol modules grow. yo + dig consume taar today; whirl joins as the third consumer.
 
 ## Sovereignty posture (per-backend rule)
 
@@ -43,15 +43,15 @@ Same posture as yo: pragmatic POSIX `socket()` on the Linux backend; the AGNOS b
 ## Sibling repos
 
 - **yo** — 0.3.0 shipping. ICMP echo probe. First entry in the family. Same per-backend sovereignty posture.
-- **whirl** — planned, NOT yet scaffolded. HTTP/HTTPS transfer (curl + wget equivalent). Arrives after the taar extraction triggered by dig completion.
-- **taar** — planned, NOT yet scaffolded. Network-probe substrate library. **dig is the extraction-trigger consumer** — the duplication friction between yo (ICMP + UDP for resolv.conf reads) and dig (DNS + UDP/TCP-53 sockets) shapes taar's API honestly. dig 0.3.x already shows what duplicates: `ipv4_parse` is verbatim across both; `platform_linux.cyr` UDP primitives differ only in which port/protocol constants are used.
+- **whirl** — planned, NOT yet scaffolded. HTTP/HTTPS transfer (curl + wget equivalent). The third taar consumer — adds `taar/src/tcp.cyr` + `tls.cyr` + `http.cyr` when it lands (taar itself already exists at 0.1.0).
+- **taar** — **0.1.0 scaffolded 2026-06-15.** Network-probe substrate library. The yo/dig duplication was the trigger: their byte-identical `ipv4` codec was the first module lifted into `taar` (ships `dist/taar.cyr`; dig + yo consume it via `[deps.taar]`). Per-protocol modules (`icmp`, `dns`, `socket`) fold in per second-consumer trigger; whirl later adds `tcp`/`tls`/`http`.
 
 ## Carry-forward (dependent on other repos)
 
 | Item | Blocked on | Owning repo |
 |---|---|---|
 | AGNOS-backend sovereign UDP path | ✅ done — UDP #51-54 landed agnos 1.45.3; r8169 RX solved 2026-05-25; `src/platform_agnos.cyr` resolves end-to-end | agnos + dig |
-| `taar` substrate extraction | dig 1.0 completion (dig IS the extraction trigger) | dig + future taar repo |
+| `taar` substrate extraction | ✅ fired 2026-06-15 — `ipv4` module lifted into taar 0.1.0 (dig 0.3.3 + yo 0.5.5 consume it); dns/socket modules fold in incrementally | dig + yo + taar |
 | LAN-on-iron validation | syscall exposure + r8169 both cleared; remaining = the actual archaemenid run | dig (iron run) |
 | QEMU + SLIRP DNS validation | ✅ done — agnos `net-tool-smoke.sh` resolves `example.com` via SLIRP 10.0.2.3 | agnos + dig |
 
