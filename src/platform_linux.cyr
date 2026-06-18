@@ -4,12 +4,12 @@
 # wraps results in tagged unions that this thin backend doesn't need.
 #
 # Sovereignty posture (per-backend rule): this file uses POSIX
-# socket() pragmatically. The AGNOS backend (future) will use the
-# sovereign udp_send / udp_recv kernel primitives once the kernel
-# UDP-53 syscall exposure lands (roadmap § 0.2.x — blocked on agnos
-# r8169 RX-path iron-validation, Attempt 97 pending). The v1.0
-# release gate enforces no-POSIX on the AGNOS backend only. Same
-# posture as yo's src/platform_linux.cyr.
+# socket() pragmatically. The AGNOS backend (src/platform_agnos.cyr)
+# uses the sovereign udp_bind/send/recv/unbind kernel primitives
+# (#51-54, landed agnos 1.45.3, via the cyrius >= 6.2.6 peer) and
+# already resolves real names end-to-end on agnos. The v1.0 release
+# gate enforces no-POSIX on the AGNOS backend only. Same posture as
+# yo's src/platform_linux.cyr.
 
 var _LX_SYS_READ            = 0;
 var _LX_SYS_WRITE           = 1;

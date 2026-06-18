@@ -1,7 +1,7 @@
 # dig — main entry point
 # Stdlib auto-included via cyrius.cyml
 
-include "src/ipv4.cyr"
+include "lib/taar.cyr"
 include "src/dns.cyr"
 include "src/platform.cyr"
 include "src/resolv.cyr"

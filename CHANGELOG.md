@@ -4,6 +4,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.3] — 2026-06-15 (fold onto taar — IPv4 codec extracted)
+
+### Changed
+- **`src/ipv4.cyr` removed; folds onto `taar` 0.1.0.** dig and `yo` shipped a
+  byte-identical IPv4 codec — the documented extraction trigger. The parser +
+  `ipv4_format_to_buf` now live in `taar/src/ipv4.cyr`; dig pulls them via
+  `[deps.taar]` (`path = "../taar"` for local dev, `git`+`tag` published
+  fallback) and `include "lib/taar.cyr"` in `src/main.cyr`. No behavior change
+  — `ipv4` is pure code (no syscalls), so the AGNOS backend
+  (`platform_agnos.cyr`) is unaffected.
+
+### Notes
+- Host + `--agnos` both build clean; **70/70 tests** green (the suite now
+  exercises `ipv4` through the taar bundle). Pure-code refactor — no QEMU
+  re-smoke needed; the 0.3.2 end-to-end resolution result stands.
+
 ## [0.3.2] — 2026-06-14 (pin → 6.2.6; drop the chrono workaround)
 
 ### Changed
@@ -56,7 +72,7 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `src/main.cyr` is now the wiring layer (was a stub `hello from dig` print at 0.1.0).
 
 ### Notes
-- 0.2.x kernel UDP-53 syscall exposure remains blocked on agnos r8169 RX-path Attempt 97. Taking yo's per-backend route to keep momentum — Linux backend is pragmatic POSIX today, AGNOS backend reaches no-POSIX at v1.0 gate.
+- 0.2.x kernel UDP-53 syscall exposure was blocked at the time on the agnos r8169 RX-path. (Since cleared: r8169 RX solved 2026-05-25 / 1.32.7; UDP-53 `udp_bind`#51–`udp_unbind`#54 landed agnos 1.45.3.) Took yo's per-backend route to keep momentum — Linux backend is pragmatic POSIX today, AGNOS backend reaches no-POSIX at v1.0 gate.
 - TCP transport (`+tcp` flag) accepted but no-op for 0.3.x — full TCP handling lands at 0.4.x alongside EDNS(0). Truncated responses currently surface a warning + empty answer rather than auto-retrying.
 
 ## [0.1.0]

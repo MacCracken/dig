@@ -38,7 +38,7 @@ string fmt alloc io vec str syscalls assert bench args flags
 
 ## Sovereignty posture (per-backend rule)
 
-Same posture as yo: pragmatic POSIX `socket()` on the Linux backend today; AGNOS backend will use sovereign `udp_send` / `udp_recv` kernel primitives once roadmap § 0.2.x lands (kernel UDP-53 syscall exposure, blocked on agnos r8169 RX-path Attempt 97). The v1.0 release gate enforces **no-POSIX on the AGNOS backend only**. This keeps dig moving while iron-validation is blocked, instead of freezing the whole resolver behind a hardware-driver dependency.
+Same posture as yo: pragmatic POSIX `socket()` on the Linux backend; the AGNOS backend (`src/platform_agnos.cyr`) uses the sovereign `udp_bind`/`udp_send`/`udp_recv`/`udp_unbind` kernel primitives (#51-54, landed agnos 1.45.3, via the cyrius ≥ 6.2.6 peer) and resolves real names end-to-end on agnos. The v1.0 release gate enforces **no-POSIX on the AGNOS backend only**. (Both the roadmap § 0.2.x kernel-exposure block and the r8169 RX dependency are cleared — r8169 RX solved 2026-05-25.)
 
 ## Sibling repos
 
@@ -50,10 +50,10 @@ Same posture as yo: pragmatic POSIX `socket()` on the Linux backend today; AGNOS
 
 | Item | Blocked on | Owning repo |
 |---|---|---|
-| AGNOS-backend sovereign UDP path | r8169 RX-path 5-part bundle iron-validating | agnos (Attempt 97 pending) |
+| AGNOS-backend sovereign UDP path | ✅ done — UDP #51-54 landed agnos 1.45.3; r8169 RX solved 2026-05-25; `src/platform_agnos.cyr` resolves end-to-end | agnos + dig |
 | `taar` substrate extraction | dig 1.0 completion (dig IS the extraction trigger) | dig + future taar repo |
-| LAN-on-iron validation | Kernel UDP/TCP syscall exposure + r8169 iron-clear | agnos + dig |
-| QEMU + SLIRP DNS validation | Kernel UDP syscall exposure | agnos + dig |
+| LAN-on-iron validation | syscall exposure + r8169 both cleared; remaining = the actual archaemenid run | dig (iron run) |
+| QEMU + SLIRP DNS validation | ✅ done — agnos `net-tool-smoke.sh` resolves `example.com` via SLIRP 10.0.2.3 | agnos + dig |
 
 ## Consumers
 

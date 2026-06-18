@@ -13,7 +13,7 @@
 | Version | Landed | Items |
 |---|---|---|
 | **0.1.0** | 2026-05-23 | Initial `cyrius init` scaffold. README + CLAUDE.md + LICENSE + CHANGELOG + cyrius.cyml + tests/dig.{tcyr,bcyr,fcyr} + `.github/workflows/{ci,release}.yml`. Stub `main.cyr` prints `hello from dig`. Stdlib vendored in `lib/` (81 modules incl. `net.cyr`). |
-| **0.3.0** | 2026-05-23 | **dig MVP — first end-to-end resolution.** Real UDP queries against arbitrary resolvers; A / AAAA / MX / NS / CNAME / SOA / PTR / TXT / SRV parsed; BIND-shape + `+short` output. 8 src/ modules (cli, dns, ipv4, output, platform/platform_linux, query, resolv) totaling 1410 LOC. 70 test assertions including name-compression cycle detection. Per-backend sovereignty posture: pragmatic POSIX on Linux, AGNOS backend deferred to v1.0 gate (same as yo). 0.2.x kernel UDP-53 syscall exposure remains blocked on agnos r8169 RX-path Attempt 97 — the Linux-backend bypass keeps momentum. |
+| **0.3.0** | 2026-05-23 | **dig MVP — first end-to-end resolution.** Real UDP queries against arbitrary resolvers; A / AAAA / MX / NS / CNAME / SOA / PTR / TXT / SRV parsed; BIND-shape + `+short` output. 8 src/ modules (cli, dns, ipv4, output, platform/platform_linux, query, resolv) totaling 1410 LOC. 70 test assertions including name-compression cycle detection. Per-backend sovereignty posture: pragmatic POSIX on Linux, AGNOS backend deferred to v1.0 gate (same as yo). At the time, 0.2.x kernel UDP-53 syscall exposure was still pending (the Linux-backend-first bypass kept momentum); that surface has since landed (agnos 1.45.3, #51-54) and the AGNOS backend now resolves end-to-end. |
 
 ---
 
@@ -21,18 +21,18 @@
 
 Ordered by dependency. Items further down depend on items earlier.
 
-### 0.2.x — Kernel UDP-53 / TCP-53 primitives (kernel-side, in `agnos`)
+### 0.2.x — Kernel UDP-53 / TCP-53 primitives (kernel-side, in `agnos`) ✅ landed
 
-**Blocked on**: r8169 RX-path 5-part bundle iron-validating (Attempt 97 pending — same dependency yo carries). Kernel UDP path already exists from the 1.32.0 networking arc (DHCP client uses it); dig adds the consumer-side surface for arbitrary UDP queries.
+**Landed**: the agnos r8169 RX-path was solved 2026-05-25 (1.32.7 — RX ring 16→64, iron-validated), and the ring-3 net syscalls dig consumes shipped in the 1.45.x arc. The AGNOS backend (`src/platform_agnos.cyr`) is built and resolves real names end-to-end on agnos (dig 0.3.1 returned an A-record for `example.com` over the UDP syscalls in ring 3 — agnos `net-tool-smoke.sh` 2/2).
 
-- [ ] Cyrius-native `udp_send(dst_ip, dst_port, payload, len)` / `udp_recv(listener_id, buf, maxlen, &src_ip, &src_port, timeout_ms)` exposed to userland. The kernel already has these primitives internally per `agnos/kernel/core/net.cyr:142-217` — exposing them via syscall is the bite. Per [[project_agnos_kernel_growth_rules]] — narrow surface, not POSIX socket emulation.
-- [ ] `tcp_connect(dst_ip, dst_port, timeout_ms) → conn_id` / `tcp_send(conn_id, buf, len)` / `tcp_recv(conn_id, buf, maxlen, timeout_ms)` / `tcp_close(conn_id)` for DNS-over-TCP (`+tcp` flag, large responses). TCP client primitives also already exist in `net.cyr`; same exposure pattern as UDP.
-- [ ] Optional: source-port randomization for DNS (RFC 5452) — security mitigation against off-path cache-poisoning. May land at v0.2.x or defer to v0.4.x.
-- [ ] QEMU-side smoke: `qemu-dns-smoke.sh` boots kernel + queries a local DNS resolver running on the host (or SLIRP's built-in DNS at 10.0.2.3) for `example.com`, asserts an A-record comes back.
+- [x] Cyrius-native UDP-53 to userland — **landed agnos 1.45.3 as `udp_bind`#51 / `udp_send`#52 / `udp_recv`#53 / `udp_unbind`#54** (listener-id based, non-blocking; per-query bind/unbind reclaim). `src/platform_agnos.cyr` calls them via the cyrius ≥ 6.2.6 peer (`sys_udp_bind`/`sys_udp_send`/`sys_udp_recv`/`sys_udp_unbind`). Narrow surface, not POSIX socket emulation — per [[project_agnos_kernel_growth_rules]].
+- [x] TCP-53 client primitives — **landed agnos 1.45.1 as `sock_connect`#47 / `sock_send`#48 / `sock_recv`#49 / `sock_close`#50**. The kernel surface for DNS-over-TCP exists; wiring dig's `+tcp` path onto it is dig-side 0.4.x work (today `+tcp` is accepted-but-no-op).
+- [x] source-port randomization for DNS (RFC 5452) — entropy available (`getrandom`#45, agnos 1.45.0); `src/platform_agnos.cyr` binds a randomized ephemeral source port (49152..65535).
+- [x] QEMU smoke — covered by agnos `net-tool-smoke.sh` (a `NET_SELFTEST` execs `/bin/dig @10.0.2.3 example.com` → NOERROR A-record over the udp_bind→send→recv path).
 
 ### 0.3.x — dig MVP (basic A-record resolution) ✅ landed 2026-05-23
 
-**Unblocked via the per-backend sovereignty rule** — Linux backend uses POSIX `socket()` pragmatically, same posture as yo; AGNOS backend's no-POSIX requirement deferred to v1.0 gate. Original block on 0.2.x kernel syscall exposure stands for the AGNOS backend only.
+**Per-backend sovereignty rule** — the Linux backend uses POSIX `socket()` pragmatically, same posture as yo; the AGNOS backend (`src/platform_agnos.cyr`) uses the sovereign UDP-53 syscalls (#51-54) with no POSIX. The 0.2.x kernel-exposure block is cleared (landed agnos 1.45.3).
 
 - [x] `src/main.cyr` argument parsing — hand-rolled in `src/cli.cyr` (the BIND `@server` / `+flag` / positional shape doesn't fit `lib/flags.cyr`'s `--long` grammar). Flags: `+short` / `+noshort`, `+tcp` / `+notcp` (accepted, no-op until 0.4.x), `+timeout=N`, `+retry=N`, `+nodnssec` / `+dnssec` (accepted, no validation yet), `-h` / `--help`.
 - [x] DNS query packet construction per RFC 1035 § 4.1 — `src/dns.cyr:dns_build_query`. Random 16-bit query ID via `/dev/urandom`. RD bit set.
@@ -51,7 +51,7 @@ Ordered by dependency. Items further down depend on items earlier.
 
 ### 0.5.x — Iron validation + parity check
 
-**Blocked on**: r8169 RX-path 5-part bundle iron-validating at Attempt 97 (yo carries the same dependency).
+**Status**: the r8169 RX-path dependency cleared (solved 2026-05-25, 1.32.7, iron-validated). dig already resolves `example.com` end-to-end on agnos under QEMU (agnos `net-tool-smoke.sh`); the items below are the remaining real-iron (archaemenid) + parity runs.
 
 - [ ] First iron run: `dig example.com` on archaemenid against `192.168.1.1`. Expected: A record returned, query time < 50 ms.
 - [ ] First WAN run: `dig @8.8.8.8 google.com`. Expected: A + AAAA, query time in 10-50 ms range from a US residential connection.
@@ -114,6 +114,6 @@ Deliberate exclusions — keeps future contributors from adding to v1.0 by accid
 
 - **Substrate (extracted via dig)**: [taar (planned, dig is extraction trigger)](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/shared-crates.md).
 - **Sibling tools**: [yo (already scaffolded)](https://github.com/MacCracken/yo), [whirl (planned, post-taar-extraction)](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/shared-crates.md).
-- **Iron dependency**: [agnos r8169 RX-path 5-part bundle](https://github.com/MacCracken/agnosticos/blob/main/docs/development/r8169-rx-path-audit.md) — LAN-on-iron path unblocks when Attempt 97 validates.
+- **Iron dependency**: [agnos r8169 RX-path 5-part bundle](https://github.com/MacCracken/agnosticos/blob/main/docs/development/r8169-rx-path-audit.md) — **cleared** (r8169 RX solved 2026-05-25, 1.32.7, iron-validated). The LAN-on-iron path is unblocked; what remains is the actual archaemenid dig run.
 - **Kernel-growth posture**: AGNOS `state.md` + memory [[project_agnos_kernel_growth_rules]].
 - **Naming lane**: English-wordplay / trickster lane (cultural-reference path: Cyrus from The Warriors → Cyrius the language) per [[feedback_naming_lanes]] memory. Family: cmdrs, bnrmr, iam, hapi, kii, yo, **dig**, whirl.

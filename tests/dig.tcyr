@@ -9,7 +9,7 @@
 # cycle detection (security-critical: malicious responses must NOT
 # lock the parser), resolv.conf line parsing, RR parsing.
 
-include "src/ipv4.cyr"
+include "lib/taar.cyr"
 include "src/dns.cyr"
 include "src/platform.cyr"
 include "src/resolv.cyr"

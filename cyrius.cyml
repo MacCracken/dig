@@ -1,6 +1,6 @@
 [package]
 name = "dig"
-version = "0.3.2"
+version = "0.3.3"
 description = "dig — DNS resolver (sovereign Cyrius reimplementation of BIND dig)"
 license = "GPL-3.0-only"
 language = "cyrius"
@@ -13,4 +13,13 @@ output = "dig"
 
 [deps]
 stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "args", "flags"]
+
+# Network-probe substrate — the IPv4 codec dig shared byte-identically
+# with yo, extracted at the 0.3.3 / yo-0.5.5 fold. `path` drives local
+# dev resolution; `git`+`tag` is the published fallback.
+[deps.taar]
+git = "https://github.com/MacCracken/taar.git"
+path = "../taar"
+tag = "0.1.0"
+modules = ["dist/taar.cyr"]
 ---
