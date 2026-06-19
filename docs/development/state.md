@@ -2,7 +2,7 @@
 
 > **⚠ NOT A LOG.** Live state with pointers — current truth only. Per-release history → [`../../CHANGELOG.md`](../../CHANGELOG.md). Milestone path → [`roadmap.md`](roadmap.md).
 >
-> **Last refresh**: 2026-05-23 (0.3.0 MVP cut).
+> **Last refresh**: 2026-06-19 (0.3.4 — toolchain 6.2.24 + taar 0.3.0 dep bump).
 
 ---
 
@@ -10,11 +10,12 @@
 
 | Field | Value |
 |---|---|
-| Current version | **0.3.0** (MVP — first end-to-end resolution) |
+| Current version | **0.3.4** (MVP line; toolchain + taar dep refresh) |
 | Status | MVP shipping. Real DNS queries fly against arbitrary resolvers; 9 RR types parse. |
 | Build size | ~103 KB (8 modules wired; DCE-disabled — `CYRIUS_DCE=1` trims ~58 KB unreachable stdlib) |
 | Module footprint | 8 src/ modules, 1410 lines (cli 278, dns 327, output 232, main 165, platform_linux 130, resolv 124, query 71, ipv4 59, platform 13) |
-| Cyrius pin | 6.0.1 |
+| Cyrius pin | 6.2.24 |
+| taar dep | `[deps.taar]` tag **0.3.0** (`dist/taar.cyr`) — dig consumes the `ipv4` codec; taar's socket/dns modules ride along unreachable |
 | Tests | 70 assertions in `tests/dig.tcyr` covering ipv4, query construction byte layout, name encode/decode, **name-compression cycle detection** (security-critical), header accessors, resolv.conf parsing, RR parsing, TC-bit detection |
 | Iron-validation host | archaemenid (Beelink SER, AMD) — same machine as the agnosticos iron-burn surface |
 | Family position | Second entry in network-tools family (after yo) — **`taar` extraction trigger FIRED 2026-06-15** (shared `ipv4` codec folded at dig 0.3.3 / yo 0.5.5) |

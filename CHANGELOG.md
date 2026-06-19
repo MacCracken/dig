@@ -4,6 +4,22 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.4] — 2026-06-19 (toolchain 6.2.24 + taar 0.3.0)
+
+### Changed
+- **Toolchain pin 6.2.6 → 6.2.24** (`cyrius.cyml [package].cyrius`). Resolves the
+  wrapper/manifest drift (the installed wrapper was already 6.2.24); CI derives the
+  install version straight from the pin.
+- **`[deps.taar]` tag 0.1.0 → 0.3.0.** taar grew its `socket` + `dns` modules at
+  0.2.0/0.3.0 (the `whirl` extraction) and gained the AGNOS `#ifdef` socket backend.
+  dig still consumes only the `ipv4` codec from the bundle — the added `taar_*`
+  socket/dns symbols compile in but are unreachable (DCE-eliminable), so the binary
+  surface is unchanged.
+
+### Notes
+- Host + `--agnos` both build clean; **70/70 tests** green. Pure dep/pin bump — no
+  source change, so the 0.3.2 end-to-end resolution result stands.
+
 ## [0.3.3] — 2026-06-15 (fold onto taar — IPv4 codec extracted)
 
 ### Changed
