@@ -4,6 +4,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.5] — 2026-06-23
+
+### Changed
+- **AGNOS resolver discovery prefers the kernel-leased DNS server** (`src/resolv.cyr`
+  `resolv_discover` + `src/platform_agnos.cyr` `platform_dns_server`). On agnos,
+  `resolv_discover` now calls the new **`net_config(3)`#61** syscall first (the DHCP
+  option-6 on-subnet resolver) and uses it when `> 0`, before `/etc/resolv.conf` and
+  the `8.8.8.8` fallback. **Only affects bare `dig <host>`** (no `@server`) — the
+  explicit `@server` path is unchanged. The off-subnet `8.8.8.8` fallback needs working
+  gateway routing the kernel can't guarantee on real iron (the same gap that froze
+  `yo`/`whirl` on archaemenid; `resolv_discover` went straight to 8.8.8.8 — the
+  `RESOLV_FALLBACK_GATEWAY` 192.168.1.1 constant was documented but unused). Linux's
+  `platform_dns_server` returns `0`, so the resolv.conf path is unchanged there. Interim
+  raw `syscall(61, 3)`. **Requires agnos ≥ 1.45.16.**
+- **`taar` dep 0.3.0 → 0.3.1** — regenerated `dist/taar.cyr` bundle; dig still consumes
+  only the `ipv4_*` codec (the new modules DCE out of dig's binary).
+
 ## [0.3.4] — 2026-06-19 (toolchain 6.2.24 + taar 0.3.0)
 
 ### Changed

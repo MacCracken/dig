@@ -94,6 +94,10 @@ fn platform_read_file(path, buf, maxlen): i64 {
     return n;
 }
 
+# Linux has no kernel-provided resolver to query — discovery uses /etc/resolv.conf.
+# Return 0 so resolv_discover falls through to the file (then the public fallback).
+fn platform_dns_server(): i64 { return 0; }
+
 # Read 2 bytes from /dev/urandom and return them as a u16. Used to
 # generate DNS query IDs — RFC 5452 calls for randomness here as a
 # cache-poisoning mitigation. Falls back to a clock-derived value if

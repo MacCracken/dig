@@ -111,9 +111,16 @@ fn resolv_parse(buf, len): i64 {
 
 # Top-level discovery wrapper. Reads /etc/resolv.conf via the platform
 # shim; on any failure (file missing, no nameserver line), falls back
-# to RESOLV_FALLBACK_GATEWAY then RESOLV_FALLBACK_PUBLIC. Caller can
-# override entirely via the `@server` CLI arg before this is called.
+# to RESOLV_FALLBACK_PUBLIC (8.8.8.8). Caller can override entirely via the
+# `@server` CLI arg before this is called. On AGNOS the DHCP-leased on-subnet
+# resolver (net_config#61, via platform_dns_server) is preferred FIRST — the
+# 8.8.8.8 fallback is off-subnet and needs working gateway routing the kernel
+# can't guarantee on real iron (it froze bare-hostname net tools on archaemenid);
+# the leased resolver is on-subnet + directly reachable. Linux's platform_dns_server
+# returns 0, so the resolv.conf path is unchanged there.
 fn resolv_discover(): i64 {
+    var ksrv = platform_dns_server();
+    if (ksrv > 0) { return ksrv; }
     var buf = alloc(4096);
     var n = platform_read_file("/etc/resolv.conf", buf, 4096);
     if (n > 0) {
