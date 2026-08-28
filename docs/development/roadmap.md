@@ -1,6 +1,6 @@
 # dig — Roadmap
 
-> **Status**: Active | **Last Updated**: 2026-08-27 (0.3.6 — taar version references refreshed)
+> **Status**: Active | **Last Updated**: 2026-08-28 (0.3.7 — post-audit revisit)
 >
 > Milestone path from scaffold (0.1.0) through v1.0 (full BIND `dig` parity + LAN-on-iron + `taar` extraction trigger fired). Per first-party-documentation roadmap shape: **Completed** / **Backlog** / **Future** / **v1.0 criteria**.
 >
@@ -14,6 +14,7 @@
 |---|---|---|
 | **0.1.0** | 2026-05-23 | Initial `cyrius init` scaffold. README + CLAUDE.md + LICENSE + CHANGELOG + cyrius.cyml + tests/dig.{tcyr,bcyr,fcyr} + `.github/workflows/{ci,release}.yml`. Stub `main.cyr` prints `hello from dig`. Stdlib vendored in `lib/` (81 modules incl. `net.cyr`). |
 | **0.3.0** | 2026-05-23 | **dig MVP — first end-to-end resolution.** Real UDP queries against arbitrary resolvers; A / AAAA / MX / NS / CNAME / SOA / PTR / TXT / SRV parsed; BIND-shape + `+short` output. 8 src/ modules (cli, dns, ipv4, output, platform/platform_linux, query, resolv) totaling 1410 LOC. 70 test assertions including name-compression cycle detection. Per-backend sovereignty posture: pragmatic POSIX on Linux, AGNOS backend deferred to v1.0 gate (same as yo). At the time, 0.2.x kernel UDP-53 syscall exposure was still pending (the Linux-backend-first bypass kept momentum); that surface has since landed (agnos 1.45.3, #51-54) and the AGNOS backend now resolves end-to-end. |
+| **0.3.7** | 2026-08-28 | **P-1 audit / hardening sweep.** Repaired the aarch64 wrong-syscall defect (`platform_linux.cyr` hardcoded an x86_64 table used on every non-AGNOS target), the `+timeout=0` infinite hang, the silently-discarded unknown record type, and a walkable integer-overflow guard. Hardened the reply path: connected UDP socket, RFC 5452 §9.1 question matching, per-attempt query IDs, fail-closed entropy, and junk datagrams no longer consuming retries. Adopted `[deps.cmdit]` 1.2.4 and dropped the never-referenced stdlib `flags`. 70 → 102 assertions, all four repairs mutation-checked. `cyrius audit` green on all four dimensions for the first time. |
 
 ---
 
@@ -40,6 +41,35 @@ Ordered by dependency. Items further down depend on items earlier.
 - [x] Name compression decoding (RFC 1035 § 4.1.4) — `dns_decode_name` + `dns_skip_name`. **Cycle-detection guard**: pointers must aim backward + hop budget `NAME_DECODE_MAX_HOPS=32`. Self-pointer, forward-pointer, out-of-bounds-pointer, oversized-label all rejected (verified in `tests/dig.tcyr`).
 - [x] Default resolver discovery — `src/resolv.cyr` reads `/etc/resolv.conf`, falls back to `8.8.8.8`. User overrides via `@server`.
 - [x] BIND-shape output — `src/output.cyr`. Full header + `;; ->>HEADER<<-` + `;; QUESTION` + `;; ANSWER` + `;; Query time: N ms · server: X · proto: udp` footer. `+short` mode prints bare rdata.
+
+### 0.3.8 — the rest of the 0.3.6 audit
+
+The 0.3.7 sweep ran eight lenses over the tree and confirmed **61** findings
+against adversarial refutation (0 refuted). Both P1s and the highest-value P2s
+landed in 0.3.7. These are the remainder — recorded so they are a backlog rather
+than a thing everyone forgets was found. None is a feature; all are repairs on
+the existing surface.
+
+**Rendering / correctness — `src/output.cyr`, `src/dns.cyr`**
+- [ ] **Propagate `output_print_rdata`'s error.** 13 validation failures return `-1`; both callers discard it and print `\n` anyway. An A record with `rdlength=5` prints an empty rdata field and **exits 0** — in `+short` that is a bare blank line, so `ip=$(dig +short host)` yields `""` and the caller is told it succeeded. Four types (MX/SRV/SOA/TXT) also partially emit before rejecting, so validation must move ahead of the first write.
+- [ ] **Bound rdata-embedded names by RDLENGTH, not `msg_len`.** Memory-safe (`dns_parse_rr` caps `rdata + rdlen`), but a name is read out of the *next* record's bytes and printed as this record's authoritative content with a success return. Proven on all six arms: `NS rdlen=0` renders a neighbouring name, rc=0. This violates the contract stated three lines above the accessor in `dns.cyr`.
+- [ ] **`dns_skip_name` needs the 255-byte cap `dns_decode_name` has.** It enforces label ≤ 63, the hop budget and the backward-pointer rule, but not total name length.
+- [ ] **AAAA rendering is not RFC 5952** — no zero-run suppression, no `::`. The code comments already admit it.
+- [ ] Unknown-type hex dump is not injective; answer line hardcodes class `IN`; question line doubles the dot on an FQDN; RCODEs 6-15 print `RCODE?`.
+
+**Semantics — `src/main.cyr`, `src/cli.cyr`, `src/resolv.cyr`**
+- [ ] **NXDOMAIN and NODATA exit 9; BIND exits 0.** A script asking "does this name exist" cannot distinguish "no" from "the resolver broke".
+- [ ] **The root zone `.` cannot be queried**, and name-encode failures are reported as network faults.
+- [ ] `@0.0.0.0` exits 2 with no message at all. `resolv_parse` accepts `0.0.0.0` and aborts the scan. A CRLF `/etc/resolv.conf` silently falls through to `8.8.8.8`. A `resolv.conf` over 4096 bytes is silently truncated. The public fallback is silent, and the fallback chain the docs describe does not exist in the code.
+- [ ] **Per-recv timeout is armed with the full budget**, so the worst case is 2x the documented ceiling.
+- [ ] Partial answers lose their footer and their counts.
+
+**Coverage**
+- [ ] **`tests/dig.fcyr` is a stub** — `if (len == 0) { return 0; } return 0;`. It is described in the v1.0 criteria as the fuzz harness for the response-frame parser, "the security-critical path". Given that this cut found two P1s in exactly that path by hand, a real harness is the highest-value test work available.
+- [ ] `output.cyr` (0/8 fns), `query.cyr` (0/1) and `platform_*.cyr` (0/10) have no direct coverage.
+- [ ] Dead code to remove: `RESOLV_FALLBACK_GATEWAY`, `_dig_streq_ci`, the `+72 type_seen` slot, `dns_rr_class`, `dns_rr_rdlength` — all with zero production readers.
+
+---
 
 ### 0.4.x — Full record-type coverage + advanced flags
 
@@ -86,16 +116,35 @@ Lower priority. Item shape pinned for orientation; specific versions TBD.
 
 ## v1.0 criteria (release gate)
 
+### 0.7.x — Host-target parity (the `platform.cyr` deferral, pulled in)
+
+**Pulled onto the roadmap 2026-08-28**, out of "Out of scope". `src/platform.cyr` had carried a bare `Windows / macOS branches still TODO` since the 2026-06-14 AGNOS breakout, with the roadmap simultaneously declaring those targets excluded — the code said "planned", the plan said "no". The code was right: the stdlib has since grown the macOS and Windows peers dig was waiting on, so the reason for the exclusion has expired.
+
+The 0.3.6 audit found the deferral is not merely a missing feature — **dig's build succeeds on targets it cannot actually run**, which is the more urgent half:
+
+- [x] **`--aarch64` produced a wrong binary and reported OK — FIXED in 0.3.7.** `src/platform_linux.cyr` hardcoded an x86_64 syscall table (`_LX_SYS_*`) while `platform.cyr` selects the Linux backend for *every* non-AGNOS target. On aarch64 those numbers mean unrelated calls — `read` 0 is `io_setup`, `close` 3 is `io_submit`, `sendto` 44 is `fstatfs`, and `nanosleep` **35 is `unlinkat`**, which the retry backoff invoked on every retry. Verified rather than reasoned: the 0.3.6 aarch64 build answers "no servers could be reached" under `qemu-aarch64`; the 0.3.7 build resolves.
+
+  Repaired by moving to the stdlib's arch-dispatched wrappers. **One correction to the original diagnosis**, worth recording because it shaped the fix: `SYS_SENDTO` / `SYS_NANOSLEEP` / `SYS_CLOCK_GETTIME` do **not** exist as per-arch constants — the stdlib names none of the three, on either arch. `sendto` was avoided entirely by switching to connect-then-write (taar's pattern, which also closes an off-path spoofing hole); `clock_gettime` and `nanosleep` remain arch-guarded literals in dig. **That stdlib gap is worth filing upstream against cyrius** — every consumer that needs a monotonic clock or a sleep on Linux currently has to hardcode, and `lib/chrono.cyr` itself hardcodes x86_64's 228, so the toolchain has the same latent bug dig just fixed.
+- [ ] **`--win` warns `undefined function 'sys_recvfrom'` / `'sys_openat'` and still exits OK** (still true at 0.3.7 — only the aarch64 half was in scope for that cut). Decide the contract: either `src/platform_windows.cyr` implements the nine-function `platform_*` surface over Winsock, or the build refuses the target outright. Silently emitting an unusable binary is the one option to rule out.
+- [ ] `src/platform_macos.cyr` — the nine-function surface over the BSD socket syscalls. Check first whether `lib/syscalls_macos.cyr` actually exposes `socket`/`sendto`/`recvfrom`; at the 6.5.35 snapshot it does **not**, so this is gated on a cyrius-side addition and should be filed there rather than worked around locally.
+- [ ] Add the buildable targets to CI. The 0.3.6 sweep found nothing in `.github/workflows/ci.yml` compiles any target but host x86_64 — the AGNOS arm is a headline feature and CI has never built it. Every target dig claims should be compiled in CI, and the ones with executable coverage should be run.
+- [ ] Only once a target builds *and* runs should it be claimed in README's feature table.
+
+**Sequencing note**: the aarch64 repair is 0.3.7 because it is a live wrong-syscall bug on a target the toolchain will happily build today. The macOS and Windows branches are genuine ports and stay here.
+
+---
+
 Ship 1.0 when all of these are true. Pre-1.0 minor cycles can land partial subsets; the v1.0 tag is the all-of-these gate.
 
 - [ ] **Feature parity with BIND `dig`**: A / AAAA / MX / TXT / NS / CNAME / SOA / SRV / PTR / DNSKEY / RRSIG / DS / NSEC / NSEC3, `+short` / `+trace` / `+tcp` / `+dnssec` / `+timeout` / `+retry`, IPv4 + IPv6 transport, EDNS(0).
 - [ ] **`taar` extracted** as a separate repo — STARTED (taar **0.5.0**; `dig` depends on it via `[deps.taar]`; the `ipv4` codec is lifted out, not vendored). Remaining for v1.0: dig's `dns`/socket primitives also live in `taar` rather than locally — see the 0.6.x note above on why this is now a migration decision rather than an extraction.
 - [ ] **LAN-on-iron validated** on archaemenid against the home gateway resolver (`192.168.1.1`) and at least one public resolver (`8.8.8.8`, `1.1.1.1`).
-- [ ] **QEMU validated** via `scripts/qemu-smoke.sh` — boots a kernel with dig in the initrd, queries SLIRP's built-in DNS at `10.0.2.3` for `example.com`, asserts an A-record comes back.
-- [ ] **No POSIX `socket()`** anywhere in `dig` or `taar`. Sovereign kernel primitives only. Audit pass per [first-party-standards § Security Hardening](https://github.com/MacCracken/agnosticos/blob/main/docs/development/first-party/first-party-standards.md#security-hardening-required-before-every-release).
-- [ ] **Tests**: `scripts/test.sh` ≥ 40 assertions covering arg parsing, every RR-type parse path, name-compression cycle detection, EDNS(0) edge cases. `tests/dig.fcyr` fuzz harness for the response-frame parser (the security-critical path — DNS responses are the classic supply-chain compromise vector). `tests/dig.bcyr` benchmark vs BIND's `dig`.
-- [ ] **Docs**: ADR for the resolver-discovery decision (`/etc/resolv.conf` vs hardcoded fallback vs runtime config), architecture note for the name-compression cycle-detection invariant, guide for the DNSSEC trust-anchor workflow.
+- [x] **QEMU validated** via agnos's `scripts/net-tool-smoke.sh` — boots a kernel with dig in the initrd, queries SLIRP's built-in DNS at `10.0.2.3` for `example.com`, asserts an A-record comes back. (This criterion named a `scripts/qemu-smoke.sh` that has never existed in this repo; the gate is real and green, it just lives in agnos. Corrected 0.3.7.)
+- [ ] **No POSIX `socket()`** on the **AGNOS backend** of `dig` or `taar` — already true for both, and re-verified at 0.3.7. The blanket "anywhere in dig or taar" reading was never the actual rule: `src/platform_linux.cyr` is the deliberate pragmatic-POSIX arm and the per-backend posture is what CLAUDE.md and state.md have always said. What v1.0 gates is that the AGNOS arm stays sovereign. Sovereign kernel primitives only, there. Audit pass per [first-party-standards § Security Hardening](https://github.com/MacCracken/agnosticos/blob/main/docs/development/first-party/first-party-standards.md#security-hardening-required-before-every-release).
+- [ ] **Tests**: `tests/dig.tcyr` via `cyrius test` — the ≥ 40-assertion floor is long cleared (**102** at 0.3.7), so what remains is coverage, not count: every RR-type parse path and EDNS(0) edge cases are still untested. (This criterion named a `scripts/test.sh` that has never existed; corrected 0.3.7.) `tests/dig.fcyr` fuzz harness for the response-frame parser (the security-critical path — DNS responses are the classic supply-chain compromise vector). `tests/dig.bcyr` benchmark vs BIND's `dig`.
+- [ ] **Docs**: ADR for the resolver-discovery decision (`/etc/resolv.conf` vs hardcoded fallback vs runtime config) — the material now exists and is scattered across `src/platform_agnos.cyr`'s header and three CHANGELOG entries (0.3.5 kernel-leased preference, 0.3.6 wrapper move, 0.3.7 hardening); it needs writing down, not deciding. Architecture note for the name-compression cycle-detection invariant **and** the RFC 5452 reply-acceptance chain added at 0.3.7 (ID + QR + question + connected socket — four checks whose interaction is the actual security property). Guide for the DNSSEC trust-anchor workflow. `docs/adr/` and `docs/architecture/` are both still empty placeholders.
 - [ ] **CI green**: `.github/workflows/{ci,release}.yml` both green on the v1.0 candidate commit. Release workflow auto-uploads `build/dig` to the GitHub release.
+- [ ] **CI builds every target dig claims.** Today it compiles host x86_64 only — the AGNOS arm is a headline feature that CI has never built, and the aarch64 defect 0.3.7 fixed would have been caught years earlier by a build job. taar added exactly this gate at its 0.5.0. See § 0.7.x.
 
 ---
 
@@ -106,7 +155,6 @@ Deliberate exclusions — keeps future contributors from adding to v1.0 by accid
 - **Authoritative-server mode** — `dig` is a resolver client, not a server. The AGNOS authoritative-DNS-server, if/when it lands, will be a separate repo with its own naming-lane decision.
 - **Caching resolver mode** — same lane separation. dig is one-shot query-and-print; the local-caching-resolver concern (Unbound-equivalent) is separate.
 - **GUI / TUI front-end** — dig is CLI-only.
-- **Windows / macOS host targets** — dig targets the AGNOS kernel + the Cyrius cross-platform stdlib. macOS / Windows ports defer to when the broader Cyrius stdlib gains those targets at parity.
 
 ---
 

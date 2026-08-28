@@ -12,7 +12,12 @@ test = "src/test.cyr"
 output = "dig"
 
 [deps]
-stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "args", "flags"]
+# "flags" was declared at 0.3.0 for "CLI parsing" and never referenced by a
+# single line of dig — cli.cyr was hand-rolled precisely because lib/flags.cyr's
+# --long grammar does not fit BIND's `@server` / `+flag` shape. Dropped at 0.3.7
+# when [deps.cmdit] took over the getopt-shaped surface, same move kii made at
+# its v1.1.0. "args" stays: cmdit_argv / cmdit_parse call args_init/argc/argv.
+stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "args"]
 
 # Network-probe substrate — the IPv4 codec dig shared byte-identically
 # with yo, extracted at the 0.3.3 / yo-0.5.5 fold. dig consumes taar only
@@ -21,6 +26,19 @@ stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "b
 # the AGNOS recv-timeout/close split — both on taar's own DNS path, which
 # dig does not call, so its surface here is unchanged from 0.3.1.
 # `path` drives local dev resolution; `git`+`tag` is the published fallback.
+# CLI substrate. dig's grammar is BIND's, not getopt-long — `@server` and
+# `+flag` are hand-tokenized in src/cli.cyr and stay that way; cmdit's own docs
+# name dig as the case its `cmdit_raw_argv` escape hatch exists for. What cmdit
+# owns here is everything AROUND the tokenizer: --help/-h, --version/-V (which
+# dig simply did not have before 0.3.7), and the 0/1/2 exit convention as named
+# constants. That kills the hand-written-help drift class rather than any
+# parsing work.
+[deps.cmdit]
+git = "https://github.com/MacCracken/cmdit.git"
+path = "../cmdit"
+tag = "1.2.4"
+modules = ["dist/cmdit.cyr"]
+
 [deps.taar]
 git = "https://github.com/MacCracken/taar.git"
 path = "../taar"

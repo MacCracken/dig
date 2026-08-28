@@ -22,48 +22,86 @@ var QRY_SOCKET  = 3;
 
 var DNS_PORT = 53;
 
+# Build a query for `name`/`qtype`, send it to `server_addr` over UDP-53, and
+# wait for a reply — retrying up to `retry` ATTEMPTS with a `timeout_s` deadline
+# on each. On success, writes the reply into `rx` (capacity `rx_cap` bytes),
+# stores the received length through `resp_len` and the round-trip time in
+# microseconds through `query_us`.
+#
+# Returns QRY_OK, or QRY_TIMEOUT (no reply within the budget), QRY_BAD (a reply
+# arrived but failed validation) or QRY_SOCKET (the transport itself failed).
+#
+# `*resp_len` is the authoritative length for every downstream parse — pass it,
+# not `rx_cap`, to `dns_parse_rr` and friends, or a short reply will be parsed
+# against stale buffer contents.
 fn query_send_recv(server_addr, name, qtype, timeout_s, retry, rx, rx_cap, resp_len, query_us): i64 {
     var fd = platform_udp_open();
     if (fd < 0) { return QRY_SOCKET; }
-    platform_set_recv_timeout_ms(fd, timeout_s * 1000);
 
-    var tx = alloc(DNS_MAX_UDP_PAYLOAD);
-    var id = platform_random_u16();
-    var tx_len = dns_build_query(tx, id, name, qtype);
-    if (tx_len == 0) {
+    # An unchecked failure here means an unbounded recv — the process would hang
+    # with no way out but a signal. Treat it as a transport failure.
+    if (platform_set_recv_timeout_ms(fd, timeout_s * 1000) < 0) {
         platform_close(fd);
-        return QRY_BAD;
+        return QRY_SOCKET;
     }
 
+    var tx = alloc(DNS_MAX_UDP_PAYLOAD);
     var tries = 0;
     if (retry < 1) { retry = 1; }
+
     while (tries < retry) {
+        tries = tries + 1;
+
+        # A FRESH query ID per attempt (RFC 5452 §9). Reusing one ID across
+        # retries would hand an off-path attacker a second and third guess at
+        # the same 16 bits on the same ephemeral port.
+        var id = platform_random_u16();
+        # Entropy failure is fatal, never fall back to a guessable ID: a
+        # predictable query ID is the whole cache-poisoning problem.
+        if (id < 0) {
+            platform_close(fd);
+            return QRY_SOCKET;
+        }
+
+        var tx_len = dns_build_query(tx, id, name, qtype);
+        # A name we cannot encode will not encode on the next try either.
+        if (tx_len == 0) {
+            platform_close(fd);
+            return QRY_BAD;
+        }
+
         var t0 = platform_now_us();
-        var sent = platform_udp_send_to(fd, server_addr, DNS_PORT, tx, tx_len);
-        if (sent < 0) {
-            tries = tries + 1;
+        if (platform_udp_send_to(fd, server_addr, DNS_PORT, tx, tx_len) < 0) {
             continue;
         }
-        var n = platform_udp_recv(fd, rx, rx_cap);
-        var t1 = platform_now_us();
-        if (n < DNS_HEADER_LEN) {
-            tries = tries + 1;
-            continue;
+
+        # Keep reading until this attempt's deadline, rather than treating one
+        # unacceptable datagram as a failed attempt. Through 0.3.6 a rejected
+        # reply consumed a retry AND re-sent immediately, so anyone who could
+        # spray junk at the socket burned the whole retry budget in microseconds
+        # and dig reported "connection timed out". Now junk costs the attacker a
+        # packet and costs dig one loop iteration.
+        var deadline = t0 + timeout_s * 1000000;
+        while (platform_now_us() < deadline) {
+            var n = platform_udp_recv(fd, rx, rx_cap);
+            # Deadline expired inside the kernel — this attempt is over.
+            if (n == PLATFORM_ERR_TIMEOUT) { break; }
+            # Any other transport error ends the attempt too.
+            if (n < 0) { break; }
+            # Runt: too short to even hold a header.
+            if (n < DNS_HEADER_LEN) { continue; }
+            # Must echo the ID we just sent.
+            if (dns_hdr_id(rx) != id) { continue; }
+            # Must be a response, not a query.
+            if ((dns_hdr_flags(rx) & DNS_FLAG_QR) == 0) { continue; }
+            # Must answer the question we actually asked (RFC 5452 §9.1).
+            if (dns_question_matches(rx, n, name, qtype) == 0) { continue; }
+
+            store64(resp_len, n);
+            store64(query_us, platform_now_us() - t0);
+            platform_close(fd);
+            return QRY_OK;
         }
-        # Guard against off-path injection: query ID must echo.
-        if (dns_hdr_id(rx) != id) {
-            tries = tries + 1;
-            continue;
-        }
-        # QR bit must be set (it's a response, not a query).
-        if ((dns_hdr_flags(rx) & DNS_FLAG_QR) == 0) {
-            tries = tries + 1;
-            continue;
-        }
-        store64(resp_len, n);
-        store64(query_us, t1 - t0);
-        platform_close(fd);
-        return QRY_OK;
     }
 
     platform_close(fd);

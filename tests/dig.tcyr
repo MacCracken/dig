@@ -84,6 +84,7 @@ fn test_dns_name_encode() {
 
 # === DNS name decoder (no compression) ===
 fn test_dns_name_decode_simple() {
+    var dnl[8];
     test_group("dns_name_decode_simple");
     # Hand-craft a minimal DNS message containing the encoded name
     # at offset 12. Header bytes are zeroed.
@@ -99,7 +100,7 @@ fn test_dns_name_decode_simple() {
     store8(&msg + 24, 0);
 
     var out[256];
-    var next = dns_decode_name(&msg, 64, 12, &out);
+    var next = dns_decode_name(&msg, 64, 12, &out, &dnl);
     assert_eq(next, 25, "next offset past name");
     assert_eq(load8(&out),     101, "decoded[0] = 'e'");
     assert_eq(load8(&out + 7), 46,  "decoded[7] = '.'");
@@ -110,6 +111,7 @@ fn test_dns_name_decode_simple() {
 
 # === Name compression with pointer (legitimate, backward) ===
 fn test_dns_name_decode_pointer() {
+    var dnl[8];
     test_group("dns_name_decode_pointer");
     # Encode "com" at off 12 (4 bytes: 03 c o m 00).
     # Encode "www" + ptr-to-12 at off 17 (1+3 + 2 = 6 bytes).
@@ -124,7 +126,7 @@ fn test_dns_name_decode_pointer() {
     store8(&msg + 22, 12);      # offset 12
 
     var out[256];
-    var next = dns_decode_name(&msg, 64, 17, &out);
+    var next = dns_decode_name(&msg, 64, 17, &out, &dnl);
     assert_eq(next, 23, "next offset past pointer");
     # "www.com" = 119 119 119 46 99 111 109 0
     assert_eq(load8(&out),     119, "decoded[0] = 'w'");
@@ -139,6 +141,7 @@ fn test_dns_name_decode_pointer() {
 # loop forever. We require: pointer must aim BACKWARD, and we
 # bound hops at NAME_DECODE_MAX_HOPS.
 fn test_dns_name_decode_pointer_cycle() {
+    var dnl[8];
     test_group("dns_name_decode_cycle");
     var msg[64];
     memset(&msg, 0, 64);
@@ -147,7 +150,7 @@ fn test_dns_name_decode_pointer_cycle() {
     store8(&msg + 13, 12);
 
     var out[256];
-    var next = dns_decode_name(&msg, 64, 12, &out);
+    var next = dns_decode_name(&msg, 64, 12, &out, &dnl);
     assert_eq(next, 0, "self-pointer rejected (no hang, returns 0)");
 
     # Forward pointer (off 20 → off 30): must also be rejected since
@@ -155,7 +158,7 @@ fn test_dns_name_decode_pointer_cycle() {
     memset(&msg, 0, 64);
     store8(&msg + 20, 0xC0);
     store8(&msg + 21, 30);
-    var next2 = dns_decode_name(&msg, 64, 20, &out);
+    var next2 = dns_decode_name(&msg, 64, 20, &out, &dnl);
     assert_eq(next2, 0, "forward pointer rejected");
 
     return 0;
@@ -163,25 +166,27 @@ fn test_dns_name_decode_pointer_cycle() {
 
 # === Pointer offset out of bounds ===
 fn test_dns_name_decode_pointer_oob() {
+    var dnl[8];
     test_group("dns_name_decode_oob");
     var msg[32];
     memset(&msg, 0, 32);
     store8(&msg + 12, 0xC0);
     store8(&msg + 13, 200);    # offset 200 is past msg_len 32
     var out[256];
-    var next = dns_decode_name(&msg, 32, 12, &out);
+    var next = dns_decode_name(&msg, 32, 12, &out, &dnl);
     assert_eq(next, 0, "out-of-bounds pointer rejected");
     return 0;
 }
 
 # === Label too long ===
 fn test_dns_name_decode_oversized_label() {
+    var dnl[8];
     test_group("dns_name_decode_oversize");
     var msg[128];
     memset(&msg, 0, 128);
     store8(&msg + 12, 64);    # > 63 — but not a pointer (top bits clear)
     var out[256];
-    var next = dns_decode_name(&msg, 128, 12, &out);
+    var next = dns_decode_name(&msg, 128, 12, &out, &dnl);
     assert_eq(next, 0, "label > 63 rejected");
     return 0;
 }
@@ -269,6 +274,226 @@ fn test_dns_parse_a_response() {
     return 0;
 }
 
+
+
+# === RFC 1035 §5.1 presentation escaping (0.3.7) ===
+#
+# Labels and TXT character-strings are arbitrary octet runs on the wire. Before
+# 0.3.7 they went to stdout raw, so a TXT record carrying CR + ESC [ 2 K erased
+# the line dig had just printed and repainted a forged one — no spoofing needed,
+# only a zone the attacker controls.
+fn _esc_eq(src, n, esc_space, want, want_len, msg) {
+    var eb[1024];
+    var w = _esc_to_buf(&eb, 1024, src, n, esc_space);
+    assert_eq(w, want_len, msg);
+    var i = 0;
+    var ok = 1;
+    while (i < want_len) {
+        if (load8(&eb + i) != load8(want + i)) { ok = 0; }
+        i = i + 1;
+    }
+    assert_eq(ok, 1, msg);
+    return 0;
+}
+
+fn test_output_escaping() {
+    test_group("output_escaping");
+    var b[16];
+
+    # All-printable input must be byte-identical to before — no regression.
+    _esc_eq("a.com", 5, 1, "a.com", 5, "printable passes through unchanged");
+
+    # ESC (0x1B) — the terminal-control byte. \027 decimal, zero-padded to 3.
+    store8(&b, 27);
+    _esc_eq(&b, 1, 1, "\\027", 4, "ESC escapes to backslash-027");
+
+    # CR (0x0D) — the carriage return that made the repaint attack work.
+    store8(&b, 13);
+    _esc_eq(&b, 1, 1, "\\013", 4, "CR escapes to backslash-013");
+
+    # LF (0x0A) — forges an extra line in +short, which scripts word-split.
+    store8(&b, 10);
+    _esc_eq(&b, 1, 1, "\\010", 4, "LF escapes to backslash-010");
+
+    # BEL (0x07) — proves the padding is three digits, not one.
+    store8(&b, 7);
+    _esc_eq(&b, 1, 1, "\\007", 4, "BEL zero-pads to three digits");
+
+    # NUL — legal in a label (RFC 4343). The old strlen sink truncated the whole
+    # name here, so `safe.com\0.evil.tld` displayed as `safe.com`.
+    store8(&b, 97); store8(&b + 1, 0); store8(&b + 2, 98);
+    _esc_eq(&b, 3, 1, "a\\000b", 6, "embedded NUL escapes, does not truncate");
+
+    # Backslash doubles; quote escapes (a raw quote would break TXT delimiting).
+    store8(&b, 92);
+    _esc_eq(&b, 1, 1, "\\\\", 2, "backslash doubles");
+    store8(&b, 34);
+    _esc_eq(&b, 1, 0, "\\\"", 2, "quote escapes inside TXT");
+
+    # High-bit / DEL.
+    store8(&b, 255);
+    _esc_eq(&b, 1, 1, "\\255", 4, "high-bit byte escapes");
+    store8(&b, 127);
+    _esc_eq(&b, 1, 1, "\\127", 4, "DEL escapes");
+
+    # Space is context-dependent: escaped in an unquoted name, literal in TXT
+    # where the quotes already delimit (BIND prints `v=spf1 -all`).
+    store8(&b, 32);
+    _esc_eq(&b, 1, 1, "\\032", 4, "space escapes in a name");
+    _esc_eq(&b, 1, 0, " ", 1, "space stays literal inside TXT");
+
+    # Refuses rather than truncating when the escape would not fit.
+    var eb2[8];
+    store8(&b, 27); store8(&b + 1, 27); store8(&b + 2, 27);
+    assert_eq(_esc_to_buf(&eb2, 8, &b, 3, 1), 0 - 1, "over-long escape refused, not truncated");
+    assert_eq(_esc_to_buf(&eb2, 8, &b, 2, 1), 8, "exactly-fitting escape accepted");
+    return 0;
+}
+
+# === RFC 5452 §9.1 question matching (0.3.7 anti-spoof) ===
+#
+# Through 0.3.6 the ONLY reply checks were the 16-bit ID and the QR bit, so an
+# off-path attacker who guessed the ID could return an answer for a DIFFERENT
+# name and dig would print it. Every rejection below is a datagram that used to
+# be accepted.
+fn _tq_build(msg, qdcount, qtype, qclass) {
+    # Header + question "a.com" at offset 12. Caller varies the tail fields.
+    memset(msg, 0, 64);
+    store8(msg + 4, 0); store8(msg + 5, qdcount);
+    store8(msg + 12, 1); store8(msg + 13, 97);                     # "a"
+    store8(msg + 14, 3); store8(msg + 15, 99);
+    store8(msg + 16, 111); store8(msg + 17, 109);                  # "com"
+    store8(msg + 18, 0);                                           # root
+    store8(msg + 19, (qtype >> 8) & 0xFF);  store8(msg + 20, qtype & 0xFF);
+    store8(msg + 21, (qclass >> 8) & 0xFF); store8(msg + 22, qclass & 0xFF);
+    return 23;
+}
+
+fn test_dns_question_match() {
+    test_group("dns_question_match");
+    var msg[64];
+
+    var n = _tq_build(&msg, 1, DNS_TYPE_A, DNS_CLASS_IN);
+    assert_eq(dns_question_matches(&msg, n, "a.com", DNS_TYPE_A), 1, "question matches");
+
+    # Case folding — RFC 4343, and 0x20-encoding resolvers randomize case.
+    assert_eq(dns_question_matches(&msg, n, "A.CoM", DNS_TYPE_A), 1, "question match is case-insensitive");
+
+    # The attack this closes: right ID, wrong name.
+    assert_eq(dns_question_matches(&msg, n, "b.com", DNS_TYPE_A), 0, "different name rejected");
+    assert_eq(dns_question_matches(&msg, n, "a.net", DNS_TYPE_A), 0, "different TLD rejected");
+    assert_eq(dns_question_matches(&msg, n, "aa.com", DNS_TYPE_A), 0, "longer label rejected");
+    assert_eq(dns_question_matches(&msg, n, "a.co", DNS_TYPE_A),  0, "shorter label rejected");
+
+    # Right name, wrong type.
+    assert_eq(dns_question_matches(&msg, n, "a.com", DNS_TYPE_AAAA), 0, "different qtype rejected");
+
+    # Wrong class.
+    var m2[64];
+    var n2 = _tq_build(&m2, 1, DNS_TYPE_A, 3);
+    assert_eq(dns_question_matches(&m2, n2, "a.com", DNS_TYPE_A), 0, "non-IN class rejected");
+
+    # qdcount must be exactly 1 — 0 means there is nothing to compare against,
+    # and >1 lets an attacker append a matching question after a bogus one.
+    var m3[64];
+    var n3 = _tq_build(&m3, 0, DNS_TYPE_A, DNS_CLASS_IN);
+    assert_eq(dns_question_matches(&m3, n3, "a.com", DNS_TYPE_A), 0, "qdcount 0 rejected");
+    var m4[64];
+    var n4 = _tq_build(&m4, 2, DNS_TYPE_A, DNS_CLASS_IN);
+    assert_eq(dns_question_matches(&m4, n4, "a.com", DNS_TYPE_A), 0, "qdcount 2 rejected");
+
+    # A question that runs past the received length must not be read.
+    assert_eq(dns_question_matches(&msg, 18, "a.com", DNS_TYPE_A), 0, "truncated question rejected");
+    assert_eq(dns_question_matches(&msg, 12, "a.com", DNS_TYPE_A), 0, "header-only reply rejected");
+    return 0;
+}
+
+# === CLI bounds (0.3.7 hardening) ===
+fn test_cli_bounds() {
+    test_group("cli_bounds");
+    var av[64];
+    store64(&av, "dig");
+    store64(&av + 16, "example.com");
+
+    # +timeout=0 reached SO_RCVTIMEO as {0,0} through 0.3.6, which Linux reads
+    # as "block indefinitely" — `dig +timeout=0` hung forever. Clamped, not
+    # rejected, matching BIND.
+    var r1 = dig_cli_new();
+    store64(&av + 8, "+timeout=0");
+    assert_eq(dig_cli_parse_argv(r1, 3, &av), DIG_CLI_OK, "+timeout=0 parses");
+    assert_eq(dig_cli_timeout_s(r1), DIG_MIN_TIMEOUT_S, "+timeout=0 clamps up to 1s");
+
+    # Upper clamp keeps query.cyr's `t0 + timeout_s * 1000000` from overflowing.
+    var r2 = dig_cli_new();
+    store64(&av + 8, "+timeout=999999");
+    assert_eq(dig_cli_parse_argv(r2, 3, &av), DIG_CLI_OK, "huge +timeout parses");
+    assert_eq(dig_cli_timeout_s(r2), DIG_MAX_TIMEOUT_S, "huge +timeout clamps down");
+
+    var r3 = dig_cli_new();
+    store64(&av + 8, "+retry=0");
+    assert_eq(dig_cli_parse_argv(r3, 3, &av), DIG_CLI_OK, "+retry=0 parses");
+    assert_eq(dig_cli_retry(r3), DIG_MIN_RETRY, "+retry=0 clamps up to 1 attempt");
+
+    var r4 = dig_cli_new();
+    store64(&av + 8, "+retry=100000");
+    assert_eq(dig_cli_parse_argv(r4, 3, &av), DIG_CLI_OK, "huge +retry parses");
+    assert_eq(dig_cli_retry(r4), DIG_MAX_RETRY, "huge +retry clamps down");
+
+    # In range, values pass through untouched.
+    var r5 = dig_cli_new();
+    store64(&av + 8, "+timeout=7");
+    assert_eq(dig_cli_parse_argv(r5, 3, &av), DIG_CLI_OK, "+timeout=7 parses");
+    assert_eq(dig_cli_timeout_s(r5), 7, "in-range +timeout preserved");
+
+    # Signed overflow wraps, so the old `if (v < 0)` guard alone let a long
+    # enough digit run land back on a positive value. The digit cap makes the
+    # check total.
+    var r6 = dig_cli_new();
+    store64(&av + 8, "+timeout=99999999999999999999");
+    assert_eq(dig_cli_parse_argv(r6, 3, &av), DIG_CLI_ERR_PARSE, "over-long digit run rejected");
+
+    var r7 = dig_cli_new();
+    store64(&av + 8, "+timeout=abc");
+    assert_eq(dig_cli_parse_argv(r7, 3, &av), DIG_CLI_ERR_PARSE, "non-numeric +timeout rejected");
+
+    var r8 = dig_cli_new();
+    store64(&av + 8, "+timeout");
+    assert_eq(dig_cli_parse_argv(r8, 3, &av), DIG_CLI_ERR_PARSE, "+timeout without = rejected");
+    return 0;
+}
+
+# === Unknown record type is an error, not a silent fallback (0.3.7) ===
+fn test_cli_bad_type() {
+    test_group("cli_bad_type");
+    var av[64];
+    store64(&av, "dig");
+    store64(&av + 8, "example.com");
+
+    # Through 0.3.6 a second bare token was silently DISCARDED: `dig example.com
+    # BOGUSTYPE` quietly queried A and exited 0, answering a different question
+    # than the one asked with nothing on stderr.
+    var r1 = dig_cli_new();
+    store64(&av + 16, "BOGUSTYPE");
+    assert_eq(dig_cli_parse_argv(r1, 3, &av), DIG_CLI_ERR_BAD_TYPE, "unknown type is an error");
+
+    # Recognized types still work, and are case-insensitive.
+    var r2 = dig_cli_new();
+    store64(&av + 16, "MX");
+    assert_eq(dig_cli_parse_argv(r2, 3, &av), DIG_CLI_OK, "MX accepted");
+    assert_eq(dig_cli_qtype(r2), DNS_TYPE_MX, "MX sets qtype");
+
+    var r3 = dig_cli_new();
+    store64(&av + 16, "aaaa");
+    assert_eq(dig_cli_parse_argv(r3, 3, &av), DIG_CLI_OK, "lowercase aaaa accepted");
+    assert_eq(dig_cli_qtype(r3), DNS_TYPE_AAAA, "aaaa sets qtype");
+
+    # No type token at all still defaults to A.
+    var r4 = dig_cli_new();
+    assert_eq(dig_cli_parse_argv(r4, 2, &av), DIG_CLI_OK, "name only accepted");
+    assert_eq(dig_cli_qtype(r4), DNS_TYPE_A, "qtype defaults to A");
+    return 0;
+}
+
 # === Truncated response (TC=1) detection ===
 fn test_dns_truncated() {
     test_group("dns_truncated");
@@ -298,6 +523,10 @@ fn main() {
     test_resolv();
     test_dns_parse_a_response();
     test_dns_truncated();
+    test_output_escaping();
+    test_dns_question_match();
+    test_cli_bounds();
+    test_cli_bad_type();
     return assert_summary();
 }
 

@@ -4,6 +4,216 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.7] — 2026-08-28 (P-1 audit sweep: wrong syscalls on aarch64, raw control bytes on your terminal)
+
+An audit/hardening/repair cut on the existing surface. No new DNS features.
+
+Two P1s. One made every non-x86_64 build call the wrong kernel entries; the
+other let any zone owner write raw terminal control bytes to the screen of
+anyone who looked them up. Alongside them: a defect that hung the process
+outright, one that answered a different question than the one asked and reported
+success, and six that let a reply dig should have dropped reach the user — three
+of which were fixed on the Linux arm first and had to be chased onto the AGNOS
+arm before the cut was honest.
+
+Every repair below has an assertion behind it, and every assertion is
+mutation-checked. The suite goes 70 → **128**.
+
+**This cut does not close the audit.** It ran eight independent lenses over the
+0.3.6 tree and confirmed 61 findings against adversarial refutation; both P1s
+and the highest-value P2s are repaired here. Twenty-three P2/P3 items remain,
+enumerated in `roadmap.md` § 0.3.8 rather than quietly dropped.
+
+### Fixed
+- **`--aarch64` built clean and produced a binary that called the wrong kernel
+  entries.** `src/platform_linux.cyr` carried a private `_LX_SYS_*` table
+  hardcoded to x86_64, while `src/platform.cyr` routes *every* non-AGNOS target
+  through that file — aarch64 included, which the toolchain builds without a
+  murmur. The numbers are unrelated between the two ABIs: `read` 0 is
+  `io_setup`, `close` 3 is `io_submit`, `sendto` 44 is `fstatfs`, and
+  `nanosleep` **35 is `unlinkat`**, which the retry backoff invoked on every
+  retry. Proven rather than argued: the 0.3.6 aarch64 build answers
+  `;; connection timed out; no servers could be reached` under `qemu-aarch64`;
+  the 0.3.7 build returns real A records.
+
+  The table is gone. Every call now goes through the stdlib's arch-dispatched
+  wrapper — `sys_socket` / `sys_connect` / `sys_write` / `sys_recvfrom` /
+  `sys_setsockopt` / `sys_close` / `sys_read` / `sys_open` / `sys_getrandom`,
+  all of which exist on both arches and were sitting there unused. `clock_gettime`
+  and `nanosleep` have no wrapper and no named constant anywhere in the stdlib,
+  so those two are arch-guarded **literals** under `#ifdef CYRIUS_ARCH_AARCH64`
+  (113/101 vs 228/35) — literals, not `var`s, because `lib/bench.cyr` documents
+  that the macOS/Windows reroute for `syscall(228)` only fires when the argument
+  const-folds, and the old table was `var`s. So the AGNOS arm is no longer the
+  only one without raw numbered syscalls; the Linux arm now has two, both named
+  and both justified in place.
+- **`dig +timeout=0` hung forever.** `+timeout` was parsed and stored unchecked,
+  and `0` reached `SO_RCVTIMEO` as `{0, 0}` — which Linux reads as *block
+  indefinitely*, the exact opposite of what the user asked. `recvfrom` never
+  returned and the process could only be killed. Now clamped to
+  `[1, 3600]` seconds at the CLI, matching BIND ("if T is less than 1, the query
+  timeout is set to 1 second"), with `platform_set_recv_timeout_ms` clamping
+  again at the syscall boundary so the contract "this call always bounds the
+  wait" holds regardless of caller. `+retry` is likewise clamped to `[1, 100]`.
+- **`dig example.com BOGUSTYPE` answered a different question and exited 0.** A
+  second bare positional that was not a recognized record type was silently
+  *discarded*, so dig queried A and printed it as though that had been the
+  request — nothing on stderr, success exit. `DIG_CLI_ERR_BAD_TYPE` had existed
+  since 0.3.0 for exactly this and was returned from nowhere in the tree. It is
+  now returned, and the case exits 2.
+- **`_dig_parse_uint`'s overflow guard could be walked past.** It checked
+  `if (v < 0)` after each `v * 10 + d`, but signed overflow wraps, so a long
+  enough digit run lands back on a positive value and passes. Confirmed by
+  mutation: with the new digit cap removed, `+timeout=99999999999999999999`
+  parses successfully. Input is now capped at 10 digits, which cannot overflow
+  i64, making the check total rather than probabilistic.
+
+### Security
+- **A DNS response could write raw terminal control bytes to your screen.** Both
+  channels that carry attacker-chosen octets to stdout — decoded names and TXT
+  character-strings — went out verbatim. RFC 1035 constrains their *length*, not
+  their content, so every byte is legal on the wire and BIND has escaped them
+  per §5.1 since forever. Demonstrated with a real build rather than argued: a
+  TXT record containing `CR ESC [ 2 K` makes dig emit
+  `68 69 0d 1b 5b 32 4b ...` — carriage return, then erase-entire-line — so the
+  record can wipe the line dig just printed and repaint a forged one. **This
+  needs no spoofing at all**, only a zone the attacker controls, and it reaches
+  the TXT path for *any* qtype because the answer walk dispatches on the RR's
+  own type. Two more channels in the same defect: an embedded `0x0A` forges an
+  extra line in `+short`, which is exactly the form scripts read with
+  `for ip in $(dig +short ...)`; and an embedded NUL truncated the whole name,
+  because the sink was `strlen`-based, so `safe.example.com\0.evil.tld`
+  displayed as `safe.example.com`.
+
+  All response-derived output now goes through `_esc_to_buf` (RFC 1035 §5.1),
+  which is length-driven rather than NUL-terminated — `dns_decode_name` gained
+  an `out_len` out-param for it. Escaping is at the sink, deliberately: doing it
+  in the decoder expands up to 4x and every caller declares `var nbuf[256]`,
+  which in a language with no bounds checking is a stack smash rather than a
+  fix. Space is context-dependent — escaped in an unquoted name as `\032`
+  (BIND does this), left literal inside TXT's quotes, so the near-universal
+  `v=spf1 -all` still renders as `v=spf1 -all` and not `v=spf1\032-all`.
+  Control bytes are escaped in both contexts and that is not configurable.
+  **Known limit, stated rather than hidden:** a literal `.` inside a label is
+  not escaped as `\.`, because the decoder flattens labels into a dotted string
+  and by the sink a separator dot and an in-label dot are indistinguishable. A
+  BIND-fidelity gap with no security consequence; it needs the decoder-side
+  rewrite parked at 0.4.x.
+- **The AGNOS arm did not get the hardening the Linux arm did — now it does.**
+  Fixing one backend and not the other is the divergence taar 0.5.0 spent a
+  release closing, and this cut had opened a fresh one:
+    - `platform_random_u16` returned `(hi << 8) | lo` on AGNOS — structurally
+      `[0, 65535]`, **never negative** — so the fail-closed entropy check added
+      to `query.cyr` above was *dead code on that arm* while live on Linux. Both
+      `sys_getrandom` call sites now check for `!= 2` and fail closed. `var
+      rb[2]` is not zero-initialised, so the unchecked version derived the
+      source port from stack residue; on a zero page that is exactly 49152.
+    - `platform_udp_recv` passed `0` as `sys_udp_recv`'s fourth argument and
+      threw the peer away. That argument is the source-address out-param, not a
+      flags word (`kernel/core/syscall.cyr`), and the kernel does **not** filter
+      by source — `net_ingress` resolves with `udp_find_listener(dst_port)` and
+      compares nothing else. So after the Linux `connect(2)` repair, AGNOS was
+      the only unfiltered arm, and the harder one: the listener mailbox is a
+      single slot every matching datagram overwrites, so a sprayer both lands
+      forgeries *and* clobbers the genuine reply. dig now stashes the peer on
+      send and drops non-matching datagrams on recv, continuing the poll rather
+      than ending the attempt.
+    - `platform_set_recv_timeout_ms` stored its argument unclamped and always
+      returned 0, so `query.cyr`'s new return check could never fire there and a
+      non-positive value put the poll deadline in the past.
+- **The UDP socket is now connected, so the kernel drops off-peer replies.**
+  `platform_udp_send_to` was `sendto(2)` on an unconnected socket and
+  `platform_udp_recv` passed `NULL` for the source-address out-param, so *any*
+  host that could reach the ephemeral port had its datagram handed to the
+  parser; the 16-bit query ID was the only thing an off-path attacker had to
+  guess. Now `connect(2)`-then-`write(2)`, following taar 0.4.0's udp path —
+  which also removes the need for a `sendto` number the stdlib does not name
+  (the aarch64 hazard above). An attacker must now guess the ephemeral port too.
+- **The reply's question section is compared against the question asked**
+  (RFC 5452 §9.1) — new `dns_question_matches`. Through 0.3.6 the only checks
+  were the query ID and the QR bit, so anyone who guessed the ID could return an
+  answer for a *different name* and dig would print it as the answer. The match
+  folds case (RFC 4343; 0x20-encoding resolvers randomize it) and is conservative
+  by construction — a `qdcount` other than 1, or a question running past the
+  received length, rejects.
+- **A fresh query ID per attempt.** The ID was generated once, outside the retry
+  loop, so all three default attempts reused the same 16 bits on the same port —
+  handing an off-path attacker a second and third guess at one target.
+- **Entropy failure is now fatal instead of falling back to the clock.**
+  `platform_random_u16` opened `/dev/urandom` and, if that failed, returned the
+  low 16 bits of `CLOCK_MONOTONIC` nanoseconds — a value an attacker who knows
+  roughly when the query was sent can search over a small range. A guessable
+  query ID is the whole cache-poisoning problem, so there is no safe fallback:
+  the call now fails closed via `sys_getrandom` and the query is abandoned.
+  Incidentally two syscalls cheaper per query, and it matches the AGNOS arm.
+- **A rejected datagram no longer costs a retry.** On a bad ID or a clear QR
+  bit the old loop consumed one of its three attempts *and re-sent the query*,
+  so anyone able to spray junk at the socket exhausted the retry budget in
+  microseconds and dig reported "connection timed out". The accept checks now
+  run in an inner loop bounded by the attempt's own deadline: junk costs the
+  attacker a packet and dig one iteration.
+- `platform_set_recv_timeout_ms`'s return value is checked. An unnoticed failure
+  there meant an unbounded receive.
+
+### Changed
+- **`[deps.cmdit]` 1.2.4 adopted, and stdlib `flags` dropped.** dig's grammar is
+  BIND's, not getopt-long, and cmdit's own docs name dig as the case its
+  `cmdit_raw_argv` escape hatch exists for — so `src/cli.cyr` keeps the
+  `@server` / `+flag` tokenizer, which is the security-relevant part. What cmdit
+  takes over is everything around it: `--help`/`-h`, `--version`/`-V`, the
+  `argc()`/`argv(i)` materialize bridge that `main.cyr` hand-rolled, and the
+  usage/success exit constants.
+
+  Stdlib `flags` went the other way: declared at 0.3.0 for "CLI parsing" and
+  **never referenced by a single line of dig** — all 25 of its symbols had zero
+  hits across `src/` and `tests/` — because `cli.cyr` was hand-rolled precisely
+  since `lib/flags.cyr`'s `--long` grammar does not fit. Same swap `kii` made at
+  its v1.1.0. `args` stays; cmdit calls it.
+- **`dig --version` exists.** It reported a parse error before. It prints from
+  the same `CYRIUS_PKG_VERSION` the query banner uses, so `VERSION` remains the
+  single source of truth.
+- **`PLATFORM_ERR_TIMEOUT` is a named constant in both platform arms** rather
+  than a bare `-11` in one and an unnamed `-EAGAIN` convention in the other.
+  taar 0.5.0 spent a release fixing exactly this divergence in its own TCP path;
+  dig's two arms are now aligned by construction.
+- All 33 previously undocumented public fns have doc comments; the two
+  over-long lines are wrapped; `src/platform.cyr`'s bare `TODO` is tracked
+  against a real roadmap entry. `cyrius audit` is green on all four dimensions
+  (fmt / lint / docs / tests) for the first time.
+- **`roadmap.md` gains § 0.7.x — Host-target parity**, and loses the
+  "Windows / macOS host targets" out-of-scope bullet that contradicted it. The
+  code had carried `Windows / macOS branches still TODO` since June while the
+  roadmap declared those targets excluded; the code was right, and the stdlib
+  has since grown the peers that made the exclusion moot.
+
+### Tests
+- **70 → 128 assertions**, in four new groups: `output_escaping` (26),
+  `dns_question_match` (12), `cli_bounds` (13), `cli_bad_type` (7).
+- **Mutation-checked, all of them:** reverting `dns_question_matches` to always
+  accept, dropping the `+timeout` clamp, restoring the silent unknown-type
+  discard, removing the digit cap, passing bytes through `_esc_to_buf` raw,
+  hardcoding the escape's hundreds digit, dropping its capacity refusal, and
+  escaping space unconditionally — each turns the suite red. One mutation
+  (`% 10` → `% 9` on the hundreds digit) does *not*, and is reported here rather
+  than quietly dropped: it is equivalent, since the two differ only above
+  c = 900 and c is a byte. The digit-cap
+  mutation is also the empirical proof that the old overflow guard was
+  insufficient rather than merely ugly.
+- Still no executed coverage of `src/platform_agnos.cyr`, and the network path
+  itself remains untested in CI. Both are named in `state.md`. The AGNOS parity
+  fixes above are therefore **review-verified only** — which is exactly how the
+  divergence they close got in.
+
+### Notes
+- x86_64, `--aarch64` and `--agnos` all build; x86_64 and aarch64 both resolve
+  live (aarch64 under `qemu-aarch64`). AGNOS still only compiles.
+- Binary grew 132,472 → 163,016 bytes. The cmdit bundle is 72 KB of source for
+  the five functions dig calls, and at 6.5.35 `CYRIUS_DCE=1` NOPs unreachable
+  code in place rather than removing it, so none of that comes back. Named here
+  rather than buried: it is a real cost of the dependency.
+- `+tcp`, `+dnssec` and EDNS(0) remain 0.4.x. Nothing here touches them.
+
+
 ### Fixed
 - **`README.md` made four claims the tree contradicts at 0.3.6.** All four were
   documentation-only; no source changed.

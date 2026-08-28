@@ -3,6 +3,9 @@
 
 include "lib/syscalls.cyr"
 
+# Stub entry for `cyrius.cyml [build].test`. Deliberately empty: the real suite
+# is `tests/dig.tcyr`, which `cyrius test` auto-discovers alongside this file.
+# Kept because the manifest's [build].test key requires a target to exist.
 fn main() {
     return 0;
 }

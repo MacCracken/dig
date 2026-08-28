@@ -21,14 +21,30 @@
 
 var _AG_O_RDONLY      = 0;
 
+# -EAGAIN. Mirrors the Linux arm's SO_RCVTIMEO return so callers need one check,
+# not one per backend. taar 0.5.0 spent a release fixing exactly this divergence
+# in its own TCP path; dig's two arms are kept aligned by construction.
+var PLATFORM_ERR_TIMEOUT = 0 - 11;
+
 var _ag_src_port   = 0;            # the bound source port (dig is single-query-at-a-time)
+# The peer of the last send. AGNOS UDP has no connect(2) — sys_udp_send takes
+# (dst_ip, packed_ports, ...) with no listener_id, so the kernel has no place to
+# record "who this listener is talking to" and cannot filter for us. We emulate
+# it here: stash the peer on send, drop non-matching datagrams on recv.
+var _ag_peer_addr  = 0;
+var _ag_peer_port  = 0;
 var _ag_timeout_ms = 5000;        # recv timeout, set by platform_set_recv_timeout_ms
 
 # Bind an ephemeral UDP source port (49152..65535) so the DNS reply routes back.
 # Returns the listener_id (0..7) as the fd, or the kernel's -1 (table full).
 fn platform_udp_open(): i64 {
     var rb[2];
-    sys_getrandom(&rb, 2, 0);
+    # Fails CLOSED. `var rb[2]` is not zero-initialised, so an unchecked failure
+    # here derives the source port from whatever was on the stack — on a virgin
+    # zero page that is exactly 49152, the most guessable value in the range.
+    # Both halves of the RFC 5452 budget (14-bit port, 16-bit ID) would collapse
+    # at once, and this arm has no connected-socket layer beneath them.
+    if (sys_getrandom(&rb, 2, 0) != 2) { return 0 - 1; }
     var port = 49152 + (((load8(&rb) << 8) | load8(&rb + 1)) & 0x3FFF);
     var lid = sys_udp_bind(port);
     if (lid < 0) { return lid; }
@@ -36,12 +52,20 @@ fn platform_udp_open(): i64 {
     return lid;
 }
 
+# Release the UDP listener. Takes the listener_id `platform_udp_open` returned
+# (AGNOS is listener-id based, not fd based — see the module header).
+# Returns the kernel's udp_unbind status: 0 on success, negative on failure.
 fn platform_close(fd): i64 {
     return sys_udp_unbind(fd);
 }
 
 # No SO_RCVTIMEO on AGNOS — just remember the timeout for the recv poll loop.
 fn platform_set_recv_timeout_ms(fd, timeout_ms): i64 {
+    # Clamped like the Linux arm. A non-positive value would put the poll
+    # deadline at `sys_uptime_ms() + 0` — already in the past — so every recv
+    # returned instantly and the query failed without ever waiting. cli.cyr
+    # clamps upstream too; relying on that alone is safety by coincidence.
+    if (timeout_ms < 1) { timeout_ms = 1; }
     _ag_timeout_ms = timeout_ms;
     return 0;
 }
@@ -50,6 +74,8 @@ fn platform_set_recv_timeout_ms(fd, timeout_ms): i64 {
 # packed form (high byte = first octet) — matches ipv4_parse output, which is
 # exactly what the kernel expects. Returns bytes sent or -1.
 fn platform_udp_send_to(fd, packed_addr, port, pkt, pkt_len): i64 {
+    _ag_peer_addr = packed_addr;
+    _ag_peer_port = port;
     var packed_ports = (_ag_src_port << 16) | (port & 0xFFFF);
     return sys_udp_send(packed_addr, packed_ports, pkt, pkt_len);
 }
@@ -59,13 +85,36 @@ fn platform_udp_send_to(fd, packed_addr, port, pkt, pkt_len): i64 {
 # kernel error (<0). The 5ms inter-poll sleep keeps us off a busy-spin.
 fn platform_udp_recv(fd, buf, maxlen): i64 {
     var deadline = sys_uptime_ms() + _ag_timeout_ms;
+    var src[16];
     while (sys_uptime_ms() < deadline) {
-        var n = sys_udp_recv(fd, buf, maxlen, 0);
-        if (n > 0) { return n; }
-        if (n < 0) { return n; }
-        sys_sleep_ms(5);
+        # 4th arg is the peer out-param, NOT a flags word: the kernel writes
+        # src_ip at +0 and src_port at +8 of a 16-byte user region
+        # (kernel/core/syscall.cyr, udp_recv). Through 0.3.7 dig passed 0 here
+        # and threw the peer away.
+        var n = sys_udp_recv(fd, buf, maxlen, &src);
+        if (n > 0) {
+            # The kernel does not filter by source — net_ingress resolves a
+            # datagram with udp_find_listener(dst_port) and compares nothing
+            # else — so this check is the ONLY peer filtering in the path. It
+            # is the AGNOS equivalent of the Linux arm's connect(2), and it
+            # matters more here: the listener mailbox is a single slot that
+            # every matching datagram overwrites, so a sprayer both lands
+            # forgeries and clobbers the genuine reply.
+            var same_ip   = load64(&src) == _ag_peer_addr;
+            var same_port = load64(&src + 8) == _ag_peer_port;
+            if ((same_ip == 1) && (same_port == 1)) {
+                return n;
+            }
+            # Not from the peer we asked. Drop it and keep polling — never
+            # return, or one junk datagram ends the attempt. Mirrors the inner
+            # deadline loop in query.cyr.
+        } elif (n < 0) {
+            return n;
+        } else {
+            sys_sleep_ms(5);
+        }
     }
-    return 0 - 11;
+    return PLATFORM_ERR_TIMEOUT;
 }
 
 # open(path,O_RDONLY)+read+close via the AGNOS FS syscalls. AGNOS sys_open takes
@@ -101,7 +150,13 @@ fn platform_dns_server(): i64 { return sys_net_dns_server(); }
 # 2 bytes of hardware entropy (RDRAND) for the DNS query ID (RFC 5452).
 fn platform_random_u16(): i64 {
     var rb[2];
-    sys_getrandom(&rb, 2, 0);
+    # Must be able to return NEGATIVE. Through 0.3.7 this arm returned
+    # `(hi << 8) | lo`, structurally [0, 65535] — so query.cyr's
+    # `if (id < 0)` entropy bail, and the comment above it promising a guessable
+    # ID is never used, were dead code on AGNOS while live on Linux. Two arms
+    # disagreeing about one platform_* symbol's contract with no compiler or
+    # test signal is precisely the divergence taar 0.5.0 spent a release closing.
+    if (sys_getrandom(&rb, 2, 0) != 2) { return 0 - 1; }
     return (load8(&rb) << 8) | load8(&rb + 1);
 }
 
@@ -111,6 +166,9 @@ fn platform_now_us(): i64 {
     return sys_uptime_ms() * 1000;
 }
 
+# Sleep for `ms` milliseconds via sys_sleep_ms (#41). A non-positive `ms`
+# returns 0 immediately without entering the kernel — same contract as the
+# Linux arm, so the recv poll loop can pass a computed remainder unchecked.
 fn platform_sleep_ms(ms): i64 {
     if (ms <= 0) { return 0; }
     return sys_sleep_ms(ms);

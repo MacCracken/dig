@@ -1,64 +1,79 @@
-# platform_linux.cyr — Linux backend (UDP + clock + /dev/urandom).
+# platform_linux.cyr — Linux backend (UDP + clock + entropy).
 #
-# Self-contained: raw syscalls only, no lib/net.cyr import. lib/net.cyr
-# wraps results in tagged unions that this thin backend doesn't need.
+# Sovereignty posture (per-backend rule): this file uses POSIX sockets
+# pragmatically. The AGNOS backend (src/platform_agnos.cyr) uses the sovereign
+# udp_bind/send/recv/unbind kernel primitives (#51-54, landed agnos 1.45.3, via
+# the cyrius >= 6.2.6 peer) and already resolves real names end-to-end on agnos.
+# The v1.0 release gate enforces no-POSIX on the AGNOS backend only. Same
+# posture as yo's src/platform_linux.cyr.
 #
-# Sovereignty posture (per-backend rule): this file uses POSIX
-# socket() pragmatically. The AGNOS backend (src/platform_agnos.cyr)
-# uses the sovereign udp_bind/send/recv/unbind kernel primitives
-# (#51-54, landed agnos 1.45.3, via the cyrius >= 6.2.6 peer) and
-# already resolves real names end-to-end on agnos. The v1.0 release
-# gate enforces no-POSIX on the AGNOS backend only. Same posture as
-# yo's src/platform_linux.cyr.
-
-var _LX_SYS_READ            = 0;
-var _LX_SYS_WRITE           = 1;
-var _LX_SYS_OPEN            = 2;
-var _LX_SYS_CLOSE           = 3;
-var _LX_SYS_NANOSLEEP       = 35;
-var _LX_SYS_SOCKET          = 41;
-var _LX_SYS_SENDTO          = 44;
-var _LX_SYS_RECVFROM        = 45;
-var _LX_SYS_SETSOCKOPT      = 54;
-var _LX_SYS_CLOCK_GETTIME   = 228;
+# ARCH CORRECTNESS (0.3.7). Through 0.3.6 this file carried its own private
+# `_LX_SYS_*` syscall-number table hardcoded to **x86_64**, while src/platform.cyr
+# dispatches every non-AGNOS target here — including `--aarch64`, which the
+# toolchain builds without complaint. The numbers differ completely between the
+# two ABIs, so an aarch64 build called the wrong kernel entry every time:
+# read 0 is io_setup, close 3 is io_submit, and nanosleep **35 is unlinkat**,
+# which the retry backoff would have invoked on every retry.
+#
+# The table is gone. Every call below now goes through the stdlib's
+# arch-dispatched wrapper (sys_socket / sys_connect / sys_write / sys_recvfrom /
+# sys_setsockopt / sys_close / sys_read / sys_open / sys_getrandom), which
+# resolves to the right number for whichever syscalls_<arch>_linux.cyr the build
+# selected. Two calls have no wrapper and no named constant anywhere in the
+# stdlib — clock_gettime and nanosleep — and those are spelled as arch-guarded
+# LITERALS below, for the reason lib/bench.cyr documents: the macOS/Windows
+# reroute for syscall(228) is keyed on a compile-time const-fold, so a `var`
+# holding the number silently defeats it. The old table was `var`s.
+#
+# See roadmap.md § 0.7.x (Host-target parity) for the remaining target work.
 
 var _LX_AF_INET         = 2;
 var _LX_SOCK_DGRAM      = 2;
-var _LX_SOCK_STREAM     = 1;
 var _LX_IPPROTO_UDP     = 17;
-var _LX_IPPROTO_TCP     = 6;
 var _LX_SOL_SOCKET      = 1;
 var _LX_SO_RCVTIMEO     = 20;
 var _LX_CLOCK_MONOTONIC = 1;
 var _LX_O_RDONLY        = 0;
 
-# Open a UDP socket suitable for DNS (port 53). Returns fd ≥ 0 on
-# success, negative errno on failure. Unprivileged — no caps required.
+# -EAGAIN. What SO_RCVTIMEO yields from recvfrom(2) when the deadline expires —
+# named so callers need one check, not one per backend. Mirrors the AGNOS arm's
+# timeout return and taar's _TAAR_ERR_TIMEOUT, which is the same value.
+var PLATFORM_ERR_TIMEOUT = 0 - 11;
+
+# Open a UDP socket suitable for DNS (port 53). Returns fd >= 0 on success,
+# negative errno on failure. Unprivileged — no caps required.
 fn platform_udp_open(): i64 {
-    return syscall(_LX_SYS_SOCKET, _LX_AF_INET, _LX_SOCK_DGRAM, _LX_IPPROTO_UDP);
+    return sys_socket(_LX_AF_INET, _LX_SOCK_DGRAM, _LX_IPPROTO_UDP);
 }
 
+# Release the socket. Takes the fd returned by `platform_udp_open`.
+# Returns the kernel's close(2) status: 0 on success, negative errno on failure.
 fn platform_close(fd): i64 {
-    return syscall(_LX_SYS_CLOSE, fd);
+    return sys_close(fd);
 }
 
-# SO_RCVTIMEO so blocking recvfrom returns -EAGAIN after timeout_ms
-# instead of waiting forever. Kernel's timeval struct is
+# SO_RCVTIMEO so a blocking recvfrom returns PLATFORM_ERR_TIMEOUT after
+# timeout_ms instead of waiting forever. The kernel's timeval is
 # {tv_sec: i64, tv_usec: i64} = 16 bytes on 64-bit Linux.
+#
+# A timeout_ms of 0 would set {0,0}, which Linux reads as "block indefinitely" —
+# the exact opposite of what a caller passing zero means. It is clamped to 1ms
+# here so the contract "this call always bounds the wait" holds unconditionally,
+# rather than relying on every caller to pre-validate. Returns 0, or negative
+# errno; callers SHOULD check it, since an unnoticed failure means an unbounded
+# recv.
 fn platform_set_recv_timeout_ms(fd, timeout_ms): i64 {
-    var tv = alloc(16);
-    var secs  = timeout_ms / 1000;
-    var usecs = (timeout_ms % 1000) * 1000;
-    store64(tv,     secs);
-    store64(tv + 8, usecs);
-    return syscall(_LX_SYS_SETSOCKOPT, fd, _LX_SOL_SOCKET, _LX_SO_RCVTIMEO, tv, 16);
+    if (timeout_ms < 1) { timeout_ms = 1; }
+    var tv[16];
+    store64(&tv,     timeout_ms / 1000);
+    store64(&tv + 8, (timeout_ms % 1000) * 1000);
+    return sys_setsockopt(fd, _LX_SOL_SOCKET, _LX_SO_RCVTIMEO, &tv, 16);
 }
 
-# Build a sockaddr_in for the given packed IPv4 (host-byte-order,
-# high byte = first octet — matches ipv4_parse output) and UDP/TCP
-# port. Port is written big-endian (network byte order, RFC 793 §3.1).
-fn _lx_sockaddr_in(packed_addr, port): i64 {
-    var sa = alloc(16);
+# Fill a 16-byte sockaddr_in for the given packed IPv4 (host-byte-order, high
+# byte = first octet — matches ipv4_parse output) and port. The port is written
+# big-endian (network byte order, RFC 793 §3.1).
+fn _lx_fill_sockaddr(sa, packed_addr, port): i64 {
     memset(sa, 0, 16);
     store16(sa, _LX_AF_INET);
     store8(sa + 2, (port >> 8) & 0xFF);
@@ -67,30 +82,56 @@ fn _lx_sockaddr_in(packed_addr, port): i64 {
     store8(sa + 5, (packed_addr >> 16) & 0xFF);
     store8(sa + 6, (packed_addr >> 8)  & 0xFF);
     store8(sa + 7, packed_addr & 0xFF);
-    return sa;
+    return 0;
 }
 
-# sendto(fd, pkt, pkt_len, 0, sa, 16). Returns bytes sent or
-# negative errno.
+# Send one datagram to (packed_addr, port). Returns bytes sent, or negative
+# errno.
+#
+# connect(2)-then-write(2) rather than sendto(2), following taar's udp path
+# (taar 0.4.0, src/socket.cyr) for the two reasons it documents:
+#
+#   1. Security. Connecting the datagram socket makes the KERNEL drop replies
+#      whose source address/port is not the peer we asked. Unconnected — which
+#      is what dig did through 0.3.6, calling recvfrom with a NULL source-address
+#      out-param — any host on the path that guessed the 16-bit query ID could
+#      land a forged answer. Connected, an off-path attacker must also guess the
+#      ephemeral source port. This is the RFC 5452 §9 layering.
+#   2. Portability. The stdlib exposes no sendto wrapper and no SYS_SENDTO
+#      constant on either arch, so sendto could only be spelled as a hardcoded
+#      44 — which is precisely the aarch64 misroute this file is fixing (44 is
+#      fstatfs there). write(2) on a connected socket needs neither.
+#
+# Re-connecting a UDP socket to a new peer is legal and cheap, so connecting per
+# send keeps the (fd, addr, port) signature intact for the platform contract.
 fn platform_udp_send_to(fd, packed_addr, port, pkt, pkt_len): i64 {
-    var sa = _lx_sockaddr_in(packed_addr, port);
-    return syscall(_LX_SYS_SENDTO, fd, pkt, pkt_len, 0, sa, 16);
+    var sa[16];
+    _lx_fill_sockaddr(&sa, packed_addr, port);
+    var c = sys_connect(fd, &sa, 16);
+    if (c < 0) { return c; }
+    return sys_write(fd, pkt, pkt_len);
 }
 
-# recvfrom(fd, buf, maxlen, 0, NULL, NULL). Returns bytes received or
-# negative errno (notably -EAGAIN when SO_RCVTIMEO fires).
+# Receive one datagram. Returns bytes received (>0), PLATFORM_ERR_TIMEOUT when
+# the SO_RCVTIMEO deadline expired, or another negative errno. A datagram longer
+# than maxlen is truncated to it.
+#
+# The NULL source-address out-params are safe here ONLY because
+# platform_udp_send_to connected the socket first — the kernel has already
+# dropped anything not from the peer we asked. Do not un-connect the send path
+# without adding an explicit source check here.
 fn platform_udp_recv(fd, buf, maxlen): i64 {
-    return syscall(_LX_SYS_RECVFROM, fd, buf, maxlen, 0, 0, 0);
+    return sys_recvfrom(fd, buf, maxlen, 0, 0, 0);
 }
 
-# Read up to maxlen bytes from path into buf. Returns bytes read or
-# negative errno. Used by src/resolv.cyr to slurp /etc/resolv.conf —
-# always tiny on real systems, so a single read() is fine.
+# Read up to maxlen bytes from path into buf. Returns bytes read, or negative
+# errno. Used by src/resolv.cyr to slurp /etc/resolv.conf — always tiny on real
+# systems, so a single read() is fine.
 fn platform_read_file(path, buf, maxlen): i64 {
-    var fd = syscall(_LX_SYS_OPEN, path, _LX_O_RDONLY, 0);
+    var fd = sys_open(path, _LX_O_RDONLY, 0);
     if (fd < 0) { return fd; }
-    var n = syscall(_LX_SYS_READ, fd, buf, maxlen);
-    syscall(_LX_SYS_CLOSE, fd);
+    var n = sys_read(fd, buf, maxlen);
+    sys_close(fd);
     return n;
 }
 
@@ -98,37 +139,58 @@ fn platform_read_file(path, buf, maxlen): i64 {
 # Return 0 so resolv_discover falls through to the file (then the public fallback).
 fn platform_dns_server(): i64 { return 0; }
 
-# Read 2 bytes from /dev/urandom and return them as a u16. Used to
-# generate DNS query IDs — RFC 5452 calls for randomness here as a
-# cache-poisoning mitigation. Falls back to a clock-derived value if
-# /dev/urandom can't be opened (shouldn't happen on Linux).
+# 2 bytes of kernel entropy for the DNS query ID (RFC 5452). Returns the u16 on
+# success, or a NEGATIVE value if the kernel could not supply entropy.
+#
+# FAILS CLOSED. Through 0.3.6 this opened /dev/urandom and, if that failed, fell
+# back to the low 16 bits of CLOCK_MONOTONIC's nanoseconds — a value an attacker
+# who knows roughly when the query was sent can search over a small range. A
+# guessable query ID is the whole cache-poisoning problem, so there is no safe
+# fallback: the caller must abort rather than send a query it cannot defend.
+#
+# Also now a single getrandom(2) instead of open/read/close, matching the AGNOS
+# arm and cutting two syscalls off every query.
 fn platform_random_u16(): i64 {
-    var buf[2];
-    var fd = syscall(_LX_SYS_OPEN, "/dev/urandom", _LX_O_RDONLY, 0);
-    if (fd < 0) {
-        var ts = alloc(16);
-        syscall(_LX_SYS_CLOCK_GETTIME, _LX_CLOCK_MONOTONIC, ts);
-        var n = load64(ts + 8);
-        return n & 0xFFFF;
-    }
-    syscall(_LX_SYS_READ, fd, &buf, 2);
-    syscall(_LX_SYS_CLOSE, fd);
-    return (load8(&buf) << 8) | load8(&buf + 1);
+    var rb[2];
+    var n = sys_getrandom(&rb, 2, 0);
+    if (n != 2) { return 0 - 1; }
+    return (load8(&rb) << 8) | load8(&rb + 1);
 }
 
 # CLOCK_MONOTONIC microseconds since boot.
+#
+# clock_gettime has no stdlib wrapper and no named per-arch constant, so the
+# number is an arch-guarded literal — never a `var`, per lib/bench.cyr: the
+# macOS/Windows reroute for syscall(228) only fires when the first argument
+# const-folds, and a `var` does not fold.
 fn platform_now_us(): i64 {
-    var ts = alloc(16);
-    syscall(_LX_SYS_CLOCK_GETTIME, _LX_CLOCK_MONOTONIC, ts);
-    var secs = load64(ts);
-    var nsec = load64(ts + 8);
+    var ts[16];
+    #ifdef CYRIUS_ARCH_AARCH64
+    syscall(113, _LX_CLOCK_MONOTONIC, &ts);
+    #endif
+    #ifndef CYRIUS_ARCH_AARCH64
+    syscall(228, _LX_CLOCK_MONOTONIC, &ts);
+    #endif
+    var secs = load64(&ts);
+    var nsec = load64(&ts + 8);
     return secs * 1000000 + nsec / 1000;
 }
 
+# Sleep for `ms` milliseconds. A non-positive `ms` returns immediately rather
+# than sleeping or erroring, so callers may pass a computed remainder unchecked.
+#
+# nanosleep, like clock_gettime, has no wrapper and no named constant. On
+# aarch64 it is 101; the x86_64 number 35 means **unlinkat** there, which is what
+# this file called before 0.3.7.
 fn platform_sleep_ms(ms): i64 {
     if (ms <= 0) { return 0; }
-    var ts = alloc(16);
-    store64(ts,     ms / 1000);
-    store64(ts + 8, (ms % 1000) * 1000000);
-    return syscall(_LX_SYS_NANOSLEEP, ts, 0);
+    var ts[16];
+    store64(&ts,     ms / 1000);
+    store64(&ts + 8, (ms % 1000) * 1000000);
+    #ifdef CYRIUS_ARCH_AARCH64
+    return syscall(101, &ts, 0);
+    #endif
+    #ifndef CYRIUS_ARCH_AARCH64
+    return syscall(35, &ts, 0);
+    #endif
 }

@@ -23,6 +23,14 @@
 
 var DIG_DEFAULT_TIMEOUT_S = 5;
 var DIG_DEFAULT_RETRY     = 3;
+
+# Accepted bounds for +timeout=N / +retry=N. Values outside these are CLAMPED,
+# not rejected — BIND's dig does the same for timeout, and a usage error for
+# `+timeout=0` would be a worse answer than "we used 1 second".
+var DIG_MIN_TIMEOUT_S = 1;
+var DIG_MAX_TIMEOUT_S = 3600;
+var DIG_MIN_RETRY     = 1;
+var DIG_MAX_RETRY     = 100;
 var DIG_DEFAULT_TYPE      = 1;    # A — DNS_TYPE_A
 
 enum DigCliResult {
@@ -49,6 +57,8 @@ enum DigCliResult {
 
 var DIG_CLI_SIZE = 96;
 
+# Allocate a parse-result struct with the documented defaults already installed
+# (qtype=A, timeout=5s, retry=3). Never returns 0 — `alloc` aborts on exhaustion.
 fn dig_cli_new(): i64 {
     var r = alloc(DIG_CLI_SIZE);
     memset(r, 0, DIG_CLI_SIZE);
@@ -58,15 +68,33 @@ fn dig_cli_new(): i64 {
     return r;
 }
 
+# The query name as a cstr — a BORROWED pointer into argv, not a copy. Valid
+# for the life of the process. 0 if no positional name was supplied.
 fn dig_cli_name(r):       i64 { return load64(r); }
+# The raw text after '@' as a cstr (borrowed from argv), or 0 if no @server was
+# given. The PARSED form is `dig_cli_server_addr`; this is kept for diagnostics.
 fn dig_cli_server_str(r): i64 { return load64(r + 8); }
+# Query TYPE code (DNS_TYPE_*). Defaults to A when no type token was given.
 fn dig_cli_qtype(r):      i64 { return load64(r + 16); }
+# Per-try timeout in seconds (`+timeout=N`), default 5.
 fn dig_cli_timeout_s(r):  i64 { return load64(r + 24); }
+# Try budget (`+retry=N`), default 3. This is a count of ATTEMPTS, not of
+# retries after the first — `query_send_recv` loops it directly.
 fn dig_cli_retry(r):      i64 { return load64(r + 32); }
+# 1 if `+short` was given (bare rdata, one per line), else 0.
 fn dig_cli_short(r):      i64 { return load64(r + 40); }
+# 1 if `+tcp` was given. Accepted and recorded but NOT acted on — dig is UDP-only
+# until the 0.4.x TCP fallback lands. Reading this today tells you what the user
+# asked for, not what the transport did.
 fn dig_cli_tcp(r):        i64 { return load64(r + 48); }
+# 1 if `+nodnssec` was given. Accepted and recorded; dig performs no DNSSEC
+# validation either way (0.4.x).
 fn dig_cli_nodnssec(r):   i64 { return load64(r + 56); }
+# 1 if `-h`/`--help` was seen. The parser records it rather than exiting, so the
+# caller decides; `dig_cli_parse_argv` also short-circuits with DIG_CLI_HELP.
 fn dig_cli_help(r):       i64 { return load64(r + 64); }
+# The @server address in packed ip4() form (first octet in the high byte), or 0
+# if none was given. Already validated as a dotted quad by `ipv4_parse`.
 fn dig_cli_server_addr(r):i64 { return load64(r + 80); }
 
 # Lowercase a single ASCII byte. Non-ASCII passes through.
@@ -123,6 +151,15 @@ fn _dig_match_type(tok): i64 {
 # Parse a non-negative ASCII integer in `s` up to NUL or non-digit.
 # Returns the value (or -1 on no digits / overflow into negative i64
 # territory). Stops at first non-digit; doesn't require full consumption.
+# Parse a non-negative decimal integer from a cstr. Returns the value, or -1 if
+# there were no digits at all or the value is out of range.
+#
+# Digit count is capped at DIG_UINT_MAX_DIGITS. The old `if (v < 0)` check alone
+# was not sound: signed overflow wraps, so a long enough digit run lands back on
+# a positive value and passes the guard. Ten digits cannot overflow i64, so the
+# cap makes the check total rather than probabilistic. Ten digits is also ~317
+# years in seconds — nothing dig accepts needs more.
+var DIG_UINT_MAX_DIGITS = 10;
 fn _dig_parse_uint(s): i64 {
     var i = 0;
     var v = 0;
@@ -131,8 +168,8 @@ fn _dig_parse_uint(s): i64 {
         var c = load8(s + i);
         if (c < 48) { break; }
         if (c > 57) { break; }
+        if (i >= DIG_UINT_MAX_DIGITS) { return 0 - 1; }
         v = v * 10 + (c - 48);
-        if (v < 0) { return 0 - 1; }     # overflow guard
         any = 1;
         i = i + 1;
     }
@@ -176,6 +213,13 @@ fn _dig_apply_plus(reg, tok): i64 {
         if (eq_off < 0) { return 2; }
         var v = _dig_parse_uint(tok + eq_off + 1);
         if (v < 0) { return 2; }
+        # Clamp rather than reject, matching BIND: "if T is less than 1, the
+        # query timeout is set to 1 second". `+timeout=0` used to reach
+        # SO_RCVTIMEO as {0,0}, which Linux reads as "block indefinitely" — dig
+        # hung forever with no way out but a signal. The upper bound also keeps
+        # query.cyr's `t0 + timeout_s * 1000000` deadline from overflowing.
+        if (v < DIG_MIN_TIMEOUT_S) { v = DIG_MIN_TIMEOUT_S; }
+        if (v > DIG_MAX_TIMEOUT_S) { v = DIG_MAX_TIMEOUT_S; }
         store64(reg + 24, v);
         return 0;
     }
@@ -183,6 +227,11 @@ fn _dig_apply_plus(reg, tok): i64 {
         if (eq_off < 0) { return 2; }
         var v2 = _dig_parse_uint(tok + eq_off + 1);
         if (v2 < 0) { return 2; }
+        # Clamped both ways. Below 1 there would be no attempt at all; above
+        # DIG_MAX_RETRY the tool spends minutes re-asking a resolver that is not
+        # answering, which is never what the user meant.
+        if (v2 < DIG_MIN_RETRY) { v2 = DIG_MIN_RETRY; }
+        if (v2 > DIG_MAX_RETRY) { v2 = DIG_MAX_RETRY; }
         store64(reg + 32, v2);
         return 0;
     }
@@ -230,14 +279,24 @@ fn dig_cli_parse_argv(reg, ac, av): i64 {
         }
         else {
             # Type or name. Try type first; if it matches, set qtype.
-            # If we haven't seen a type yet AND this token doesn't
-            # look like a record-type literal, treat as name.
+            # Otherwise the first such token is the query name.
             var t = _dig_match_type(tok);
             if (t != 0) {
                 store64(reg + 16, t);
                 store64(reg + 72, 1);
             } else {
-                if (load64(reg) == 0) { store64(reg, tok); }
+                if (load64(reg) == 0) {
+                    store64(reg, tok);
+                } else {
+                    # A second bare token that is not a recognized record type.
+                    # Through 0.3.6 this was silently DISCARDED, so
+                    # `dig example.com BOGUSTYPE` quietly queried A and exited 0
+                    # — the user asked one question and got the answer to a
+                    # different one, with nothing on stderr to say so.
+                    # DIG_CLI_ERR_BAD_TYPE existed for this and was never
+                    # returned from anywhere; now it is.
+                    return DIG_CLI_ERR_BAD_TYPE;
+                }
             }
         }
         i = i + 1;

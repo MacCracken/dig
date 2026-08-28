@@ -7,8 +7,14 @@
 #
 # AGNOS branch landed 2026-06-14: src/platform_agnos.cyr replaces the POSIX
 # socket() path with the sovereign udp_bind/send/recv/unbind (#51-54) + getrandom
-# (#45) + FS syscalls via the CYRIUS_TARGET_AGNOS peer (cyrius >= 6.2.3). Windows
-# / macOS branches still TODO. Same dispatch posture as yo's src/platform.cyr.
+# (#45) + FS syscalls via the CYRIUS_TARGET_AGNOS peer (cyrius >= 6.2.3). Same
+# dispatch posture as yo's src/platform.cyr.
+#
+# NOTE THE DISPATCH IS TWO-WAY, NOT PER-TARGET: everything that is not AGNOS
+# gets platform_linux.cyr, including --aarch64 and --win. That is why the
+# Windows/macOS branches are a correctness item and not just a feature gap.
+# The bare TODO this comment used to carry is now tracked in roadmap.md § 0.7.x
+# (Host-target parity), together with the aarch64 wrong-syscall repair.
 
 #ifdef CYRIUS_TARGET_AGNOS
 include "src/platform_agnos.cyr"

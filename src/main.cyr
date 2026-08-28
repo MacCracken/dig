@@ -1,6 +1,7 @@
 # dig — main entry point
 # Stdlib auto-included via cyrius.cyml
 
+include "lib/cmdit.cyr"
 include "lib/taar.cyr"
 include "src/dns.cyr"
 include "src/platform.cyr"
@@ -9,33 +10,65 @@ include "src/cli.cyr"
 include "src/output.cyr"
 include "src/query.cyr"
 
-# Materialize args.cyr's argc/argv accessors into a contiguous
-# cstr-pointer array. Same shape yo uses.
-fn _materialize_argv(ac): i64 {
-    var av = alloc(ac * 8);
-    var i = 0;
-    while (i < ac) {
-        store64(av + i * 8, argv(i));
-        i = i + 1;
-    }
-    return av;
-}
-
+# Write a cstr to stderr.
 fn _eputs(s): i64 { syscall(1, 2, s, strlen(s)); return 0; }
 
+# Print the version line, same shape and same source of truth as the query
+# banner (`; <<>> dig X.Y.Z <<>>`) — both read _DIG_VERSION_STR, which is
+# CYRIUS_PKG_VERSION, which is [package].version, which is the VERSION file.
+fn _dig_print_version(): i64 {
+    _out_puts("dig ");
+    _out_puts(_DIG_VERSION_STR);
+    _out_puts("\n");
+    return 0;
+}
+
+# Program entry. Initializes the allocator and argv, parses the command line,
+# resolves the server to query, sends it and prints the answer.
+#
+# Returns the process exit status directly, following BIND's dig rather than the
+# 0/1/2 AGNOS userland convention, because matching upstream matters more here
+# than matching the family — scripts written against BIND's dig check these:
+#   0  success (also --help and --version)
+#   2  usage error — bad flag, bad @server, unknown record type, no name
+#   9  no usable answer — timed out, transport failed, or the response could not
+#      be parsed. BIND spells this "no reply from server".
+# cmdit's CMDIT_EXIT_OK / CMDIT_EXIT_USAGE name the first two; 9 has no cmdit
+# constant because it is not part of that convention.
 fn main() {
     alloc_init();
-    args_init();
+
+    # cmdit owns the boilerplate AROUND dig's grammar, not the grammar itself:
+    # --help/-h and --version/-V are registered for free and short-circuit here,
+    # and cmdit_argv does the argc()/argv(i) -> contiguous cstr* materialize that
+    # main.cyr used to hand-roll. dig's `@server` / `+flag` tokens are not
+    # getopt-shaped, so cmdit captures them as positionals and hands the whole
+    # array back through cmdit_raw_argv for src/cli.cyr to tokenize — the escape
+    # hatch cmdit documents for exactly this case.
+    var h = cmdit_new("dig");
+    var cr = cmdit_parse(h);
+    if (cr == CMDIT_HELP)    { dig_cli_print_help();  return CMDIT_EXIT_OK; }
+    if (cr == CMDIT_VERSION) { _dig_print_version();  return CMDIT_EXIT_OK; }
+    if (cr == CMDIT_RESULT_ERR) {
+        cmdit_print_error(h);
+        dig_cli_print_usage(2);
+        return CMDIT_EXIT_USAGE;
+    }
 
     var reg = dig_cli_new();
-    var ac = argc();
-    var av = _materialize_argv(ac);
-    var rc = dig_cli_parse_argv(reg, ac, av);
+    var rc = dig_cli_parse_argv(reg, cmdit_raw_argc(h), cmdit_raw_argv(h));
 
-    if (rc == DIG_CLI_HELP)            { dig_cli_print_help(); return 0; }
-    if (rc == DIG_CLI_ERR_PARSE)       { _eputs("dig: parse error\n");           dig_cli_print_usage(2); return 2; }
-    if (rc == DIG_CLI_ERR_BAD_SERVER)  { _eputs("dig: bad @server (need dotted-quad IPv4)\n"); return 2; }
-    if (rc == DIG_CLI_ERR_BAD_TYPE)    { _eputs("dig: unknown record type\n");   return 2; }
+    if (rc == DIG_CLI_HELP)            { dig_cli_print_help(); return CMDIT_EXIT_OK; }
+    if (rc == DIG_CLI_ERR_PARSE) {
+        _eputs("dig: parse error\n");
+        dig_cli_print_usage(2);
+        return CMDIT_EXIT_USAGE;
+    }
+    if (rc == DIG_CLI_ERR_BAD_SERVER) {
+        _eputs("dig: bad @server (need dotted-quad IPv4)\n");
+        return CMDIT_EXIT_USAGE;
+    }
+    if (rc == DIG_CLI_ERR_BAD_TYPE)    { _eputs("dig: unknown record type\n");   return CMDIT_EXIT_USAGE; }
 
     var name = dig_cli_name(reg);
     if (name == 0) {
@@ -129,7 +162,8 @@ fn main() {
     output_print_question(name, qtype);
 
     if (dns_hdr_truncated(rx) == 1) {
-        _out_puts(";; WARNING: response truncated (TC=1) — retry over TCP (0.4.x: +tcp will do this automatically)\n");
+        _out_puts(";; WARNING: response truncated (TC=1) — retry over TCP");
+        _out_puts(" (0.4.x: +tcp will do this automatically)\n");
     }
     if (ancount > 0) {
         _out_puts(";; ANSWER\n");

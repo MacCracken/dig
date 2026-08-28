@@ -24,6 +24,80 @@ var _DIG_VERSION_STR = CYRIUS_PKG_VERSION;
 fn _out_puts(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
 fn _out_eputs(s): i64 { syscall(1, 2, s, strlen(s)); return 0; }
 
+# RFC 1035 §5.1 presentation escaping into a caller buffer. Returns bytes
+# written, or -1 if the result would not fit `dst_cap` (refuses, never truncates).
+#
+# EVERY byte that reaches stdout from a DNS response goes through here. Labels
+# and TXT character-strings are arbitrary octet runs on the wire — the RFC
+# constrains their LENGTH, not their content — so before 0.3.7 a response could
+# put raw control bytes on the user's terminal. Demonstrated, not theorised: a
+# TXT record carrying CR + ESC [ 2 K erases the line dig just printed and
+# repaints whatever it likes, and needs no spoofing at all, only a zone the
+# attacker controls. An embedded 0x0A forges an extra line in `+short`, the form
+# scripts read with `for ip in $(dig +short ...)`. An embedded NUL used to
+# truncate the whole name at the first one, because the sink was strlen-based.
+#
+# Length-driven, never strlen — see dns_decode_name's `out_len`.
+#
+# `esc_space` selects context. A bare space is ambiguous in an unquoted name, so
+# names pass 1 and get `\032` (what BIND prints). TXT is already delimited by
+# quotes and passes 0 — escaping there would render the near-universal
+# `v=spf1 -all` as `v=spf1\032-all` for no benefit. Control bytes are escaped in
+# BOTH contexts; that is the security-relevant half and it is not configurable.
+#
+# KNOWN LIMIT: a literal 0x2E inside a label is NOT escaped as `\.`, because
+# dns_decode_name flattens labels into a dotted string and by the time bytes
+# reach here a separator dot and an in-label dot are indistinguishable. A
+# BIND-fidelity gap with no security consequence; closing it needs the
+# decoder-side rewrite parked at 0.4.x.
+fn _esc_to_buf(dst, dst_cap, src, n, esc_space): i64 {
+    var o = 0;
+    var i = 0;
+    while (i < n) {
+        var c = load8(src + i);
+        var esc = 0;
+        if (c == 92)       { esc = 1; }
+        elif (c == 34)     { esc = 2; }
+        elif (c == 32)     { if (esc_space == 1) { esc = 3; } }
+        elif (c < 32)      { esc = 3; }
+        elif (c > 126)     { esc = 3; }
+        if (esc == 1) {
+            if (o + 2 > dst_cap) { return 0 - 1; }
+            store8(dst + o, 92); store8(dst + o + 1, 92);
+            o = o + 2;
+        } elif (esc == 2) {
+            if (o + 2 > dst_cap) { return 0 - 1; }
+            store8(dst + o, 92); store8(dst + o + 1, 34);
+            o = o + 2;
+        } elif (esc == 3) {
+            if (o + 4 > dst_cap) { return 0 - 1; }
+            store8(dst + o,     92);
+            store8(dst + o + 1, 48 + ((c / 100) % 10));
+            store8(dst + o + 2, 48 + ((c / 10) % 10));
+            store8(dst + o + 3, 48 + (c % 10));
+            o = o + 4;
+        } else {
+            if (o + 1 > dst_cap) { return 0 - 1; }
+            store8(dst + o, c);
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+    return o;
+}
+
+# Write `n` bytes to stdout with the escaping above. Callers pass at most
+# DNS_MAX_NAME_LEN (255) bytes — a name, or one TXT character-string — and the
+# 1024-byte scratch covers the 4x worst case (255 * 4 = 1020) with room to
+# spare. An over-long input is refused rather than truncated.
+fn _out_escaped(p, n, esc_space): i64 {
+    var eb[1024];
+    var w = _esc_to_buf(&eb, 1024, p, n, esc_space);
+    if (w < 0) { return 0 - 1; }
+    syscall(1, 1, &eb, w);
+    return 0;
+}
+
 # Type-code → "A" / "AAAA" / "MX" / ... mnemonic. Returns a cstr.
 fn output_type_str(t): i64 {
     if (t == DNS_TYPE_A)     { return "A"; }
@@ -44,6 +118,9 @@ fn output_type_str(t): i64 {
     return "TYPE?";
 }
 
+# RCODE -> mnemonic ("NOERROR", "NXDOMAIN", ...) as a cstr, BIND spelling.
+# Unknown codes fall back to a placeholder rather than reading off a table, so
+# an attacker-chosen RCODE cannot index out of range.
 fn output_rcode_str(r): i64 {
     if (r == DNS_RCODE_NOERROR)  { return "NOERROR"; }
     if (r == DNS_RCODE_FORMERR)  { return "FORMERR"; }
@@ -64,7 +141,10 @@ fn output_print_rdata(msg, msg_len, rr, next_off): i64 {
     if (t == DNS_TYPE_A) {
         if (rdlen != 4) { return 0 - 1; }
         var buf[16];
-        var packed = (load8(msg + rdoff) << 24) | (load8(msg + rdoff + 1) << 16) | (load8(msg + rdoff + 2) << 8) | load8(msg + rdoff + 3);
+        var packed = (load8(msg + rdoff) << 24)
+        | (load8(msg + rdoff + 1) << 16)
+        | (load8(msg + rdoff + 2) << 8)
+        |  load8(msg + rdoff + 3);
         var n = ipv4_format_to_buf(packed, &buf);
         syscall(1, 1, &buf, n);
         return 0;
@@ -90,33 +170,37 @@ fn output_print_rdata(msg, msg_len, rr, next_off): i64 {
         fmt_int(prio);
         _out_puts(" ");
         var nbuf[256];
-        var nend = dns_decode_name(msg, msg_len, rdoff + 2, &nbuf);
+        var nl0[8];
+        var nend = dns_decode_name(msg, msg_len, rdoff + 2, &nbuf, &nl0);
         if (nend == 0) { return 0 - 1; }
-        _out_puts(&nbuf);
+        _out_escaped(&nbuf, load64(&nl0), 1);
         _out_puts(".");
         return 0;
     }
     if (t == DNS_TYPE_NS) {
         var nb1[256];
-        var ne1 = dns_decode_name(msg, msg_len, rdoff, &nb1);
+        var nl1[8];
+        var ne1 = dns_decode_name(msg, msg_len, rdoff, &nb1, &nl1);
         if (ne1 == 0) { return 0 - 1; }
-        _out_puts(&nb1);
+        _out_escaped(&nb1, load64(&nl1), 1);
         _out_puts(".");
         return 0;
     }
     if (t == DNS_TYPE_CNAME) {
         var nb2[256];
-        var ne2 = dns_decode_name(msg, msg_len, rdoff, &nb2);
+        var nl2[8];
+        var ne2 = dns_decode_name(msg, msg_len, rdoff, &nb2, &nl2);
         if (ne2 == 0) { return 0 - 1; }
-        _out_puts(&nb2);
+        _out_escaped(&nb2, load64(&nl2), 1);
         _out_puts(".");
         return 0;
     }
     if (t == DNS_TYPE_PTR) {
         var nb3[256];
-        var ne3 = dns_decode_name(msg, msg_len, rdoff, &nb3);
+        var nl3[8];
+        var ne3 = dns_decode_name(msg, msg_len, rdoff, &nb3, &nl3);
         if (ne3 == 0) { return 0 - 1; }
-        _out_puts(&nb3);
+        _out_escaped(&nb3, load64(&nl3), 1);
         _out_puts(".");
         return 0;
     }
@@ -131,7 +215,7 @@ fn output_print_rdata(msg, msg_len, rr, next_off): i64 {
             if (p + 1 + l > end) { return 0 - 1; }
             if (first == 0) { _out_puts(" "); }
             _out_puts("\"");
-            syscall(1, 1, msg + p + 1, l);
+            if (l > 0) { _out_escaped(msg + p + 1, l, 0); }
             _out_puts("\"");
             p = p + 1 + l;
             first = 0;
@@ -140,13 +224,15 @@ fn output_print_rdata(msg, msg_len, rr, next_off): i64 {
     }
     if (t == DNS_TYPE_SOA) {
         var nb4[256];
-        var ne4 = dns_decode_name(msg, msg_len, rdoff, &nb4);
+        var nl4[8];
+        var ne4 = dns_decode_name(msg, msg_len, rdoff, &nb4, &nl4);
         if (ne4 == 0) { return 0 - 1; }
-        _out_puts(&nb4); _out_puts(". ");
+        _out_escaped(&nb4, load64(&nl4), 1); _out_puts(". ");
         var nb5[256];
-        var ne5 = dns_decode_name(msg, msg_len, ne4, &nb5);
+        var nl5[8];
+        var ne5 = dns_decode_name(msg, msg_len, ne4, &nb5, &nl5);
         if (ne5 == 0) { return 0 - 1; }
-        _out_puts(&nb5); _out_puts(". ");
+        _out_escaped(&nb5, load64(&nl5), 1); _out_puts(". ");
         if (ne5 + 20 > rdoff + rdlen) { return 0 - 1; }
         fmt_int(_dns_load_u32(msg, ne5));       _out_puts(" ");
         fmt_int(_dns_load_u32(msg, ne5 + 4));   _out_puts(" ");
@@ -164,9 +250,10 @@ fn output_print_rdata(msg, msg_len, rr, next_off): i64 {
         fmt_int(weight); _out_puts(" ");
         fmt_int(port);   _out_puts(" ");
         var nb6[256];
-        var ne6 = dns_decode_name(msg, msg_len, rdoff + 6, &nb6);
+        var nl6[8];
+        var ne6 = dns_decode_name(msg, msg_len, rdoff + 6, &nb6, &nl6);
         if (ne6 == 0) { return 0 - 1; }
-        _out_puts(&nb6); _out_puts(".");
+        _out_escaped(&nb6, load64(&nl6), 1); _out_puts(".");
         return 0;
     }
     # Unknown type — print raw bytes as a hex dump fallback.
@@ -201,9 +288,10 @@ fn output_print_question(name, qtype): i64 {
 # Print one ANSWER RR line: `name. ttl IN TYPE rdata`.
 fn output_print_answer_rr(msg, msg_len, rr, next_off): i64 {
     var nbuf[256];
-    var ne = dns_decode_name(msg, msg_len, dns_rr_name_off(rr), &nbuf);
+    var nl7[8];
+    var ne = dns_decode_name(msg, msg_len, dns_rr_name_off(rr), &nbuf, &nl7);
     if (ne == 0) { return 0 - 1; }
-    _out_puts(&nbuf);
+    _out_escaped(&nbuf, load64(&nl7), 1);
     _out_puts(".\t");
     fmt_int(dns_rr_ttl(rr));
     _out_puts("\tIN\t");
