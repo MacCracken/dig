@@ -86,10 +86,17 @@ fn platform_read_file(path, buf, maxlen): i64 {
 # leased gateway), packed first-octet-high-byte; 0 if unconfigured. resolv_discover
 # prefers this over /etc/resolv.conf + the off-subnet 8.8.8.8 fallback: the leased
 # resolver is on-subnet, so it routes without depending on gateway-MAC egress (the
-# QEMU-passed / iron-failed gap for bare `dig <host>`). Raw syscall #61 (cyrius is
-# hands-off; a future sys_net_config wrapper replaces this — see the agnos issue
-# 2026-06-23-agnos-net-config-syscall-wrapper). Requires agnos >= 1.45.16.
-fn platform_dns_server(): i64 { return syscall(61, 3); }
+# QEMU-passed / iron-failed gap for bare `dig <host>`). Requires agnos >= 1.45.16.
+#
+# 0.3.5 shipped this as a raw `syscall(61, 3)` because dig's 6.2.24 pin predated
+# the wrapper. cyrius >= 6.2.39 added `sys_net_config(field)` plus the named field
+# accessors to the agnos syscall peer, closing the agnos issue
+# 2026-06-23-agnos-net-config-syscall-wrapper that this cohort filed — dig simply
+# sat 15 patches below it until the 0.3.6 pin bump. The last raw syscall literal
+# on this backend is now retired: same #61/field=3, via the shared wrapper.
+# Using the wrapper also contains a real hazard — on Linux, syscall 61 is wait4,
+# so the bare number is only safe inside an agnos-only arm.
+fn platform_dns_server(): i64 { return sys_net_dns_server(); }
 
 # 2 bytes of hardware entropy (RDRAND) for the DNS query ID (RFC 5452).
 fn platform_random_u16(): i64 {

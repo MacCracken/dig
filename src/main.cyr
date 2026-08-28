@@ -63,12 +63,12 @@ fn main() {
     store64(query_us_slot, 0);
 
     var qr = query_send_recv(
-        server, name, qtype,
-        dig_cli_timeout_s(reg),
-        dig_cli_retry(reg),
-        rx, DNS_MAX_UDP_PAYLOAD,
-        resp_len_slot, query_us_slot
-    );
+      server, name, qtype,
+      dig_cli_timeout_s(reg),
+      dig_cli_retry(reg),
+      rx, DNS_MAX_UDP_PAYLOAD,
+      resp_len_slot, query_us_slot
+      );
 
     if (qr == QRY_SOCKET) {
         _eputs("dig: cannot open UDP socket\n");

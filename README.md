@@ -8,7 +8,7 @@ DNS resolver written in [Cyrius](https://github.com/MacCracken/cyrius). Sovereig
 
 ```sh
 $ dig example.com
-; <<>> dig 0.1.0 <<>> example.com
+; <<>> dig 0.3.6 <<>> example.com
 ;; QUESTION
 ;example.com.        IN    A
 ;; ANSWER

@@ -4,6 +4,88 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.6] — 2026-08-27 (toolchain 6.5.35 + taar 0.5.0; the banner stops lying)
+
+Dependency-and-pin refresh that closes a two-release version-reporting bug and
+retires this repo's last raw syscall literal. No DNS behaviour changes.
+
+### Fixed
+- **The `; <<>> dig X.Y.Z <<>>` banner had reported `0.3.3` since 0.3.4.**
+  `src/output.cyr` carried a hand-maintained `_DIG_VERSION_STR = "0.3.3"` that
+  nobody bumped at 0.3.4 or 0.3.5, so both of those releases identified
+  themselves as 0.3.3 in every non-`+short` query. Rather than bump the literal
+  a third time, the constant now derives from the compiler-injected
+  `CYRIUS_PKG_VERSION`, which resolves `[package].version` — itself now
+  `${file:VERSION}`. `VERSION` is the single source of truth end to end and the
+  class of drift is closed, not patched.
+
+  This needs **cyrius ≥ 6.5.34**: the constant was added at 6.5.21 but resolved
+  only in the *entry* file until 6.5.34 fixed include visibility, and
+  `output.cyr` is included by `main.cyr`, not the entry. The pin bump below is
+  what makes the fix expressible.
+
+### Changed
+- **Toolchain pin 6.2.24 → 6.5.35** (`cyrius.cyml [package].cyrius`). Three minor
+  lines and ~200 patches, and it is **source-clean**: diffing cyrius's
+  `docs/api-surface.snapshot` between the two tags, filtered to the eleven stdlib
+  modules dig declares, gives **203 → 233 symbols with zero removals and zero
+  arity changes**. Nothing dig calls moved. That matters more than usual now that
+  6.5.1 made arity mismatch a hard error rather than a warning.
+
+  Clears the wrapper/manifest drift warning (the installed wrapper was already
+  6.5.35) and brings the vendored `lib/` snapshot forward — all 26 stdlib modules
+  had been frozen at the 6.2.24 snapshot and now match 6.5.35 byte for byte.
+  Aligns dig with the rest of the network-tools family: `taar`, `yo` and `whirl`
+  are all on 6.5.35.
+- **`[package].version` is now `${file:VERSION}`** instead of a duplicated
+  literal — see Fixed above.
+- **`platform_dns_server` retires its raw `syscall(61, 3)`.** The wrapper the
+  0.3.5 code comment was waiting on has existed since **cyrius 6.2.39** —
+  `sys_net_config(field)` plus the named accessors (`sys_net_ip` /
+  `sys_net_netmask` / `sys_net_gateway` / `sys_net_dns_server`), which closed the
+  agnos issue `2026-06-23-agnos-net-config-syscall-wrapper` this very cohort
+  filed. dig was pinned at 6.2.24 and so sat 15 patches below its own fix for two
+  months; the pin bump is what makes it reachable, not 6.5.35 itself.
+  `src/platform_agnos.cyr` now calls `sys_net_dns_server()` — same syscall, same
+  field, no magic number, and the last raw syscall literal on the AGNOS backend
+  is gone. This is not merely cosmetic: **on Linux, syscall 61 is `wait4`**, so
+  the bare number was one misplaced `#ifdef` away from being a live hazard; the
+  agnos-only wrapper contains it. Still requires agnos ≥ 1.45.16.
+- **`taar` dep 0.3.1 → 0.5.0.** Matches the pins `yo` and `whirl` already carry;
+  taar's own 0.4.0/0.5.0 notes name dig 0.3.5 as the last stale consumer, so this
+  closes that out. **The stale tag had been masked locally**: `[deps.taar]`
+  carries both `path = "../taar"` and `git`+`tag`, and `path` wins for local dev,
+  so every build on this machine was already compiling the sibling checkout's
+  0.5.0 bundle while CI — which has no sibling and takes the `git`+`tag` path —
+  was building 0.3.1. Local and CI were compiling different taar versions and
+  nothing said so. They agree again now (tag `0.5.0` = `450745d`, confirmed
+  published and byte-identical to the local `dist/taar.cyr`).
+  taar 0.4.0 added DNS-over-TCP with RFC 1035 §4.2.2 truncation fallback and
+  0.5.0 split the AGNOS `taar_tcp_recv` timeout-vs-clean-close contract — both
+  on taar's own DNS path, which dig does not call. dig still consumes only the
+  `ipv4_*` codec, so its behavioural surface is unchanged. The bump does resolve
+  a real build wart: taar 0.5.0's bundle calls `sys_net_dns_server()`, absent
+  from the 6.2.24 stdlib, so the AGNOS build emitted
+  `warning: undefined function 'sys_net_dns_server'`. On 6.5.35 the symbol
+  exists and the warning is gone.
+- **`src/main.cyr` reformatted by the 6.5.35 formatter** — multi-line call
+  arguments reindent 8 → 6 spaces. Mechanical, `cyrius fmt` output at the new
+  pin; keeps `cyrius audit`'s fmt dimension green.
+
+### Notes
+- Host build, `--agnos` build and **70/70 tests** all green at the new pin. Live
+  resolution re-smoked against the systemd-resolved stub (`127.0.0.53`) —
+  `example.com` returns A records and the banner now reads `0.3.6`.
+- **`CYRIUS_DCE=1` no longer shrinks the image.** At 6.5.35 it NOPs unreachable
+  code in place rather than eliminating it: 132,472 bytes either way, against
+  state.md's 6.2.x-era claim that it trimmed ~58 KB. The size figures there are
+  corrected.
+- `cyrius audit` still reports 2 lint warnings (>120-char lines in `main.cyr`
+  and `output.cyr`), one untracked `TODO` deferral in `platform.cyr`, and 33
+  undocumented public fns. All pre-date this release and are untouched here —
+  they are a quality sweep, not a pin bump.
+
+
 ## [0.3.5] — 2026-06-23
 
 ### Changed

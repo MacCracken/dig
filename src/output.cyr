@@ -14,7 +14,12 @@
 # Per-type formatting lives in `output_print_rdata` so adding a new
 # RR type is a single switch arm.
 
-var _DIG_VERSION_STR = "0.3.3";
+# Banner version. Derived from `[package].version` (itself `${file:VERSION}`)
+# via the compiler-injected `CYRIUS_PKG_VERSION` constant — hand-maintained
+# until 0.3.6, where it had silently reported 0.3.3 for two releases.
+# Requires cyrius >= 6.5.34: the constant resolved only in the entry file
+# before that, and output.cyr is included by main.cyr, not the entry.
+var _DIG_VERSION_STR = CYRIUS_PKG_VERSION;
 
 fn _out_puts(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
 fn _out_eputs(s): i64 { syscall(1, 2, s, strlen(s)); return 0; }
