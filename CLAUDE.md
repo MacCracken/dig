@@ -20,9 +20,9 @@
 
 ## Goal
 
-Own the **DNS-resolver surface** in the AGNOS network-tools family: A / AAAA / MX / TXT / NS / CNAME / SOA / SRV / PTR queries against arbitrary resolvers, with `+short` / `+trace` / `+tcp` / `+dnssec` flag aesthetics from upstream BIND. Cyrius-native, no POSIX `socket()` — consumes the kernel's sovereign `udp_send` / `udp_recv` / `tcp_connect` primitives per the kernel-grows-for-native-workloads rule.
+Own the **DNS-resolver surface** in the AGNOS network-tools family: A / AAAA / MX / TXT / NS / CNAME / SOA / SRV / PTR queries against arbitrary resolvers, with `+short` / `+trace` / `+tcp` / `+dnssec` flag aesthetics from upstream BIND. Cyrius-native, with a **per-backend sovereignty rule**: the Linux backend uses POSIX `socket()` pragmatically; the AGNOS backend consumes the kernel's sovereign `udp_bind` / `udp_send` / `udp_recv` / `udp_unbind` primitives per the kernel-grows-for-native-workloads rule. The v1.0 gate enforces no-POSIX on the AGNOS backend only.
 
-**Strategic position — extraction trigger for `taar`**. Second entry in the network-tools family (after `yo`); the duplication friction between yo (ICMP) and dig (DNS + UDP/TCP-53 sockets — orthogonal protocol surface) is what shapes taar's API honestly. Per user direction 2026-05-23: yo → dig → extract taar (at dig completion) → whirl consumes already-extracted taar. The three-consumer brainstorm window (yo + dig + whirl) pins taar's eventual scope; dig completion is the extraction trigger. Same shape as mihi → iam/chakshu (2026-05-20).
+**Strategic position — `taar` consumer**. Second entry in the network-tools family (after `yo`). The durable rule: extract shared substrate at the duplication point, not at a version milestone — the friction between yo (ICMP) and dig (DNS + UDP/TCP-53 sockets, an orthogonal protocol surface) is what shapes `taar`'s API honestly, and real consumers pin its scope. Same shape as mihi → iam/chakshu. Current extraction/migration status lives in [`docs/development/state.md`](docs/development/state.md).
 
 ## Current State
 

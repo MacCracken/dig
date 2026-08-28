@@ -17,19 +17,18 @@ example.com.   3600  IN    A    93.184.216.34
 
 $ dig +short example.com AAAA
 2606:2800:21f:cb07:6820:80da:af6b:8b2c
-
-$ dig +trace google.com
-;; root  -> .                NS  a.root-servers.net.
-;; tld   -> com.             NS  a.gtld-servers.net.
-;; auth  -> google.com.      NS  ns1.google.com.
-;; final -> google.com.      A   142.250.80.46
 ```
+
+**Planned, not implemented**: `+trace` (manual recursion — root → TLD → authoritative,
+printing each step) is a 0.4.x backlog item. `src/cli.cyr` does not recognize the flag;
+it is soft-accepted and ignored, so `dig +trace google.com` today performs an ordinary
+query. See [`docs/development/roadmap.md`](docs/development/roadmap.md) § 0.4.x.
 
 Same shape as BIND's `dig` but Cyrius-native end to end:
 
-- No POSIX `socket()` — kernel exposes a sovereign `udp_send` / `udp_recv` / `tcp_connect` surface. Per [[project_agnos_kernel_growth_rules]] we add what `dig` actually needs, not POSIX emulation.
-- No `libc`, no `libresolv`, no `libbind`. RFC 1035 + RFC 3596 (AAAA) + RFC 2782 (SRV) + RFC 4034 (DNSSEC RRSIG/DNSKEY) all parsed in Cyrius.
-- Reads naturally as a verb: `dig example.com`, `dig +short MX gmail.com`, `dig +trace +tcp +dnssec example.com`.
+- **Per-backend sovereignty.** The Linux backend (`src/platform_linux.cyr`) uses POSIX `socket()` / `sendto` / `recvfrom` pragmatically — same posture as `yo`. The AGNOS backend (`src/platform_agnos.cyr`) uses the sovereign `udp_bind` / `udp_send` / `udp_recv` / `udp_unbind` kernel primitives with no POSIX. The v1.0 gate enforces no-POSIX **on the AGNOS backend only**. Per [[project_agnos_kernel_growth_rules]] the kernel grows what `dig` actually needs, not POSIX emulation.
+- No `libc`, no `libresolv`, no `libbind`. RFC 1035 + RFC 3596 (AAAA) + RFC 2782 (SRV) all parsed in Cyrius. DNSSEC (RFC 4034) is **not** parsed or validated: `+dnssec` is accepted with no effect, and RRSIG / DNSKEY / DS / NSEC are recognized as type mnemonics only. The validation ladder is 0.4.x.
+- Reads naturally as a verb: `dig example.com`, `dig +short MX gmail.com`, `dig @1.1.1.1 +short example.com AAAA`.
 
 ## Why use it
 
@@ -50,11 +49,7 @@ Toolchain pin lives in `cyrius.cyml` (`[package].cyrius`). Don't hardcode it in 
 
 ## Install
 
-```sh
-sh scripts/install.sh                  # copies build/dig → ~/.cyrius/bin/
-```
-
-Or drop the built binary anywhere on `$PATH`. No runtime deps.
+Drop the built binary anywhere on `$PATH`. No runtime deps.
 
 ## Family
 

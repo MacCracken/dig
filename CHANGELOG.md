@@ -4,6 +4,68 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+- **`README.md` made four claims the tree contradicts at 0.3.6.** All four were
+  documentation-only; no source changed.
+  - The `## What it does` block showed a worked `dig +trace google.com` session
+    with root → TLD → auth → final output. `+trace` is a 0.4.x backlog item and
+    `src/cli.cyr` has no case for it — it falls through to the soft-accept arm,
+    so that command silently runs an ordinary A query. The fake transcript is
+    gone, replaced by an explicit *planned, not implemented* note pointing at
+    the roadmap. The `+trace +tcp +dnssec` ergonomics example went with it.
+  - "RFC 1035 + RFC 3596 (AAAA) + RFC 2782 (SRV) + RFC 4034 (DNSSEC
+    RRSIG/DNSKEY) all parsed in Cyrius" overstated by one RFC. DNSSEC rdata is
+    not parsed and no chain is validated; `RRSIG` / `DNSKEY` / `DS` / `NSEC`
+    exist only as type-code constants in `src/dns.cyr` and mnemonics in
+    `output_type_str`. The RFC 4034 clause is dropped and the gap stated.
+  - "No POSIX `socket()` — kernel exposes a sovereign `udp_send` / `udp_recv` /
+    `tcp_connect` surface" contradicted the actual rule and the actual code:
+    `src/platform_linux.cyr` is the pragmatic-POSIX arm and issues raw
+    `socket` / `sendto` / `recvfrom` syscalls by design. Restated as the
+    per-backend rule already documented in `docs/development/state.md`
+    § *Sovereignty posture* — POSIX on Linux, sovereign primitives on AGNOS,
+    no-POSIX enforced at the v1.0 gate on the AGNOS backend only.
+  - `## Install` told the reader to run `sh scripts/install.sh`. There is no
+    `scripts/` directory in this repo and never has been. The block is deleted;
+    the "drop the built binary anywhere on `$PATH`" line was already correct and
+    is now the whole section.
+
+### Changed
+- **`CLAUDE.md` carried the same no-POSIX overclaim in its Goal section** —
+  restated as the per-backend rule, matching the README fix above.
+- **`CLAUDE.md`'s "Strategic position" paragraph leaked volatile state.** It
+  framed the `taar` extraction as still pending ("dig completion is the
+  extraction trigger") when the extraction fired 2026-06-15 at dig 0.3.3 /
+  yo 0.5.5, taar is 0.5.0, and whirl 0.6.13 is already the third consumer. Per
+  this file's own header rule, that status belongs in
+  `docs/development/state.md`; the paragraph is trimmed to the durable
+  rationale — extract at the duplication point, not at a version milestone.
+
+### Fixed
+- **The three test-harness gates could score PASS with 256 failures.**
+  `tests/dig.tcyr`, `tests/dig.bcyr` and `tests/dig.fcyr` each ended with a bare
+  `syscall(60, r)` passing the harness result straight out as the process exit
+  status. A wait status is only 8 bits, so exactly 256 / 512 / 768 failures
+  truncate to 0 and the gate reports PASS — `assert_summary()` returns a raw
+  failure *count*, not a boolean, so the count is the exit code. All three now
+  clamp any non-zero result to 1 before exiting.
+
+  Latent here (dig has 70 assertions, so 256 is not currently reachable) but
+  unsound in principle, and reachable in practice next door: sibling `yo` hit it
+  with 365 assertions and fixed it at yo 0.5.9, whose trailer shape this matches
+  byte for byte — the two repos are meant to stay structurally identical. cyrius
+  fixed the same defect in its own `cyrius init` scaffold template at 6.5.6.
+
+### Changed
+- **The test harnesses retire this repo's last raw syscall literals.** The same
+  three files now call `sys_exit_group(r)` instead of `syscall(60, r)`. The bare
+  literal was x86_64-specific — `SYS_EXIT` is 60 on x86_64 Linux but 93 on
+  aarch64 and 0 on AGNOS, so the harnesses would have exited via the wrong
+  syscall on any non-x86_64 backend. 0.3.6 retired the last raw literal in
+  `src/`; `tests/` had been missed. This is the form `src/main.cyr` and
+  `src/test.cyr` already used, and the form the pinned 6.5.35 `cyrius init`
+  template emits.
+
 ## [0.3.6] — 2026-08-27 (toolchain 6.5.35 + taar 0.5.0; the banner stops lying)
 
 Dependency-and-pin refresh that closes a two-release version-reporting bug and
