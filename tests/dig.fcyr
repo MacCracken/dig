@@ -1,20 +1,262 @@
-# dig fuzz harness
+# dig — DNS response-frame fuzz harness (`cyrius fuzz`).
+#
+# dig's threat model is a HOSTILE DATAGRAM: platform_udp_recv hands the
+# response parser (rx, n) bytes that an off-path attacker may have chosen
+# in full. This harness drives that path with adversarial input and asserts
+# the invariants every parse must hold, no matter how malformed the bytes:
+#
+#   1. SURVIVAL — every entry point returns. No fault, no unbounded loop.
+#                 (A compression-pointer cycle is the classic hang here.)
+#   2. CONTRACT — the documented result shape holds on EVERY path:
+#                 dns_decode_name / dns_skip_name / dns_parse_rr return
+#                 either 0 (reject) or an offset that is strictly greater
+#                 than where they started and never past msg_len. An offset
+#                 past msg_len is the precondition for the out-of-bounds
+#                 read in output_print_rdata's TXT/hex arms.
+#   3. NO FORGERY — dns_question_matches returns 1 only for a datagram whose
+#                 echoed question really is the one we asked.
+#
+# Since 0.3.8 the output_print_rdata call below also drives the presentation
+# escaper and the validate-before-emit / RDLENGTH-bound checks, so hostile
+# rdata exercises the rendering path too, not only the parser.
+#
+# Replaces the 0.3.7 stub, which was `if (len == 0) { return 0; } return 0;`
+# with NO include of any src/ module, called once with the literal "test".
+# `cyrius fuzz` printed PASS — worse than having no target at all, because it
+# read as coverage. Proven: with dns_parse_rr's rdlength bound deleted, the unit
+# suite stayed green and the stub still passed, while this harness faults.
+#
+# Invariant 2 is what a crash-only fuzzer misses: dns_parse_rr returning
+# rdata+rdlen unchecked does not crash *here*, it crashes in the formatter
+# that trusts the offset.
+#
+# Stack-array note: `var buf[N]` reserves N BYTES; `buf` as an rvalue is the
+# first 8 bytes, not the address — pass `&buf`.
 
-fn fuzz_main(data, len) {
-    if (len == 0) { return 0; }
+include "lib/cmdit.cyr"
+include "lib/taar.cyr"
+include "src/dns.cyr"
+include "src/platform.cyr"
+include "src/resolv.cyr"
+include "src/cli.cyr"
+include "src/output.cyr"
+include "src/query.cyr"
+
+var FZ_CAP = 512;          # DNS_MAX_UDP_PAYLOAD — the real rx buffer size
+
+# ---- deterministic LCG so every failure reproduces from its seed ----
+var _fz_state = 0;
+fn _fz_seed(s): i64 { _fz_state = s; return 0; }
+fn _fz_next(): i64 {
+    _fz_state = _fz_state * 6364136223846793005 + 1442695040888963407;
+    return (_fz_state >> 33) & 255;
+}
+fn _fz_fill(buf, len): i64 {
+    var i = 0;
+    while (i < len) { store8(buf + i, _fz_next()); i = i + 1; }
     return 0;
 }
 
-fn main() {
-    alloc_init();
-    fuzz_main("test", 4);
-    println("fuzz: ok");
+# ---- seed corpus: a well-formed A response for "a.com" ----
+# Returns length; writes into buf (>= 64 bytes).
+fn fz_valid_a(buf): i64 {
+    memset(buf, 0, 64);
+    store8(buf + 0, 0x12); store8(buf + 1, 0x34);          # id
+    store8(buf + 2, 0x81); store8(buf + 3, 0x80);          # QR RD RA NOERROR
+    store8(buf + 4, 0); store8(buf + 5, 1);                # qd 1
+    store8(buf + 6, 0); store8(buf + 7, 1);                # an 1
+    store8(buf + 12, 1); store8(buf + 13, 97);             # "a"
+    store8(buf + 14, 3); store8(buf + 15, 99);
+    store8(buf + 16, 111); store8(buf + 17, 109);          # "com"
+    store8(buf + 18, 0);
+    store8(buf + 19, 0); store8(buf + 20, 1);              # qtype A
+    store8(buf + 21, 0); store8(buf + 22, 1);              # qclass IN
+    store8(buf + 23, 0xC0); store8(buf + 24, 12);          # name ptr
+    store8(buf + 25, 0); store8(buf + 26, 1);              # type A
+    store8(buf + 27, 0); store8(buf + 28, 1);              # class IN
+    store8(buf + 31, 1); store8(buf + 32, 44);             # ttl 300
+    store8(buf + 33, 0); store8(buf + 34, 4);              # rdlen 4
+    store8(buf + 35, 93); store8(buf + 36, 184);
+    store8(buf + 37, 216); store8(buf + 38, 34);
+    return 39;
+}
+
+# ---- the invariant battery, run over one (msg, len) ----
+fn fz_check(msg, len, label): i64 {
+    var out[DNS_NAME_BUF_LEN];
+    var outl[8];
+
+    # Names: decode and skip must agree on "reject or land in range".
+    var probe = 12;
+    while (probe < len) {
+        var d = dns_decode_name(msg, len, probe, &out, &outl);
+        assert(d == 0 || (d > probe && d <= len), label);
+        var s = dns_skip_name(msg, len, probe);
+        assert(s == 0 || (s > probe && s <= len), label);
+        # Both guard the same frame; neither may accept what the other
+        # rejects as OUT OF RANGE (they may disagree on name length).
+        probe = probe + 1;
+    }
+
+    # Section walk, bounded by the ATTACKER'S ancount.
+    var start = dns_answer_section_start(msg, len);
+    assert(start == 0 || (start >= DNS_HEADER_LEN && start <= len), label);
+    if (start > 0) {
+        var rr = alloc(DNS_RR_SIZE);
+        var an = dns_hdr_ancount(msg);
+        var off = start;
+        var k = 0;
+        while (k < an) {
+            var nx = dns_parse_rr(msg, len, off, rr);
+            if (nx == 0) { k = an; }
+            else {
+                # THE invariant: a parsed RR never reports past the bytes
+                # we actually received, and always advances.
+                assert(nx > off, label);
+                assert(nx <= len, label);
+                assert(dns_rr_rdata_off(rr) <= nx, label);
+                assert(nx - dns_rr_rdata_off(rr) >= 0, label);
+                # Formatter must survive whatever rdata the attacker chose.
+                output_print_rdata(msg, len, rr, nx);
+                off = nx;
+                k = k + 1;
+            }
+        }
+    }
+
+    # Anti-spoof gate: boolean, and never 1 for a name we did not ask.
+    var q = dns_question_matches(msg, len, "a.com", DNS_TYPE_A);
+    assert(q == 0 || q == 1, label);
+    assert(dns_question_matches(msg, len, "zzz.invalid", DNS_TYPE_A) == 0, label);
+
+    # Header accessors are total on any >= 12 bytes.
+    if (len >= DNS_HEADER_LEN) {
+        assert(dns_hdr_id(msg) >= 0, label);
+        assert(dns_hdr_rcode(msg) >= 0, label);
+        assert(dns_hdr_rcode(msg) <= 15, label);
+        assert(dns_hdr_truncated(msg) == 0 || dns_hdr_truncated(msg) == 1, label);
+    }
     return 0;
+}
+
+# Self-check: if the corpus stopped parsing, every "survived" run below
+# would be exercising nothing but the reject paths.
+fn fz_selfcheck(): i64 {
+    var b[64];
+    var n = fz_valid_a(&b);
+    assert(dns_answer_section_start(&b, n) == 23, "selfcheck: answer starts at 23");
+    var rr = alloc(DNS_RR_SIZE);
+    assert(dns_parse_rr(&b, n, 23, rr) == 39, "selfcheck: RR ends at 39");
+    assert(dns_rr_type(rr) == DNS_TYPE_A, "selfcheck: RR is an A record");
+    assert(dns_question_matches(&b, n, "a.com", DNS_TYPE_A) == 1, "selfcheck: question matches");
+    return 0;
+}
+
+# Strategy 1 — uniform random bytes.
+fn fz_random(seed): i64 {
+    _fz_seed(seed);
+    var buf[512];
+    var n = 12 + (_fz_next() % 200);
+    _fz_fill(&buf, n);
+    fz_check(&buf, n, "random");
+    return 0;
+}
+
+# Strategy 2 — a VALID frame with n random byte-flips. Reaches deep parser
+# states uniform noise never does (a header that still says qd=1,an=1).
+fn fz_mutate(seed, nmut): i64 {
+    _fz_seed(seed);
+    var buf[512];
+    var n = fz_valid_a(&buf);
+    var m = 0;
+    while (m < nmut) {
+        store8(&buf + (_fz_next() % n), _fz_next());
+        m = m + 1;
+    }
+    fz_check(&buf, n, "mutate");
+    return 0;
+}
+
+# Strategy 3 — structure-aware: keep the frame legal but let the attacker
+# choose rdlength and the counts. This is the rdlength/ancount surface.
+fn fz_fields(seed): i64 {
+    _fz_seed(seed);
+    var buf[512];
+    var n = fz_valid_a(&buf);
+    store8(&buf + 4, _fz_next()); store8(&buf + 5, _fz_next());   # qdcount
+    store8(&buf + 6, _fz_next()); store8(&buf + 7, _fz_next());   # ancount
+    store8(&buf + 25, _fz_next()); store8(&buf + 26, _fz_next()); # rr type
+    store8(&buf + 33, _fz_next()); store8(&buf + 34, _fz_next()); # rdlength
+    fz_check(&buf, n, "fields");
+    return 0;
+}
+
+# Strategy 4 — every truncation of a valid frame. A short recv is the
+# most common real-world malformed datagram.
+fn fz_truncate(): i64 {
+    var buf[512];
+    var n = fz_valid_a(&buf);
+    var cut = 12;
+    while (cut <= n) { fz_check(&buf, cut, "truncate"); cut = cut + 1; }
+    return 0;
+}
+
+# Strategy 5 — adversarial compression pointers. The hang surface.
+fn fz_pointers(seed): i64 {
+    _fz_seed(seed);
+    var buf[512];
+    var n = fz_valid_a(&buf);
+    # Scatter pointer pairs across the frame, targets chosen at random so
+    # forward, backward, self- and chain-pointers all occur.
+    var i = 0;
+    while (i < 8) {
+        var at = 12 + (_fz_next() % (n - 14));
+        store8(&buf + at, 0xC0);
+        store8(&buf + at + 1, _fz_next() % n);
+        i = i + 1;
+    }
+    fz_check(&buf, n, "pointers");
+    return 0;
+}
+
+# The formatter writes to stdout by design, so ~1.5M fuzz iterations would
+# otherwise bury the result line under a megabyte of rendered rdata. Point fd 1
+# at /dev/null for the fuzzing itself and restore it before the summary — the
+# formatter must still RUN (that is the point: hostile rdata has to reach the
+# escaper and the RDLENGTH checks), it just must not narrate.
+var _fz_saved_stdout = 0;
+fn _fz_mute(): i64 {
+    _fz_saved_stdout = sys_dup2(1, 90);
+    var devnull = sys_open("/dev/null", 1, 0);
+    if (devnull >= 0) { sys_dup2(devnull, 1); }
+    return 0;
+}
+fn _fz_unmute(): i64 {
+    sys_dup2(90, 1);
+    return 0;
+}
+
+fn main(): i64 {
+    alloc_init();
+    fz_selfcheck();
+    _fz_mute();
+
+    var seed = 1;
+    while (seed <= 4000)  { fz_random(seed);      seed = seed + 1; }
+    seed = 1;
+    while (seed <= 4000)  { fz_mutate(seed, 3);   seed = seed + 1; }
+    seed = 1;
+    while (seed <= 2000)  { fz_mutate(seed, 12);  seed = seed + 1; }
+    seed = 1;
+    while (seed <= 4000)  { fz_fields(seed);      seed = seed + 1; }
+    seed = 1;
+    while (seed <= 4000)  { fz_pointers(seed);    seed = seed + 1; }
+    fz_truncate();
+    _fz_unmute();
+
+    return assert_summary();
 }
 
 var r = main();
-# Clamp before exiting: a wait status is only 8 bits, so any exit code that is
-# a multiple of 256 truncates to 0 and would score PASS. Any failure at all is
-# exit 1.
 if (r > 0) { r = 1; }
 sys_exit_group(r);

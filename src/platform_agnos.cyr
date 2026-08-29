@@ -165,11 +165,3 @@ fn platform_random_u16(): i64 {
 fn platform_now_us(): i64 {
     return sys_uptime_ms() * 1000;
 }
-
-# Sleep for `ms` milliseconds via sys_sleep_ms (#41). A non-positive `ms`
-# returns 0 immediately without entering the kernel — same contract as the
-# Linux arm, so the recv poll loop can pass a computed remainder unchecked.
-fn platform_sleep_ms(ms): i64 {
-    if (ms <= 0) { return 0; }
-    return sys_sleep_ms(ms);
-}

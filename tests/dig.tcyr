@@ -18,6 +18,14 @@ include "src/output.cyr"
 include "src/query.cyr"
 
 # === IPv4 parser ===
+# The one thing coupling DNS_NAME_BUF_LEN to DNS_MAX_NAME_LEN. cyrius cannot
+# take an expression as an array size, so the derivation lives here or nowhere.
+fn test_name_buf_contract() {
+    test_group("name_buf_contract");
+    assert_eq(DNS_NAME_BUF_LEN, DNS_MAX_NAME_LEN + 1, "name buffer is exactly max-name + NUL");
+    return 0;
+}
+
 fn test_ipv4() {
     test_group("ipv4");
     assert_eq(ipv4_parse("0.0.0.0"),         0x00000000, "ipv4 zeros");
@@ -99,7 +107,7 @@ fn test_dns_name_decode_simple() {
     store8(&msg + 21, 99); store8(&msg + 22, 111); store8(&msg + 23, 109);
     store8(&msg + 24, 0);
 
-    var out[256];
+    var out[DNS_NAME_BUF_LEN];
     var next = dns_decode_name(&msg, 64, 12, &out, &dnl);
     assert_eq(next, 25, "next offset past name");
     assert_eq(load8(&out),     101, "decoded[0] = 'e'");
@@ -125,7 +133,7 @@ fn test_dns_name_decode_pointer() {
     store8(&msg + 21, 0xC0);    # pointer high byte
     store8(&msg + 22, 12);      # offset 12
 
-    var out[256];
+    var out[DNS_NAME_BUF_LEN];
     var next = dns_decode_name(&msg, 64, 17, &out, &dnl);
     assert_eq(next, 23, "next offset past pointer");
     # "www.com" = 119 119 119 46 99 111 109 0
@@ -149,7 +157,7 @@ fn test_dns_name_decode_pointer_cycle() {
     store8(&msg + 12, 0xC0);
     store8(&msg + 13, 12);
 
-    var out[256];
+    var out[DNS_NAME_BUF_LEN];
     var next = dns_decode_name(&msg, 64, 12, &out, &dnl);
     assert_eq(next, 0, "self-pointer rejected (no hang, returns 0)");
 
@@ -172,7 +180,7 @@ fn test_dns_name_decode_pointer_oob() {
     memset(&msg, 0, 32);
     store8(&msg + 12, 0xC0);
     store8(&msg + 13, 200);    # offset 200 is past msg_len 32
-    var out[256];
+    var out[DNS_NAME_BUF_LEN];
     var next = dns_decode_name(&msg, 32, 12, &out, &dnl);
     assert_eq(next, 0, "out-of-bounds pointer rejected");
     return 0;
@@ -185,7 +193,7 @@ fn test_dns_name_decode_oversized_label() {
     var msg[128];
     memset(&msg, 0, 128);
     store8(&msg + 12, 64);    # > 63 — but not a pointer (top bits clear)
-    var out[256];
+    var out[DNS_NAME_BUF_LEN];
     var next = dns_decode_name(&msg, 128, 12, &out, &dnl);
     assert_eq(next, 0, "label > 63 rejected");
     return 0;
@@ -494,6 +502,361 @@ fn test_cli_bad_type() {
     return 0;
 }
 
+
+# === Guards that survived deletion before 0.3.8 (E2) ===
+#
+# Every assertion in this group corresponds to a guard that could be deleted
+# with the whole suite still reporting green. They are the ones that were
+# protecting nothing.
+fn test_surviving_guards() {
+    test_group("surviving_guards");
+    var msg[256];
+    var rr = alloc(DNS_RR_SIZE);
+
+    # -- dns_parse_rr's rdlength bound --
+    # A record claiming more rdata than the message holds must be refused.
+    memset(&msg, 0, 256);
+    store8(&msg + 12, 0);                                   # root owner name
+    store8(&msg + 14, 1); store8(&msg + 16, 1);             # type A, class IN
+    store8(&msg + 21, 0xFF); store8(&msg + 22, 0xFF);       # rdlength 65535
+    assert_eq(dns_parse_rr(&msg, 40, 12, rr), 0, "rdlength 65535 refused");
+
+    store8(&msg + 21, 0); store8(&msg + 22, 4);             # rdlength 4
+    assert_eq(dns_parse_rr(&msg, 27, 12, rr), 27, "rdlength that exactly fits is accepted");
+    assert_eq(dns_parse_rr(&msg, 26, 12, rr), 0,  "rdlength one past msg_len refused");
+    store8(&msg + 22, 0);                                   # rdlength 0
+    assert_eq(dns_parse_rr(&msg, 40, 12, rr), 23, "rdlength 0 advances past the header");
+
+    # -- NAME_DECODE_MAX_HOPS --
+    # The existing cycle group feeds a self-pointer and a forward pointer, both
+    # killed by the must-point-backward rule alone, so the hop BUDGET was never
+    # the deciding guard. This is a chain of strictly-backward 2-byte pointers
+    # where every single hop is legal — only the counter can stop it.
+    memset(&msg, 0, 256);
+    store8(&msg + 4, 0);                                    # a root label at 4
+    var q = 6;
+    var prev = 4;
+    while (q < 160) {
+        store8(&msg + q, 0xC0); store8(&msg + q + 1, prev); # -> strictly backward
+        prev = q;
+        q = q + 2;
+    }
+    var ob[DNS_NAME_BUF_LEN];
+    var obl[8];
+    assert_eq(dns_decode_name(&msg, 256, prev, &ob, &obl), 0, "long legal backward chain hits the hop budget");
+    assert_eq(dns_skip_name(&msg, 256, prev), 0, "skip_name hits the hop budget too");
+
+    # -- dns_skip_name's label>63 guard --
+    # The obvious test passes for the wrong reason: in a small buffer an
+    # oversize skip runs past msg_len and the LENGTH check catches it. Here the
+    # skip lands back in bounds, so only the label guard can refuse it.
+    memset(&msg, 0, 256);
+    store8(&msg + 12, 64);                                  # illegal label length
+    store8(&msg + 77, 0);                                   # terminator, in bounds
+    assert_eq(dns_skip_name(&msg, 256, 12), 0, "skip_name refuses a 64-byte label in bounds");
+    store8(&msg + 12, 63);
+    store8(&msg + 76, 0);
+    assert_eq(dns_skip_name(&msg, 256, 12), 77, "skip_name accepts a 63-byte label");
+
+    # -- dns_skip_name's total-length cap (added 0.3.8) --
+    # Six 63-byte labels = 384 wire octets, over RFC 1035 §2.3.4's 255. The
+    # walker used to accept this while the decoder refused it, so full output
+    # printed `;; ANSWER` with no records under it and exit 0 while `+short` on
+    # the same bytes printed the address.
+    # The buffer must be big enough that the over-long name still FITS —
+    # otherwise the msg_len bound refuses it and the test passes without the
+    # wire cap ever running. 4 x 63-byte labels = 256 wire octets (each label
+    # costs its length byte too), one over RFC 1035 §2.3.4's 255.
+    var big[512];
+    memset(&big, 0, 512);
+    var o = 12;
+    var lab = 0;
+    while (lab < 4) {
+        store8(&big + o, 63);
+        o = o + 64;
+        lab = lab + 1;
+    }
+    store8(&big + o, 0);
+    assert_eq(dns_skip_name(&big, 512, 12), 0, "skip_name refuses a name over 255 wire octets");
+    # Positive control at 3 labels = 192 wire octets, comfortably legal — so a
+    # mutant cannot satisfy both by simply refusing everything.
+    memset(&big, 0, 512);
+    o = 12;
+    lab = 0;
+    while (lab < 3) {
+        store8(&big + o, 63);
+        o = o + 64;
+        lab = lab + 1;
+    }
+    store8(&big + o, 0);
+    assert_eq(dns_skip_name(&big, 512, 12), o + 1, "skip_name accepts a 192-octet name");
+    var db[DNS_NAME_BUF_LEN];
+    var dbl[8];
+    assert_eq(dns_decode_name(&big, 512, 12, &db, &dbl), o + 1, "decode_name agrees with skip_name");
+
+    # The one window where decode_name's WIRE cap differs from the presentation
+    # cap it already had. Labels 63/63/63/62 are 256 wire octets (one over the
+    # RFC limit) but only 254 presentation characters — so the old `dst >= 255`
+    # check accepted them and the name was two octets over. Without this case
+    # the wire cap in decode_name is untested, since every longer name is caught
+    # by the presentation check anyway.
+    memset(&big, 0, 512);
+    store8(&big + 12, 63);
+    store8(&big + 76, 63);
+    store8(&big + 140, 63);
+    store8(&big + 204, 62);
+    store8(&big + 267, 0);
+    assert_eq(dns_decode_name(&big, 512, 12, &db, &dbl), 0, "decode_name refuses a 256-octet wire name");
+    assert_eq(dns_skip_name(&big, 512, 12), 0, "skip_name refuses it too — the two agree");
+
+    # -- dns_skip_question's p + 4 bound --
+    memset(&msg, 0, 256);
+    store8(&msg + 4, 0); store8(&msg + 5, 1);               # qdcount 1
+    store8(&msg + 12, 0);                                   # root question name
+    assert_eq(dns_answer_section_start(&msg, 17), 17, "question with a full fixed tail is accepted");
+    assert_eq(dns_answer_section_start(&msg, 16), 0,  "question truncated in its qtype/qclass refused");
+    return 0;
+}
+
+# === resolv.conf parsing (E2 + the 0.3.8 repairs) ===
+fn test_resolv_038() {
+    test_group("resolv_038");
+
+    # The whitespace guard after the literal. The natural test
+    # (`nameservers 1.2.3.4`) passes for the wrong reason — it extracts "s",
+    # which ipv4_parse rejects anyway. This is the discriminating input.
+    var c1 = "nameserver1.2.3.4\n";
+    assert_eq(resolv_parse(c1, 18), 0, "nameserver with no separator is not a nameserver line");
+
+    # 0 is resolv_parse's not-found sentinel, so a `0.0.0.0` line must be
+    # SKIPPED, not returned. Two lines are required: a single-line case cannot
+    # tell "skipped and kept scanning" from "aborted the scan".
+    var c2 = "nameserver 0.0.0.0\nnameserver 192.168.1.1\n";
+    assert_eq(resolv_parse(c2, 42), 0xC0A80101, "0.0.0.0 is skipped, scan continues");
+
+    # CRLF. Without the CR break the token is "1.1.1.1\r", which ipv4_parse
+    # rejects, and discovery silently fell through to 8.8.8.8.
+    var c3 = "nameserver 1.1.1.1\r\n";
+    assert_eq(resolv_parse(c3, 20), 0x01010101, "CRLF line parses");
+    var c4 = "# comment\r\nnameserver 9.9.9.9\r\nnameserver 1.1.1.1\r\n";
+    assert_eq(resolv_parse(c4, 50), 0x09090909, "multi-line CRLF advances correctly");
+
+    # A truncated buffer must not yield a DIFFERENT valid address.
+    var c5 = "nameserver 10.0.0.53\n";
+    assert_eq(resolv_parse(c5, 21), 0x0A000035, "full line parses");
+    # The 4096-byte read cut mid-octet: 10.0.0.53 becomes a perfectly valid
+    # 10.0.0.5 and nothing anywhere reports a problem. This is why the buffer
+    # grew to 16 KiB at 0.3.8 rather than the parser learning to detect it —
+    # the parser CANNOT detect it, the bytes it was handed are well-formed.
+    assert_eq(resolv_parse(c5, 19), 0x0A000005, "mid-octet cut silently yields a different valid address");
+    return 0;
+}
+
+# === Reply acceptance policy (E4) ===
+#
+# dns_question_matches was well covered as a function; its USE was not covered
+# at all, so every guard in the accept path could be deleted with a green suite.
+fn test_reply_acceptable() {
+    test_group("reply_acceptable");
+    var msg[64];
+    var n = _tq_build(&msg, 1, DNS_TYPE_A, DNS_CLASS_IN);
+    store8(&msg, 0x12); store8(&msg + 1, 0x34);             # id 0x1234
+    store8(&msg + 2, 0x80);                                 # QR set
+
+    assert_eq(query_reply_acceptable(&msg, n, 0x1234, "a.com", DNS_TYPE_A), 1, "good reply accepted");
+    assert_eq(query_reply_acceptable(&msg, n, 0x1235, "a.com", DNS_TYPE_A), 0, "wrong id rejected");
+    assert_eq(query_reply_acceptable(&msg, n, 0x1234, "b.com", DNS_TYPE_A), 0, "wrong name rejected");
+    assert_eq(query_reply_acceptable(&msg, n, 0x1234, "a.com", DNS_TYPE_MX), 0, "wrong qtype rejected");
+    assert_eq(query_reply_acceptable(&msg, 11, 0x1234, "a.com", DNS_TYPE_A), 0, "runt rejected");
+    store8(&msg + 2, 0);                                    # clear QR
+    assert_eq(query_reply_acceptable(&msg, n, 0x1234, "a.com", DNS_TYPE_A), 0, "QR-clear rejected");
+    return 0;
+}
+
+
+# === AAAA rendering, RFC 5952 (E3) ===
+#
+# Through 0.3.7 this printed eight fixed 4-hex-digit groups, so EVERY
+# real-world AAAA differed from BIND — not merely ones with zero runs. Each
+# expectation below was cross-checked against glibc inet_ntop, which is the
+# exact primitive BIND uses.
+fn _aaaa_is(bytes, want, msg) {
+    var raw[16];
+    var i = 0;
+    while (i < 16) { store8(&raw + i, load8(bytes + i)); i = i + 1; }
+    var out[64];
+    var n = _aaaa_to_buf(&out, &raw, 0);
+    assert_eq(n, strlen(want), msg);
+    var ok = 1;
+    var k = 0;
+    while (k < n) {
+        if (load8(&out + k) != load8(want + k)) { ok = 0; }
+        k = k + 1;
+    }
+    assert_eq(ok, 1, msg);
+    return 0;
+}
+
+fn _aaaa_set(b, i, hi, lo) {
+    store8(b + i * 2, hi);
+    store8(b + i * 2 + 1, lo);
+    return 0;
+}
+
+fn test_aaaa_rfc5952() {
+    test_group("aaaa_rfc5952");
+    var b[16];
+
+    # All zeros -> "::" (§4.2.2: a run of 8 collapses entirely)
+    memset(&b, 0, 16);
+    _aaaa_is(&b, "::", "all zeros renders ::");
+
+    # ::1 — the trailing-run case, where the closing colon must be emitted
+    memset(&b, 0, 16);
+    _aaaa_set(&b, 7, 0, 1);
+    _aaaa_is(&b, "::1", "loopback renders ::1");
+
+    # 2001:db8::1 — leading-zero suppression (§4.1) plus a middle run
+    memset(&b, 0, 16);
+    _aaaa_set(&b, 0, 0x20, 0x01); _aaaa_set(&b, 1, 0x0d, 0xb8); _aaaa_set(&b, 7, 0, 1);
+    _aaaa_is(&b, "2001:db8::1", "2001:db8::1");
+
+    # §4.2.3 tie-break: two runs of 2, the LEFTMOST wins.
+    # 2001:db8:0:0:1:0:0:1 -> 2001:db8::1:0:0:1
+    memset(&b, 0, 16);
+    _aaaa_set(&b, 0, 0x20, 0x01); _aaaa_set(&b, 1, 0x0d, 0xb8);
+    _aaaa_set(&b, 4, 0, 1); _aaaa_set(&b, 7, 0, 1);
+    _aaaa_is(&b, "2001:db8::1:0:0:1", "equal-length runs: leftmost wins");
+
+    # No zero run at all — isolates §4.1 leading-zero suppression, which is the
+    # part that made every ordinary address differ from BIND.
+    memset(&b, 0, 16);
+    var i = 0;
+    while (i < 8) { _aaaa_set(&b, i, 0, i + 1); i = i + 1; }
+    _aaaa_is(&b, "1:2:3:4:5:6:7:8", "no zero run, leading zeros suppressed");
+
+    # §4.2.2: a SINGLE zero field must NOT be shortened to ::
+    memset(&b, 0, 16);
+    i = 0;
+    while (i < 8) { _aaaa_set(&b, i, 0, i + 1); i = i + 1; }
+    _aaaa_set(&b, 3, 0, 0);
+    _aaaa_is(&b, "1:2:3:0:5:6:7:8", "a lone zero field is not collapsed");
+
+    # §5 / glibc inet_ntop6: IPv4-mapped renders a dotted quad
+    memset(&b, 0, 16);
+    _aaaa_set(&b, 5, 0xFF, 0xFF); _aaaa_set(&b, 6, 0xC0, 0x00); _aaaa_set(&b, 7, 0x02, 0x01);
+    _aaaa_is(&b, "::ffff:192.0.2.1", "IPv4-mapped renders dotted quad");
+
+    # ::0.0.0.1 is NOT taken as v4 (glibc excludes best.len==7 with words[7]==1)
+    memset(&b, 0, 16);
+    _aaaa_set(&b, 7, 0, 1);
+    _aaaa_is(&b, "::1", "the len-7 words[7]==1 case stays ::1, not ::0.0.0.1");
+    return 0;
+}
+
+# === rdata validation returns (E3 / A3 / A4) ===
+#
+# Every one of these used to print a half-rendered record and return a status
+# nobody read. The assertions are on the RETURN VALUE, which is what main.cyr
+# now folds into the exit code.
+fn _rr_at(msg, off, t, rdlen) {
+    # Minimal RR: root owner name, type t, class IN, ttl 0, rdlength rdlen.
+    store8(msg + off, 0);
+    store8(msg + off + 1, (t >> 8) & 0xFF);  store8(msg + off + 2, t & 0xFF);
+    store8(msg + off + 3, 0);                store8(msg + off + 4, 1);
+    store8(msg + off + 9, (rdlen >> 8) & 0xFF); store8(msg + off + 10, rdlen & 0xFF);
+    return off + 11;
+}
+
+fn test_rdata_validation() {
+    test_group("rdata_validation");
+    var msg[256];
+    var rr = alloc(DNS_RR_SIZE);
+
+    # A: rdlength must be exactly 4.
+    var lens = 0;
+    while (lens < 8) {
+        memset(&msg, 0, 256);
+        var rdo = _rr_at(&msg, 12, DNS_TYPE_A, lens);
+        var nx = dns_parse_rr(&msg, 256, 12, rr);
+        if (lens != 4) {
+            assert_eq(output_print_rdata(&msg, 256, rr, nx), 0 - 1, "A with wrong rdlength refused");
+        }
+        lens = lens + 1;
+    }
+
+    # AAAA: exactly 16.
+    memset(&msg, 0, 256);
+    var rdo2 = _rr_at(&msg, 12, DNS_TYPE_AAAA, 15);
+    var nx2 = dns_parse_rr(&msg, 256, 12, rr);
+    assert_eq(output_print_rdata(&msg, 256, rr, nx2), 0 - 1, "AAAA rdlength 15 refused");
+
+    # MX below its fixed size.
+    memset(&msg, 0, 256);
+    _rr_at(&msg, 12, DNS_TYPE_MX, 2);
+    var nx3 = dns_parse_rr(&msg, 256, 12, rr);
+    assert_eq(output_print_rdata(&msg, 256, rr, nx3), 0 - 1, "MX rdlength 2 refused");
+
+    # SRV below its fixed size.
+    memset(&msg, 0, 256);
+    _rr_at(&msg, 12, DNS_TYPE_SRV, 6);
+    var nx4 = dns_parse_rr(&msg, 256, 12, rr);
+    assert_eq(output_print_rdata(&msg, 256, rr, nx4), 0 - 1, "SRV rdlength 6 refused");
+
+    # A TXT whose internal length prefix overruns its own rdata.
+    memset(&msg, 0, 256);
+    var rdo5 = _rr_at(&msg, 12, DNS_TYPE_TXT, 3);
+    store8(&msg + rdo5, 9);                       # claims 9 bytes inside a 3-byte rdata
+    var nx5 = dns_parse_rr(&msg, 256, 12, rr);
+    assert_eq(output_print_rdata(&msg, 256, rr, nx5), 0 - 1, "TXT inner length overrunning rdata refused");
+
+    # THE A4 CASE. rdlen=0 for a name-bearing type: memory-safe, but the name
+    # would be read out of the NEXT record's bytes and printed as this record's
+    # authoritative content, returning success.
+    var t = 0;
+    var types[3];
+    memset(&msg, 0, 256);
+    var rdo6 = _rr_at(&msg, 12, DNS_TYPE_NS, 0);
+    store8(&msg + rdo6, 3);                       # a neighbouring name follows
+    store8(&msg + rdo6 + 1, 101); store8(&msg + rdo6 + 2, 118); store8(&msg + rdo6 + 3, 108);
+    store8(&msg + rdo6 + 4, 0);
+    var nx6 = dns_parse_rr(&msg, 256, 12, rr);
+    assert_eq(output_print_rdata(&msg, 256, rr, nx6), 0 - 1, "NS rdlength 0 refused, not read from the next record");
+
+    # Positive control: a legal uncompressed CNAME whose name exactly fills rdata.
+    memset(&msg, 0, 256);
+    var rdo7 = _rr_at(&msg, 12, DNS_TYPE_CNAME, 5);
+    store8(&msg + rdo7, 1); store8(&msg + rdo7 + 1, 97);   # "a"
+    store8(&msg + rdo7 + 2, 1); store8(&msg + rdo7 + 3, 98); # "b"
+    store8(&msg + rdo7 + 4, 0);
+    var nx7 = dns_parse_rr(&msg, 256, 12, rr);
+    assert_eq(output_print_rdata(&msg, 256, rr, nx7), 0, "legal CNAME exactly filling rdata is accepted");
+    return 0;
+}
+
+# === RCODE and CLASS naming (E3 / A8 / A10) ===
+fn test_rcode_names() {
+    test_group("rcode_names");
+    assert_eq(strlen(output_rcode_str(0)), 7, "NOERROR");
+    assert_eq(strlen(output_rcode_str(3)), 8, "NXDOMAIN");
+    assert_eq(strlen(output_rcode_str(5)), 7, "REFUSED");
+    # 6-10 gained mnemonics at 0.3.8; every one of them used to print `RCODE?`.
+    assert_eq(strlen(output_rcode_str(6)),  8, "YXDOMAIN");
+    assert_eq(strlen(output_rcode_str(7)),  7, "YXRRSET");
+    assert_eq(strlen(output_rcode_str(8)),  7, "NXRRSET");
+    assert_eq(strlen(output_rcode_str(9)),  7, "NOTAUTH");
+    assert_eq(strlen(output_rcode_str(10)), 7, "NOTZONE");
+    # 11-15 have no mnemonic; the accessor returns 0 so the printer can format
+    # RESERVED<n> rather than discarding the value in a flat "RCODE?".
+    assert_eq(output_rcode_str(11), 0, "reserved rcode has no mnemonic");
+    assert_eq(output_rcode_str(15), 0, "reserved rcode 15 has no mnemonic");
+    # Types: recognized ones resolve, unknown returns 0 so TYPE<n> can be built.
+    assert_eq(strlen(output_type_str(DNS_TYPE_A)), 1, "type A");
+    assert_eq(strlen(output_type_str(DNS_TYPE_AAAA)), 4, "type AAAA");
+    assert_eq(output_type_str(257), 0, "unknown type has no mnemonic");
+    return 0;
+}
+
 # === Truncated response (TC=1) detection ===
 fn test_dns_truncated() {
     test_group("dns_truncated");
@@ -511,6 +874,7 @@ fn test_dns_truncated() {
 
 fn main() {
     alloc_init();
+    test_name_buf_contract();
     test_ipv4();
     test_dns_query_build();
     test_dns_name_encode();
@@ -523,6 +887,12 @@ fn main() {
     test_resolv();
     test_dns_parse_a_response();
     test_dns_truncated();
+    test_aaaa_rfc5952();
+    test_rdata_validation();
+    test_rcode_names();
+    test_surviving_guards();
+    test_resolv_038();
+    test_reply_acceptable();
     test_output_escaping();
     test_dns_question_match();
     test_cli_bounds();

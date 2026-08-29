@@ -6,7 +6,11 @@
 # Returns:
 #   QRY_OK     0  — got a response (response in rx buf, length in *resp_len)
 #   QRY_TIMEOUT 1 — exhausted retries with no reply
-#   QRY_BAD    2  — got a reply but malformed (parse failed)
+#   QRY_BAD    2  — the query could not be BUILT (name unencodable). Not a
+#                   response condition: main.cyr validates the name up front, so
+#                   this is unreachable in practice and kept only as a backstop.
+#                   Real malformed-response cases have their own messages in
+#                   main.cyr and never come through here.
 #   QRY_SOCKET 3  — couldn't open the socket
 #
 # rx buf: caller provides ≥ DNS_MAX_UDP_PAYLOAD bytes.
@@ -22,14 +26,41 @@ var QRY_SOCKET  = 3;
 
 var DNS_PORT = 53;
 
+# Is this datagram an acceptable reply to the query we sent? 1 yes, 0 no.
+#
+# THE ACCEPTANCE POLICY, deliberately split out of the transport loop so it can
+# be asserted without a socket. Every guard here could be deleted with the whole
+# suite still green before 0.3.8 — including the RFC 5452 §9.1 question check
+# that 0.3.7 exists to have added. `dns_question_matches` was well tested as a
+# FUNCTION; its USE was not tested at all, which is the gap that matters.
+#
+# Four independent things must hold, and the order is cheapest-first:
+#   1. long enough to hold a header at all;
+#   2. echoes the 16-bit ID we generated for THIS attempt;
+#   3. has QR set, so it is a response and not someone's query;
+#   4. answers the question we actually asked (RFC 5452 §9.1) — without this, an
+#      attacker who guesses the ID can answer for a different name entirely.
+#
+# On the Linux arm the connected socket has already dropped off-peer datagrams
+# before any of this runs, and on AGNOS platform_udp_recv does the same check by
+# hand; these four are the layer above that, not a substitute for it.
+fn query_reply_acceptable(rx, n, id, name, qtype): i64 {
+    if (n < DNS_HEADER_LEN) { return 0; }
+    if (dns_hdr_id(rx) != id) { return 0; }
+    if ((dns_hdr_flags(rx) & DNS_FLAG_QR) == 0) { return 0; }
+    if (dns_question_matches(rx, n, name, qtype) == 0) { return 0; }
+    return 1;
+}
+
 # Build a query for `name`/`qtype`, send it to `server_addr` over UDP-53, and
 # wait for a reply — retrying up to `retry` ATTEMPTS with a `timeout_s` deadline
 # on each. On success, writes the reply into `rx` (capacity `rx_cap` bytes),
 # stores the received length through `resp_len` and the round-trip time in
 # microseconds through `query_us`.
 #
-# Returns QRY_OK, or QRY_TIMEOUT (no reply within the budget), QRY_BAD (a reply
-# arrived but failed validation) or QRY_SOCKET (the transport itself failed).
+# Returns QRY_OK, or QRY_TIMEOUT (no reply within the budget), QRY_BAD (the
+# query could not be built from this name — not a response condition) or
+# QRY_SOCKET (the transport itself failed, including entropy failure).
 #
 # `*resp_len` is the authoritative length for every downstream parse — pass it,
 # not `rx_cap`, to `dns_parse_rr` and friends, or a short reply will be parsed
@@ -83,19 +114,28 @@ fn query_send_recv(server_addr, name, qtype, timeout_s, retry, rx, rx_cap, resp_
         # packet and costs dig one loop iteration.
         var deadline = t0 + timeout_s * 1000000;
         while (platform_now_us() < deadline) {
+            # Re-arm SO_RCVTIMEO to the REMAINING budget before each recv.
+            # The loop condition bounds when a recv may START, never when it
+            # must END — so through 0.3.7, one junk datagram timed to arrive
+            # just before the deadline bought a whole extra timeout window.
+            # Measured: `+timeout=1 +retry=1` went 1.06s -> 1.92s from a single
+            # well-placed packet, and the shipped defaults 15.3s -> 30.7s. Bound
+            # was exactly 2x per attempt. Note a FLOOD never triggered it — the
+            # loop condition handles that correctly; precision was the attack.
+            #
+            # The `< 1` guard is load-bearing, not padding: the loop guarantees
+            # only a positive MICROsecond remainder, so this division can floor
+            # to 0, and platform_set_recv_timeout_ms clamps 0 up to 1ms — which
+            # would spin here rather than exit.
+            var left_ms = (deadline - platform_now_us()) / 1000;
+            if (left_ms < 1) { break; }
+            if (platform_set_recv_timeout_ms(fd, left_ms) < 0) { break; }
             var n = platform_udp_recv(fd, rx, rx_cap);
             # Deadline expired inside the kernel — this attempt is over.
             if (n == PLATFORM_ERR_TIMEOUT) { break; }
             # Any other transport error ends the attempt too.
             if (n < 0) { break; }
-            # Runt: too short to even hold a header.
-            if (n < DNS_HEADER_LEN) { continue; }
-            # Must echo the ID we just sent.
-            if (dns_hdr_id(rx) != id) { continue; }
-            # Must be a response, not a query.
-            if ((dns_hdr_flags(rx) & DNS_FLAG_QR) == 0) { continue; }
-            # Must answer the question we actually asked (RFC 5452 §9.1).
-            if (dns_question_matches(rx, n, name, qtype) == 0) { continue; }
+            if (query_reply_acceptable(rx, n, id, name, qtype) == 0) { continue; }
 
             store64(resp_len, n);
             store64(query_us, platform_now_us() - t0);

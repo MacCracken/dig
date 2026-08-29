@@ -20,10 +20,12 @@
 # sys_setsockopt / sys_close / sys_read / sys_open / sys_getrandom), which
 # resolves to the right number for whichever syscalls_<arch>_linux.cyr the build
 # selected. Two calls have no wrapper and no named constant anywhere in the
-# stdlib — clock_gettime and nanosleep — and those are spelled as arch-guarded
-# LITERALS below, for the reason lib/bench.cyr documents: the macOS/Windows
-# reroute for syscall(228) is keyed on a compile-time const-fold, so a `var`
-# holding the number silently defeats it. The old table was `var`s.
+# stdlib — clock_gettime and nanosleep — and clock_gettime is spelled as an
+# arch-guarded LITERAL below, for the reason lib/bench.cyr documents: the
+# macOS/Windows reroute for syscall(228) is keyed on a compile-time const-fold,
+# so a `var` holding the number silently defeats it. The old table was `var`s.
+# (nanosleep left with platform_sleep_ms at 0.3.8 — it had no callers, and a
+# dead function holding a raw arch-specific number is a loaded gun.)
 #
 # See roadmap.md § 0.7.x (Host-target parity) for the remaining target work.
 
@@ -174,23 +176,4 @@ fn platform_now_us(): i64 {
     var secs = load64(&ts);
     var nsec = load64(&ts + 8);
     return secs * 1000000 + nsec / 1000;
-}
-
-# Sleep for `ms` milliseconds. A non-positive `ms` returns immediately rather
-# than sleeping or erroring, so callers may pass a computed remainder unchecked.
-#
-# nanosleep, like clock_gettime, has no wrapper and no named constant. On
-# aarch64 it is 101; the x86_64 number 35 means **unlinkat** there, which is what
-# this file called before 0.3.7.
-fn platform_sleep_ms(ms): i64 {
-    if (ms <= 0) { return 0; }
-    var ts[16];
-    store64(&ts,     ms / 1000);
-    store64(&ts + 8, (ms % 1000) * 1000000);
-    #ifdef CYRIUS_ARCH_AARCH64
-    return syscall(101, &ts, 0);
-    #endif
-    #ifndef CYRIUS_ARCH_AARCH64
-    return syscall(35, &ts, 0);
-    #endif
 }

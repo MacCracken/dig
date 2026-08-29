@@ -4,6 +4,200 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.8] — 2026-08-28 (the rest of the audit: 23 findings closed, and a real fuzz harness)
+
+0.3.7 repaired both P1s the audit found and left 23 P2/P3 items on the roadmap.
+This closes them. Same rule as that cut: no new features, every repair has an
+assertion behind it, and every assertion is mutation-checked. The suite goes
+128 → **198**, and `tests/dig.fcyr` goes from a two-line stub to **1,560,376**
+adversarial assertions.
+
+Two of these were found by the tests rather than by the audit — including an
+off-by-one in a guard 0.3.8 itself was adding. Both are called out below.
+
+### Fixed
+- **`dns_skip_name` accepted names `dns_decode_name` could not render.** The
+  walker capped label length and pointer hops but never total name length,
+  while the decoder did — so `dns_parse_rr` returned a valid offset for a
+  6×63-label owner name that then failed to decode. The visible result: full
+  output printed `;; ANSWER` with **zero records under it** and exit 0, while
+  `+short` on the identical bytes printed the address. Two modes of one tool
+  disagreeing about the same reply, neither reporting a problem. Both walkers
+  now count wire octets against RFC 1035 §2.3.4's 255.
+
+  **The cap was initially one octet lax, and the test caught it, not the
+  audit.** The accumulator omitted the root label's own byte, so a 256-octet
+  name still passed. The case that exposed it is labels 63/63/63/62 — exactly
+  256 wire octets but only 254 presentation characters, which is the single
+  window where the new wire cap differs from the presentation cap the decoder
+  already had. Both accumulators now seed at 1.
+- **Rdata-embedded names were bounded by `msg_len`, not RDLENGTH.** Memory-safe
+  — `dns_parse_rr` guarantees `rdata + rdlen <= msg_len` — but the name was read
+  out of the **next record's** bytes and printed as this record's authoritative
+  content, with a success return. Proven on all six name-bearing arms: an `NS`
+  with `rdlen=0` rendered a neighbouring name at rc=0. This violated the
+  contract written three lines above the accessor in `dns.cyr`. Every arm now
+  post-checks the decoded end offset against `rdoff + rdlen`, with `==` rather
+  than `<=` because BIND treats unconsumed trailing rdata as FORMERR too.
+- **13 rdata validation failures were discarded by both callers.** They returned
+  `-1`; the callers printed the trailing newline regardless. So an A record with
+  `rdlength=5` emitted an empty rdata field and **exited 0** — under `+short`, a
+  bare blank line, meaning `ip=$(dig +short host)` yielded `""` and the caller
+  was told it had succeeded. The status now propagates through
+  `output_print_short_rr` / `output_print_answer_rr` into a sticky flag and out
+  as exit 9, with the warning on **stderr** so it cannot corrupt the `+short`
+  stream scripts parse.
+- **MX, SRV, SOA and TXT emitted before validating.** MX wrote its preference,
+  SRV its priority/weight/port and SOA *both names* before discovering the rdata
+  was short, leaving half-rendered records on stdout. All four now validate
+  first; TXT needs a two-pass walk, since each segment is only discoverable by
+  walking the one before it.
+- **`dig . NS` — the canonical way to fetch root hints — could not be run.** The
+  root zone hit `dns_encode_name`'s empty-label rejection, which propagated as
+  `QRY_BAD` and printed **`dig: malformed response`** with exit 9, blaming the
+  resolver for an argv-shaped input having never sent a packet. The encoder now
+  accepts `.` as a whole name — keyed on the whole string, not on position, so
+  `.example.com` still refuses rather than silently querying the root. Names
+  that genuinely cannot be encoded are now rejected up front in `main.cyr` as a
+  usage error naming the input, by the same encoder that would put them on the
+  wire.
+- **NXDOMAIN and NODATA exited 9.** BIND returns 0 for a successful lookup
+  including NXDOMAIN, and reserves its non-zero codes for transport failures —
+  so `dig @$NS $ZONE >/dev/null || alert "resolver down"` cried wolf on a
+  perfectly healthy negative answer, indistinguishable from a dead resolver.
+  Worse, `+short` was inconsistent with *itself*: 9 on NXDOMAIN but 0 on NODATA,
+  same wire bytes, the difference being only which loop body never ran. A
+  well-formed reply that was received and printed is now exit 0 whatever the
+  RCODE says; the status is already reported in the `status:` field, which is
+  where BIND puts it. 9 is retained for socket failure and timeout, which is
+  what it means. This also unblocks `+trace` at 0.4.x — every hop of a
+  delegation walk is NOERROR with ANCOUNT=0.
+- **`@0.0.0.0` exited 2 with nothing on stdout or stderr.** `ipv4_parse` returns
+  packed 0 for it, which is not `< 0`, so the parse succeeded and 0 landed in
+  the slot that also meant "no @server given" — the one input that both parses
+  and collides. Presence now has its own flag rather than being inferred from
+  the value, so `@0.0.0.0` behaves as an ordinary explicit override (Linux
+  remaps `INADDR_ANY` to loopback on connect, the historic `resolver(5)`
+  semantic).
+- **A `nameserver 0.0.0.0` line aborted the whole `/etc/resolv.conf` scan.**
+  `resolv_parse` returned on `addr >= 0`, but 0 is its own documented
+  "nothing found" sentinel and the caller tests `> 0` — producer and consumer
+  disagreed. Proven with a bind-mounted file: `0.0.0.0` followed by `1.1.1.1`
+  made dig query **8.8.8.8**; it now queries 1.1.1.1.
+- **A CRLF `/etc/resolv.conf` fell through to 8.8.8.8.** The address token
+  terminated on space and tab but not CR, so `1.1.1.1\r` failed to parse and the
+  line was skipped. Same bind-mount proof: 8.8.8.8 before, 1.1.1.1 after. (CR is
+  deliberately *not* added to the blank-skipper — it is not whitespace in the
+  `resolver(5)` grammar, and accepting `nameserver\r 1.2.3.4` would make dig
+  laxer than glibc and BIND.)
+- **A `/etc/resolv.conf` over 4096 bytes was silently truncated**, and a cut
+  landing inside the final octet yields a *different valid address* — 10.0.0.53
+  read as 10.0.0.5, with nothing anywhere able to detect it, because the bytes
+  the parser was handed are well-formed. Buffer grown to 16 KiB.
+- **The fallback to a public resolver was completely silent**, and the chain the
+  file documented did not exist: the header promised
+  `/etc/resolv.conf → 192.168.1.1 → 8.8.8.8` and declared a
+  `RESOLV_FALLBACK_GATEWAY` constant, but there was no gateway step and the
+  constant had no readers. That was the most safety-relevant claim in the file
+  and it was false. The header now describes the real order, the dead constant
+  is gone, and every path that ends at the public fallback prints one line on
+  **stderr** — the shared backstop for all four resolv.conf defects above, and
+  the only signal under `+short`, which returns before the footer that would
+  have shown `server: 8.8.8.8`.
+- **A single well-timed junk datagram doubled the query deadline.** SO_RCVTIMEO
+  was armed once with the whole budget, and the inner loop bounds when a recv
+  may *start*, never when it must *end*. Measured: `+timeout=1 +retry=1` went
+  1.06s → 1.92s from one packet, shipped defaults 15.3s → 30.7s. Now re-armed to
+  the remaining budget before each recv; measured back to 2.06s for
+  `+timeout=2 +retry=1`. Note a *flood* never triggered this — the loop
+  condition handled that correctly. Precision was the attack.
+- **A truncated answer lost its footer and its counts.** On a mid-loop parse
+  failure `main` returned before `output_print_footer`, so the user got N valid
+  records, one stderr line, no `;; Query time`, exit 9, and no way to tell how
+  many records were missing or whether the ones shown were sound. Reachable with
+  no lie at all — the 512-byte UDP cap cuts a larger reply mid-record. Both
+  loops now break, warn with `N of M`, and fall through to the footer.
+
+### Changed
+- **AAAA rendering is RFC 5952.** dig printed eight fixed 4-hex-digit groups, so
+  **every** real-world AAAA differed from BIND, not merely ones with zero runs.
+  Now §4.1 leading-zero suppression, §4.2.2/§4.2.3 leftmost-longest `::`
+  (single zero fields are not collapsed), §4.3 lowercase, and §5's dotted-quad
+  forms as glibc's `inet_ntop6` implements them and BIND therefore inherits —
+  without which `::ffff:c000:0201` rendered `::ffff:c000:201` instead of
+  `::ffff:192.0.2.1`. Verified field-by-field against `inet_ntop`.
+- **Unknown RR types render RFC 3597 `\# <len> <hex>`.** The old dump used the
+  VARIABLE-width `fmt_hex` per byte, so distinct rdata collided —
+  `{00 01 0a 05}`, `{00 1a 05}` and `{00 01 a5}` all printed `01a5` — while the
+  same file already did this correctly for AAAA with fixed-width `fmt_byte`.
+  Unknown type codes now print `TYPE<n>` and unknown RCODEs `RESERVED<n>`,
+  instead of `TYPE?` / `RCODE?`, which discarded the value. RCODEs 6-10 gained
+  their real mnemonics.
+- **The answer line prints the reply's own CLASS.** `dns_rr_class` had been
+  populated since 0.3.0 and read by no production code, so a reply carrying
+  CLASS=CH was displayed as IN. (The QUESTION line's `IN` literal stays — dig
+  only ever sends QCLASS=IN, so that one is truthful by construction.)
+- **`dig example.com.` no longer prints `;example.com..`.** The wire query was
+  always correct; only the display doubled the dot.
+- **Dead code removed**: `_dig_streq_ci` (a third comparator variant with
+  subtly different semantics from the two in use — a trap), `platform_sleep_ms`
+  on both arms (uncalled, and the Linux body held a raw `nanosleep` number that
+  means `unlinkat` on aarch64 — a dead function holding a loaded gun),
+  `dns_rr_rdlength`, `DNS_FLAG_RA`, `RESOLV_FALLBACK_GATEWAY`, and the
+  write-only `type_seen` slot.
+- **Every `write(2)` goes through `sys_write`.** Seven raw `syscall(1, ...)`
+  sites remained in `src/`. They worked on aarch64 because the toolchain
+  translates 1 → 64 — but "it happens to be translated" is exactly the reasoning
+  that made `sendto`/44 a P1 in the first place, so they are named now.
+- **`DNS_NAME_BUF_LEN`** replaces thirteen hand-written `var nbuf[256]`. The
+  contract is a zero-margin exact fit and cyrius cannot take an expression as an
+  array size, so a test asserts `DNS_NAME_BUF_LEN == DNS_MAX_NAME_LEN + 1` —
+  that assertion is the only thing coupling the two numbers.
+
+### Tests
+- **128 → 198 assertions**, in seven new groups: `aaaa_rfc5952`,
+  `rdata_validation`, `rcode_names`, `surviving_guards`, `resolv_038`,
+  `reply_acceptable`, `name_buf_contract`.
+- **`tests/dig.fcyr` is a real fuzz harness.** It was
+  `if (len == 0) { return 0; } return 0;` with **no `include` of any `src/`
+  module**, called once with the literal `"test"` — and `cyrius fuzz` printed
+  PASS, which is worse than having no target at all because it read as coverage.
+  Proven: with `dns_parse_rr`'s rdlength bound deleted, the old stub still
+  passed. The replacement runs **1,560,376** assertions across five strategies
+  (uniform random, mutated valid frames, structure-aware field fuzzing, every
+  truncation, scattered compression pointers) against three invariants —
+  survival, offset contract, and no-forgery — and drives `output_print_rdata` on
+  every record so hostile rdata reaches the escaper and the RDLENGTH checks too.
+  It catches the rdlength mutant the stub missed.
+- **`query_reply_acceptable` extracted** from the transport loop. All four
+  acceptance guards — including the RFC 5452 §9.1 question check 0.3.7 exists to
+  have added — could be deleted with the whole suite green, because
+  `dns_question_matches` was tested as a function while its *use* was not tested
+  at all.
+- **Five guards that survived deletion** now have assertions: `dns_parse_rr`'s
+  rdlength bound, the compression hop budget in **both** walkers (the existing
+  cycle tests fed only self- and forward-pointers, which the backward rule kills
+  on its own, so the budget was never the deciding guard — the new case is a
+  33-link chain of individually-legal backward pointers), `dns_skip_name`'s
+  label-length guard, `dns_skip_question`'s fixed-tail bound, and
+  `resolv_parse`'s whitespace guard.
+- Several of these tests initially passed **for the wrong reason** and were
+  rewritten: the `dns_skip_name` cases were hitting the `msg_len` bound rather
+  than the guard under test, which is why the buffers are now deliberately
+  oversized. That is the failure mode the whole group exists to prevent.
+
+### Notes
+- x86_64, `--aarch64` and `--agnos` all build; x86_64 and aarch64 both resolve
+  live. `cyrius audit` green on all four dimensions.
+- Binary 163,016 → 167,376 bytes.
+- **Still open, deliberately:** the AGNOS arm has no executed coverage, so its
+  0.3.7 parity fixes remain review-verified only; there is no CI job building
+  any target but host x86_64; and `docs/adr/` and `docs/architecture/` are still
+  empty placeholders while the v1.0 gate names two documents that the last three
+  releases have now fully supplied the material for. All three are in
+  `roadmap.md`.
+
+
 ## [0.3.7] — 2026-08-28 (P-1 audit sweep: wrong syscalls on aarch64, raw control bytes on your terminal)
 
 An audit/hardening/repair cut on the existing surface. No new DNS features.

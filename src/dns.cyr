@@ -45,7 +45,6 @@ var DNS_CLASS_IN = 1;
 # === Header flag bits (in the FLAGS u16) ===
 var DNS_FLAG_QR = 0x8000;   # set on responses
 var DNS_FLAG_RD = 0x0100;   # recursion desired
-var DNS_FLAG_RA = 0x0080;   # recursion available
 var DNS_FLAG_TC = 0x0200;   # truncated — caller should retry over TCP
 
 # === RCODEs (low 4 bits of FLAGS) ===
@@ -55,11 +54,28 @@ var DNS_RCODE_SERVFAIL = 2;
 var DNS_RCODE_NXDOMAIN = 3;
 var DNS_RCODE_NOTIMP   = 4;
 var DNS_RCODE_REFUSED  = 5;
+var DNS_RCODE_YXDOMAIN = 6;
+var DNS_RCODE_YXRRSET  = 7;
+var DNS_RCODE_NXRRSET  = 8;
+var DNS_RCODE_NOTAUTH  = 9;
+var DNS_RCODE_NOTZONE  = 10;
+# 16 (BADVERS) is deliberately absent: dns_hdr_rcode masks to 4 bits, and the
+# extended RCODE lives in the OPT pseudo-RR's TTL high byte, which dig does not
+# parse until 0.4.x. An arm for it here would be unreachable.
 
 # === Limits ===
 var DNS_HEADER_LEN          = 12;
 var DNS_MAX_LABEL_LEN       = 63;     # RFC 1035 §2.3.4
 var DNS_MAX_NAME_LEN        = 255;    # RFC 1035 §2.3.4
+
+# Buffer size every dns_decode_name output must have. The contract is a
+# ZERO-MARGIN exact fit — the terminating NUL lands on index 255 of a 256-byte
+# buffer — and through 0.3.7 that was stated only in prose next to thirteen
+# hand-written `var nbuf[256]`. An enum with a literal initializer is required
+# here: cyrius will not take an expression as an array size, so the derivation
+# from DNS_MAX_NAME_LEN cannot be written down. `tests/dig.tcyr` therefore
+# asserts the two agree — that assertion is the only thing coupling them.
+enum DnsNameBuf { DNS_NAME_BUF_LEN = 256; }
 var DNS_MAX_UDP_PAYLOAD     = 512;    # RFC 1035 §2.3.4 (no EDNS yet)
 var NAME_DECODE_MAX_HOPS    = 32;     # cycle-detection budget
 
@@ -68,6 +84,22 @@ var NAME_DECODE_MAX_HOPS    = 32;     # cycle-detection budget
 # terminates with a zero byte. Returns bytes written, or 0 on any
 # violation (label > 63, total > 255, trailing dot syntax error).
 fn dns_encode_name(name, out): i64 {
+    # The root zone. `dig . NS` is the canonical way to fetch root hints, and
+    # through 0.3.7 it died in the empty-label check below: encode returned 0,
+    # query.cyr mapped that to QRY_BAD, and main printed
+    # `dig: malformed response` and exited 9 — blaming the resolver for an
+    # argv-shaped input, having never sent a packet.
+    #
+    # Keyed on the WHOLE name being ".", not on position. A guard like
+    # `src == 0` would make `.example.com` encode as the root and silently query
+    # something entirely different, which is strictly worse than refusing it.
+    # The empty-label rejection below stays exactly as it is.
+    if (load8(name) == 46) {
+        if (load8(name + 1) == 0) {
+            store8(out, 0);
+            return 1;
+        }
+    }
     var src = 0;
     var dst = 0;
     var label_start = dst;
@@ -139,6 +171,10 @@ fn dns_decode_name(msg, msg_len, off, out, out_len): i64 {
     store64(out_len, 0);
     var cur = off;
     var dst = 0;
+    # Seeded at 1 for the root label's own terminator byte, which RFC 1035
+    # §2.3.4's 255-octet limit counts. Starting at 0 made the cap one octet
+    # lax — caught by tests/dig.tcyr's 63/63/63/62 case, which is exactly 256.
+    var wire = 1;
     var end_off = 0;       # 0 = "haven't followed a pointer yet"
     var hops = 0;
     while (1) {
@@ -169,6 +205,14 @@ fn dns_decode_name(msg, msg_len, off, out, out_len): i64 {
             # Literal label.
             if (b > DNS_MAX_LABEL_LEN) { return 0; }
             if (cur + 1 + b > msg_len) { return 0; }
+            # Cap on the WIRE length, matching dns_skip_name. RFC 1035 §2.3.4's
+            # 255 is a wire limit; `dst` below is the PRESENTATION length, which
+            # for an n-label name is wire-2 (no length prefixes, n-1 dots, no
+            # root byte). Capping dst alone accepted wire names up to 257 octets
+            # — lax, and lax in a different direction from the walker, which is
+            # how the two guards drifted apart in the first place.
+            wire = wire + 1 + b;
+            if (wire > DNS_MAX_NAME_LEN) { return 0; }
             if (dst > 0) {
                 if (dst >= DNS_MAX_NAME_LEN) { return 0; }
                 store8(out + dst, 46);    # '.'
@@ -195,6 +239,7 @@ fn dns_skip_name(msg, msg_len, off): i64 {
     var cur = off;
     var end_off = 0;
     var hops = 0;
+    var wire = 1;      # the root terminator — see dns_decode_name
     while (1) {
         if (cur >= msg_len) { return 0; }
         var b = load8(msg + cur);
@@ -215,6 +260,15 @@ fn dns_skip_name(msg, msg_len, off): i64 {
             cur = ptr;
         } else {
             if (b > DNS_MAX_LABEL_LEN) { return 0; }
+            # Total decompressed WIRE length, capped at RFC 1035 §2.3.4's 255.
+            # Without this the walker accepted names the printer could not
+            # render: dns_parse_rr would return a valid offset for a 6x63-label
+            # owner name while dns_decode_name returned 0, so full output printed
+            # `;; ANSWER` with no records under it and exit 0, while `+short` on
+            # the identical bytes printed the address. Two modes of one tool
+            # disagreeing about the same reply, neither reporting a problem.
+            wire = wire + 1 + b;
+            if (wire > DNS_MAX_NAME_LEN) { return 0; }
             cur = cur + 1 + b;
         }
     }
@@ -371,8 +425,8 @@ fn dns_rr_class(rr):      i64 { return load64(rr + 16); }
 # unsigned; `_dns_load_u32` zero-extends, so no sign-extension surprise here.
 fn dns_rr_ttl(rr):        i64 { return load64(rr + 24); }
 # Offset within `msg` where this RR's rdata begins. Its LENGTH is not stored —
-# recover it with `dns_rr_rdlength(rr, next_off)` using the offset `dns_parse_rr`
-# returned. Callers that format rdata must bound every read against that length.
+# recover it as `next_off - dns_rr_rdata_off(rr)`, using the offset
+# `dns_parse_rr` returned. Callers that format rdata must bound every read against that length.
 fn dns_rr_rdata_off(rr):  i64 { return load64(rr + 32); }
 
 # Parse the resource record beginning at `off` into the caller's 40-byte `rr`
@@ -402,10 +456,4 @@ fn dns_parse_rr(msg, msg_len, off, rr): i64 {
     store64(rr + 24, ttl);
     store64(rr + 32, rdata);
     return rdata + rdlen;
-}
-
-# Helper: rdlength of the RR just parsed (recomputes from next_off
-# the caller already has). Provided as a sanity-helper for callers.
-fn dns_rr_rdlength(rr, next_off): i64 {
-    return next_off - dns_rr_rdata_off(rr);
 }

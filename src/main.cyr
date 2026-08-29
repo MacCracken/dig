@@ -11,7 +11,7 @@ include "src/output.cyr"
 include "src/query.cyr"
 
 # Write a cstr to stderr.
-fn _eputs(s): i64 { syscall(1, 2, s, strlen(s)); return 0; }
+fn _eputs(s): i64 { sys_write(2, s, strlen(s)); return 0; }
 
 # Print the version line, same shape and same source of truth as the query
 # banner (`; <<>> dig X.Y.Z <<>>`) — both read _DIG_VERSION_STR, which is
@@ -74,16 +74,33 @@ fn main() {
     if (name == 0) {
         _eputs("dig: missing query name\n");
         dig_cli_print_usage(2);
-        return 2;
+        return CMDIT_EXIT_USAGE;
+    }
+
+    # Validate the name HERE, by the same encoder that will put it on the wire.
+    # Through 0.3.7 an unencodable name (an empty label, a 64-byte label, a name
+    # over 255 octets) reached query_send_recv, failed inside dns_build_query,
+    # came back as QRY_BAD and was reported as `dig: malformed response` with
+    # exit 9 — blaming the resolver for an argv error, having never sent a
+    # packet. Reusing the encoder rather than re-deriving RFC 1035 §2.3.4 in
+    # cli.cyr is deliberate: a second copy of those rules would drift.
+    var nchk[256];
+    if (dns_encode_name(name, &nchk) == 0) {
+        _eputs("dig: '");
+        _eputs(name);
+        _eputs("' is not a legal domain name\n");
+        return CMDIT_EXIT_USAGE;
     }
 
     # Resolver: explicit @server beats /etc/resolv.conf beats fallback.
+    # `0` is a legal parsed address (0.0.0.0), so presence gets its own flag
+    # rather than being inferred from the value. Through 0.3.7 `@0.0.0.0` parsed
+    # fine, collided with the "no server" sentinel, and fell into a bare
+    # `return 2` with nothing on stdout OR stderr — the one input that both
+    # parsed and collided. Linux remaps INADDR_ANY to loopback on connect, which
+    # is the historic resolver(5) semantic, so it is honoured as an override.
     var server = dig_cli_server_addr(reg);
-    if (server == 0) {
-        if (dig_cli_server_str(reg) != 0) {
-            # User passed @ but it didn't parse — already returned above.
-            return 2;
-        }
+    if (dig_cli_server_seen(reg) == 0) {
         server = resolv_discover();
     }
 
@@ -127,9 +144,14 @@ fn main() {
     var rcode = dns_hdr_rcode(rx);
     var ancount = dns_hdr_ancount(rx);
 
+    # Sticky status flags. Set by the record loops below, folded into the exit
+    # code at the very end so a problem never costs the user the rest of the
+    # report — which is what returning mid-loop used to do.
+    var trunc = 0;
+    var malformed = 0;
+
     # +short: just rdata. Skip everything else.
     if (dig_cli_short(reg) == 1) {
-        if (rcode != DNS_RCODE_NOERROR) { return 9; }
         var off = dns_answer_section_start(rx, resp_len);
         if (off == 0) {
             _eputs("dig: response section parse failure\n");
@@ -137,25 +159,37 @@ fn main() {
         }
         var rr = alloc(DNS_RR_SIZE);
         var k = 0;
+        var short_trunc = 0;
         while (k < ancount) {
             var next = dns_parse_rr(rx, resp_len, off, rr);
             if (next == 0) {
-                _eputs("dig: answer RR parse failure\n");
-                return 9;
+                _out_eputs(";; WARNING: message truncated after ");
+                fmt_int(k);
+                _out_eputs(" of ");
+                fmt_int(ancount);
+                _out_eputs(" records\n");
+                short_trunc = 1;
+                k = ancount;
+            } else {
+                # Every answer RR's rdata prints, with no qtype filter — the
+                # same as BIND. (Through 0.3.7 the comment here promised a
+                # type/CNAME-chain filter that did not exist and never had.
+                # Filtering would hide exactly the record an operator debugging
+                # a hostile resolver needs to see.)
+                if (output_print_short_rr(rx, resp_len, rr, next) < 0) { malformed = 1; }
+                off = next;
+                k = k + 1;
             }
-            # Only print rdata whose type matches the query type or
-            # CNAME chain (BIND prints the full chain in +short).
-            output_print_short_rr(rx, resp_len, rr, next);
-            off = next;
-            k = k + 1;
         }
+        if (short_trunc == 1) { return 9; }
+        if (malformed == 1)   { return 9; }
         return 0;
     }
 
     # Full BIND-shape output.
     output_print_header(name);
     _out_puts(";; ->>HEADER<<- opcode: QUERY, status: ");
-    _out_puts(output_rcode_str(rcode));
+    output_print_rcode(rcode);
     _out_puts(", id: ");
     fmt_int(dns_hdr_id(rx));
     _out_puts("\n");
@@ -177,12 +211,24 @@ fn main() {
         while (k2 < ancount) {
             var next2 = dns_parse_rr(rx, resp_len, off2, rr2);
             if (next2 == 0) {
-                _eputs("dig: answer RR parse failure\n");
-                return 9;
+                # Break, do not return. Returning here skipped the footer
+                # entirely, so the user got N good records, one stderr line, no
+                # `;; Query time` line and exit 9 — with no way to tell whether
+                # the N shown were valid or how many were missing. Reachable
+                # with no lie at all: the 512-byte UDP cap cuts a larger reply
+                # mid-record.
+                _out_eputs(";; WARNING: message truncated after ");
+                fmt_int(k2);
+                _out_eputs(" of ");
+                fmt_int(ancount);
+                _out_eputs(" records\n");
+                trunc = 1;
+                k2 = ancount;
+            } else {
+                if (output_print_answer_rr(rx, resp_len, rr2, next2) < 0) { malformed = 1; }
+                off2 = next2;
+                k2 = k2 + 1;
             }
-            output_print_answer_rr(rx, resp_len, rr2, next2);
-            off2 = next2;
-            k2 = k2 + 1;
         }
     } else {
         _out_puts(";; (no answer)\n");
@@ -190,8 +236,16 @@ fn main() {
 
     output_print_footer(query_us, server, dig_cli_tcp(reg));
 
-    if (rcode != DNS_RCODE_NOERROR) { return 9; }
-    if (ancount == 0)               { return 9; }
+    # A well-formed reply that was received and printed is a SUCCESS, whatever
+    # the RCODE says — BIND returns 0 for NXDOMAIN and the status is already
+    # reported in the `status:` field, which is where BIND puts it. Through
+    # 0.3.7 both NXDOMAIN and NODATA exited 9, indistinguishable from "the
+    # resolver never answered", so `dig @$NS $ZONE >/dev/null || alert` cried
+    # wolf on a perfectly healthy negative answer. `+short` was even
+    # inconsistent with itself: 9 on NXDOMAIN, 0 on NODATA, same wire bytes.
+    # 9 is retained for QRY_SOCKET / QRY_TIMEOUT above, which is what it means.
+    if (trunc == 1)     { return 9; }
+    if (malformed == 1) { return 9; }
     return 0;
 }
 

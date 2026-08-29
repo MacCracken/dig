@@ -1,6 +1,6 @@
 # dig — Roadmap
 
-> **Status**: Active | **Last Updated**: 2026-08-28 (0.3.7 — post-audit revisit)
+> **Status**: Active | **Last Updated**: 2026-08-28 (0.3.8 — audit backlog closed)
 >
 > Milestone path from scaffold (0.1.0) through v1.0 (full BIND `dig` parity + LAN-on-iron + `taar` extraction trigger fired). Per first-party-documentation roadmap shape: **Completed** / **Backlog** / **Future** / **v1.0 criteria**.
 >
@@ -14,6 +14,7 @@
 |---|---|---|
 | **0.1.0** | 2026-05-23 | Initial `cyrius init` scaffold. README + CLAUDE.md + LICENSE + CHANGELOG + cyrius.cyml + tests/dig.{tcyr,bcyr,fcyr} + `.github/workflows/{ci,release}.yml`. Stub `main.cyr` prints `hello from dig`. Stdlib vendored in `lib/` (81 modules incl. `net.cyr`). |
 | **0.3.0** | 2026-05-23 | **dig MVP — first end-to-end resolution.** Real UDP queries against arbitrary resolvers; A / AAAA / MX / NS / CNAME / SOA / PTR / TXT / SRV parsed; BIND-shape + `+short` output. 8 src/ modules (cli, dns, ipv4, output, platform/platform_linux, query, resolv) totaling 1410 LOC. 70 test assertions including name-compression cycle detection. Per-backend sovereignty posture: pragmatic POSIX on Linux, AGNOS backend deferred to v1.0 gate (same as yo). At the time, 0.2.x kernel UDP-53 syscall exposure was still pending (the Linux-backend-first bypass kept momentum); that surface has since landed (agnos 1.45.3, #51-54) and the AGNOS backend now resolves end-to-end. |
+| **0.3.8** | 2026-08-28 | **Audit backlog closed** — the 23 P2/P3 findings 0.3.7 left open. Rendering (RFC 5952 AAAA, RFC 3597 unknown types, real CLASS/RCODE names, the doubled FQDN dot), validation (rdata bounded by RDLENGTH not `msg_len`, 13 discarded error returns now reaching the exit code, validate-before-emit), semantics (`dig . NS` works, NXDOMAIN exits 0 like BIND, `@0.0.0.0` no longer exits 2 in silence), resolv.conf (`0.0.0.0` skipped rather than fatal, CRLF, 16 KiB, an audible fallback), the 2x deadline extension from one well-timed packet, and partial answers keeping their footer. Dead code removed. Tests 128 → 198; `tests/dig.fcyr` went from a stub that reported PASS while including no source at all to 1,560,376 assertions across five strategies. |
 | **0.3.7** | 2026-08-28 | **P-1 audit / hardening sweep.** Repaired the aarch64 wrong-syscall defect (`platform_linux.cyr` hardcoded an x86_64 table used on every non-AGNOS target), the `+timeout=0` infinite hang, the silently-discarded unknown record type, and a walkable integer-overflow guard. Hardened the reply path: connected UDP socket, RFC 5452 §9.1 question matching, per-attempt query IDs, fail-closed entropy, and junk datagrams no longer consuming retries. Adopted `[deps.cmdit]` 1.2.4 and dropped the never-referenced stdlib `flags`. 70 → 102 assertions, all four repairs mutation-checked. `cyrius audit` green on all four dimensions for the first time. |
 
 ---
@@ -42,34 +43,18 @@ Ordered by dependency. Items further down depend on items earlier.
 - [x] Default resolver discovery — `src/resolv.cyr` reads `/etc/resolv.conf`, falls back to `8.8.8.8`. User overrides via `@server`.
 - [x] BIND-shape output — `src/output.cyr`. Full header + `;; ->>HEADER<<-` + `;; QUESTION` + `;; ANSWER` + `;; Query time: N ms · server: X · proto: udp` footer. `+short` mode prints bare rdata.
 
-### 0.3.8 — the rest of the 0.3.6 audit
+### 0.3.8 — the rest of the 0.3.6 audit ✅ landed 2026-08-28
 
-The 0.3.7 sweep ran eight lenses over the tree and confirmed **61** findings
-against adversarial refutation (0 refuted). Both P1s and the highest-value P2s
-landed in 0.3.7. These are the remainder — recorded so they are a backlog rather
-than a thing everyone forgets was found. None is a feature; all are repairs on
-the existing surface.
-
-**Rendering / correctness — `src/output.cyr`, `src/dns.cyr`**
-- [ ] **Propagate `output_print_rdata`'s error.** 13 validation failures return `-1`; both callers discard it and print `\n` anyway. An A record with `rdlength=5` prints an empty rdata field and **exits 0** — in `+short` that is a bare blank line, so `ip=$(dig +short host)` yields `""` and the caller is told it succeeded. Four types (MX/SRV/SOA/TXT) also partially emit before rejecting, so validation must move ahead of the first write.
-- [ ] **Bound rdata-embedded names by RDLENGTH, not `msg_len`.** Memory-safe (`dns_parse_rr` caps `rdata + rdlen`), but a name is read out of the *next* record's bytes and printed as this record's authoritative content with a success return. Proven on all six arms: `NS rdlen=0` renders a neighbouring name, rc=0. This violates the contract stated three lines above the accessor in `dns.cyr`.
-- [ ] **`dns_skip_name` needs the 255-byte cap `dns_decode_name` has.** It enforces label ≤ 63, the hop budget and the backward-pointer rule, but not total name length.
-- [ ] **AAAA rendering is not RFC 5952** — no zero-run suppression, no `::`. The code comments already admit it.
-- [ ] Unknown-type hex dump is not injective; answer line hardcodes class `IN`; question line doubles the dot on an FQDN; RCODEs 6-15 print `RCODE?`.
-
-**Semantics — `src/main.cyr`, `src/cli.cyr`, `src/resolv.cyr`**
-- [ ] **NXDOMAIN and NODATA exit 9; BIND exits 0.** A script asking "does this name exist" cannot distinguish "no" from "the resolver broke".
-- [ ] **The root zone `.` cannot be queried**, and name-encode failures are reported as network faults.
-- [ ] `@0.0.0.0` exits 2 with no message at all. `resolv_parse` accepts `0.0.0.0` and aborts the scan. A CRLF `/etc/resolv.conf` silently falls through to `8.8.8.8`. A `resolv.conf` over 4096 bytes is silently truncated. The public fallback is silent, and the fallback chain the docs describe does not exist in the code.
-- [ ] **Per-recv timeout is armed with the full budget**, so the worst case is 2x the documented ceiling.
-- [ ] Partial answers lose their footer and their counts.
-
-**Coverage**
-- [ ] **`tests/dig.fcyr` is a stub** — `if (len == 0) { return 0; } return 0;`. It is described in the v1.0 criteria as the fuzz harness for the response-frame parser, "the security-critical path". Given that this cut found two P1s in exactly that path by hand, a real harness is the highest-value test work available.
-- [ ] `output.cyr` (0/8 fns), `query.cyr` (0/1) and `platform_*.cyr` (0/10) have no direct coverage.
-- [ ] Dead code to remove: `RESOLV_FALLBACK_GATEWAY`, `_dig_streq_ci`, the `+72 type_seen` slot, `dns_rr_class`, `dns_rr_rdlength` — all with zero production readers.
-
----
+All 23 remaining P2/P3 findings closed. Rendering (RFC 5952 AAAA, RFC 3597
+unknown types, class/RCODE naming, the doubled FQDN dot), validation (rdata
+bounded by RDLENGTH, errors propagated to the exit code, MX/SRV/SOA/TXT
+validate-before-emit), semantics (root zone queryable, NXDOMAIN exits 0,
+`@0.0.0.0` no longer silent), resolv.conf (`0.0.0.0` skipped not fatal, CRLF,
+16 KiB buffer, an audible fallback), the 2x deadline extension, and partial
+answers keeping their footer. Dead code removed; every `write(2)` routed through
+`sys_write`. Tests 128 → 198 and a real fuzz harness at 1,560,376 assertions,
+replacing a stub that reported PASS while including no source at all. See
+CHANGELOG [0.3.8].
 
 ### 0.4.x — Full record-type coverage + advanced flags
 

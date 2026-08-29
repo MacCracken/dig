@@ -51,9 +51,10 @@ enum DigCliResult {
 #   +48  tcp        : i64 (0/1)
 #   +56  nodnssec   : i64 (0/1)
 #   +64  help       : i64 (0/1)
-#   +72  type_seen  : i64 (0 → no type token; we use default A)
+#   +72  (reserved)  : i64 — was `type_seen`, write-only since 0.3.0 and
+#                       dropped at 0.3.8; the default-A path never read it
 #   +80  server_addr: i64 (parsed IPv4, 0 if none)
-#   +88  reserved   : i64
+#   +88  server_seen: i64 (0/1 — @server was supplied at all)
 
 var DIG_CLI_SIZE = 96;
 
@@ -96,6 +97,11 @@ fn dig_cli_help(r):       i64 { return load64(r + 64); }
 # The @server address in packed ip4() form (first octet in the high byte), or 0
 # if none was given. Already validated as a dotted quad by `ipv4_parse`.
 fn dig_cli_server_addr(r):i64 { return load64(r + 80); }
+# 1 if an `@server` was given at all, else 0. Presence needs its own flag
+# because 0 is a LEGAL parsed address (0.0.0.0) — using the address itself as
+# the sentinel meant `@0.0.0.0` parsed successfully, collided with "no server
+# given", and fell through to a bare `return 2` with nothing printed anywhere.
+fn dig_cli_server_seen(r):i64 { return load64(r + 88); }
 
 # Lowercase a single ASCII byte. Non-ASCII passes through.
 fn _dig_lc(c): i64 {
@@ -103,19 +109,6 @@ fn _dig_lc(c): i64 {
         if (c <= 90) { return c + 32; }
     }
     return c;
-}
-
-# Case-insensitive cstr equality.
-fn _dig_streq_ci(a, b): i64 {
-    var i = 0;
-    while (1) {
-        var ca = _dig_lc(load8(a + i));
-        var cb = _dig_lc(load8(b + i));
-        if (ca != cb) { return 0; }
-        if (ca == 0) { return 1; }
-        i = i + 1;
-    }
-    return 0;
 }
 
 # Compare a cstr against a literal, bounded by lit_len. Token must
@@ -271,6 +264,7 @@ fn dig_cli_parse_argv(reg, ac, av): i64 {
             var addr = ipv4_parse(tok + 1);
             if (addr < 0) { return DIG_CLI_ERR_BAD_SERVER; }
             store64(reg + 80, addr);
+            store64(reg + 88, 1);         # server_seen — see dig_cli_server_seen
         }
         elif (c0 == 43) {      # '+' — option
             var rc = _dig_apply_plus(reg, tok);
@@ -283,7 +277,6 @@ fn dig_cli_parse_argv(reg, ac, av): i64 {
             var t = _dig_match_type(tok);
             if (t != 0) {
                 store64(reg + 16, t);
-                store64(reg + 72, 1);
             } else {
                 if (load64(reg) == 0) {
                     store64(reg, tok);
@@ -309,7 +302,7 @@ fn dig_cli_parse_argv(reg, ac, av): i64 {
 # Print "Usage: ..." line.
 fn dig_cli_print_usage(fd): i64 {
     var u = "Usage: dig [@server] [+flag...] <name> [type]\n";
-    syscall(1, fd, u, strlen(u));
+    sys_write(fd, u, strlen(u));
     return 0;
 }
 

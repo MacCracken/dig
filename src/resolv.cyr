@@ -11,9 +11,19 @@
 # nameserver lines pointing at IPv4 — IPv6 nameservers wait for
 # roadmap § 0.4.x.
 #
-# Fallback chain (per roadmap.md § 0.3.x): /etc/resolv.conf → 192.168.1.1 → 8.8.8.8.
+# Discovery order, as the code actually walks it:
+#   1. platform_dns_server() — the AGNOS DHCP-leased on-subnet resolver
+#      (net_config#61). Returns 0 on Linux, so this step is a no-op there.
+#   2. /etc/resolv.conf, first valid `nameserver <dotted-quad>` line.
+#   3. RESOLV_FALLBACK_PUBLIC (8.8.8.8).
+#
+# Through 0.3.7 this header claimed the chain was
+# "/etc/resolv.conf -> 192.168.1.1 -> 8.8.8.8", and declared a
+# RESOLV_FALLBACK_GATEWAY constant to match. There was no gateway step and the
+# constant had no readers — so the header promised that an on-subnet gateway
+# would be tried before queries escaped to a third party, which was false, and
+# it was the most safety-relevant claim in the file. Both are gone.
 
-var RESOLV_FALLBACK_GATEWAY = 0xC0A80101;   # 192.168.1.1
 var RESOLV_FALLBACK_PUBLIC  = 0x08080808;   # 8.8.8.8
 var RESOLV_NAMESERVER_LIT   = "nameserver";   # 10 bytes
 
@@ -83,6 +93,16 @@ fn resolv_parse(buf, len): i64 {
                         var ec = load8(buf + end);
                         if (ec == 32) { break; }
                         if (ec == 9) { break; }
+                        # CR, for a CRLF file. Without this the token is
+                        # "1.1.1.1\r", ipv4_parse rejects it, the line is
+                        # skipped, and with no other nameserver line discovery
+                        # silently fell through to 8.8.8.8 — off-box, to a third
+                        # party. (glibc has the same CRLF limitation but fails
+                        # CLOSED, to 127.0.0.1. Deliberately NOT adding CR to
+                        # _resolv_skip_blank: CR is not whitespace in the
+                        # resolver(5) grammar, and accepting `nameserver\r 1.2.3.4`
+                        # would make dig laxer than both glibc and BIND.)
+                        if (ec == 13) { break; }
                         end = end + 1;
                     }
                     var tlen = end - j;
@@ -96,7 +116,16 @@ fn resolv_parse(buf, len): i64 {
                             }
                             store8(&tmp + tlen, 0);
                             var addr = ipv4_parse(&tmp);
-                            if (addr >= 0) { return addr; }
+                            # `> 0`, not `>= 0`. 0 is this function's documented
+                            # "nothing found" sentinel and the caller tests
+                            # `> 0` — so `nameserver 0.0.0.0` used to "succeed"
+                            # with 0, abandoning the rest of the file, and the
+                            # caller then read that as failure and used 8.8.8.8.
+                            # Proven: a resolv.conf of `0.0.0.0` then `1.1.1.1`
+                            # queried 8.8.8.8; now it queries 1.1.1.1. (The
+                            # point is producer/consumer agreement, not that
+                            # 0.0.0.0 is unusable — the kernel remaps it.)
+                            if (addr > 0) { return addr; }
                         }
                     }
                     i = eol + 1;
@@ -108,6 +137,8 @@ fn resolv_parse(buf, len): i64 {
     }
     return 0;
 }
+
+var RESOLV_CONF_MAX = 16384;
 
 # Top-level discovery wrapper. Reads /etc/resolv.conf via the platform
 # shim; on any failure (file missing, no nameserver line), falls back
@@ -121,11 +152,23 @@ fn resolv_parse(buf, len): i64 {
 fn resolv_discover(): i64 {
     var ksrv = platform_dns_server();
     if (ksrv > 0) { return ksrv; }
-    var buf = alloc(4096);
-    var n = platform_read_file("/etc/resolv.conf", buf, 4096);
+    # 16 KiB, up from 4096. A single unchecked 4096-byte read silently truncated
+    # larger files: a nameserver line straddling offset 4096 yielded a DIFFERENT
+    # valid address (10.0.0.5 for 10.0.0.53), and a first nameserver line past
+    # 4096 yielded the public fallback. platform_read_file is one read(2), so the
+    # buffer has to cover the file rather than the loop covering the buffer.
+    var buf = alloc(RESOLV_CONF_MAX);
+    var n = platform_read_file("/etc/resolv.conf", buf, RESOLV_CONF_MAX);
     if (n > 0) {
         var addr = resolv_parse(buf, n);
         if (addr > 0) { return addr; }
     }
+    # Say so. Every path that lands here — file missing, unreadable, CRLF,
+    # truncated, only-IPv6-nameservers, only 0.0.0.0 — used to leak identically
+    # and in silence, and `+short` and the timeout path never print the footer
+    # that would have shown `server: 8.8.8.8`. This one line on stderr is the
+    # shared backstop for all of them.
+    _out_eputs(";; WARNING: no usable nameserver in /etc/resolv.conf");
+    _out_eputs(" — falling back to 8.8.8.8\n");
     return RESOLV_FALLBACK_PUBLIC;
 }

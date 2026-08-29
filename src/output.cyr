@@ -21,8 +21,8 @@
 # before that, and output.cyr is included by main.cyr, not the entry.
 var _DIG_VERSION_STR = CYRIUS_PKG_VERSION;
 
-fn _out_puts(s): i64 { syscall(1, 1, s, strlen(s)); return 0; }
-fn _out_eputs(s): i64 { syscall(1, 2, s, strlen(s)); return 0; }
+fn _out_puts(s): i64 { sys_write(1, s, strlen(s)); return 0; }
+fn _out_eputs(s): i64 { sys_write(2, s, strlen(s)); return 0; }
 
 # RFC 1035 §5.1 presentation escaping into a caller buffer. Returns bytes
 # written, or -1 if the result would not fit `dst_cap` (refuses, never truncates).
@@ -94,7 +94,7 @@ fn _out_escaped(p, n, esc_space): i64 {
     var eb[1024];
     var w = _esc_to_buf(&eb, 1024, p, n, esc_space);
     if (w < 0) { return 0 - 1; }
-    syscall(1, 1, &eb, w);
+    sys_write(1, &eb, w);
     return 0;
 }
 
@@ -115,7 +115,19 @@ fn output_type_str(t): i64 {
     if (t == DNS_TYPE_NSEC)  { return "NSEC"; }
     if (t == DNS_TYPE_DNSKEY){ return "DNSKEY"; }
     if (t == DNS_TYPE_NSEC3) { return "NSEC3"; }
-    return "TYPE?";
+    return 0;
+}
+
+# Print the RR-type mnemonic, or RFC 3597 §5's `TYPE<n>`. The old `"TYPE?"`
+# fallback threw the code away, leaving output that neither a human nor a script
+# can act on — and it is the MORE reachable of the two unknown-type paths, since
+# any CAA / SVCB / HTTPS / TLSA record in an answer lands here.
+fn output_print_type(t): i64 {
+    var m = output_type_str(t);
+    if (m != 0) { return _out_puts(m); }
+    _out_puts("TYPE");
+    fmt_int(t);
+    return 0;
 }
 
 # RCODE -> mnemonic ("NOERROR", "NXDOMAIN", ...) as a cstr, BIND spelling.
@@ -128,15 +140,170 @@ fn output_rcode_str(r): i64 {
     if (r == DNS_RCODE_NXDOMAIN) { return "NXDOMAIN"; }
     if (r == DNS_RCODE_NOTIMP)   { return "NOTIMP"; }
     if (r == DNS_RCODE_REFUSED)  { return "REFUSED"; }
-    return "RCODE?";
+    if (r == DNS_RCODE_YXDOMAIN) { return "YXDOMAIN"; }
+    if (r == DNS_RCODE_YXRRSET)  { return "YXRRSET"; }
+    if (r == DNS_RCODE_NXRRSET)  { return "NXRRSET"; }
+    if (r == DNS_RCODE_NOTAUTH)  { return "NOTAUTH"; }
+    if (r == DNS_RCODE_NOTZONE)  { return "NOTZONE"; }
+    return 0;
+}
+
+# Print the RCODE mnemonic, or BIND's `RESERVED<n>` for 11-15. A print-style
+# helper rather than a cstr-returning one because the reserved range needs the
+# number formatted in. Through 0.3.7 every code above 5 printed a flat
+# `RCODE?`, which discards the value the operator needs.
+fn output_print_rcode(r): i64 {
+    var m = output_rcode_str(r);
+    if (m != 0) { return _out_puts(m); }
+    _out_puts("RESERVED");
+    fmt_int(r);
+    return 0;
+}
+
+# Print the CLASS mnemonic, or `CLASS<n>` for anything else — never a table
+# index, since the class is an attacker-chosen 16-bit value. Omitting CS(2) is
+# deliberate: BIND has no entry for it either, so both print `CLASS2`.
+fn output_print_class(c): i64 {
+    if (c == DNS_CLASS_IN) { return _out_puts("IN"); }
+    if (c == 3)            { return _out_puts("CH"); }
+    if (c == 4)            { return _out_puts("HS"); }
+    _out_puts("CLASS");
+    fmt_int(c);
+    return 0;
 }
 
 # Print one RR's rdata in type-appropriate form. Returns 0 on success,
 # negative on parse error.
+# Render an AAAA as RFC 5952 §4: leading zeros suppressed, the leftmost longest
+# run of >=2 zero groups replaced by `::`, lowercase hex (fmt_hex gives all
+# three). Through 0.3.7 this printed eight fixed 4-digit groups, so EVERY
+# real-world AAAA differed from BIND, not merely ones with zero runs.
+#
+# The `use_v4` arm is RFC 5952 §5 as glibc's inet_ntop6 implements it — and
+# therefore as BIND inherits it. Without it `::ffff:c000:0201` renders
+# `::ffff:c000:201` where BIND prints `::ffff:192.0.2.1`.
+#
+# Renders into `dst` (needs 64 bytes) and returns the length, so the RFC 5952
+# rules above are assertable without capturing stdout. `_out_aaaa` is the thin
+# stdout wrapper.
+fn _aaaa_to_buf(dst, msg, rdoff): i64 {
+    var w[16];
+    var i = 0;
+    while (i < 8) {
+        store16(&w + i * 2, (load8(msg + rdoff + i * 2) << 8) | load8(msg + rdoff + i * 2 + 1));
+        i = i + 1;
+    }
+    # Leftmost longest zero run. Strictly-greater keeps the leftmost on a tie
+    # (§4.2.3); a run of one is not eligible (§4.2.2).
+    var best_base = 0 - 1;
+    var best_len = 0;
+    var cur_base = 0 - 1;
+    var cur_len = 0;
+    i = 0;
+    while (i < 8) {
+        if (load16(&w + i * 2) == 0) {
+            if (cur_base < 0) { cur_base = i; cur_len = 0; }
+            cur_len = cur_len + 1;
+            if (cur_len > best_len) { best_base = cur_base; best_len = cur_len; }
+        } else {
+            cur_base = 0 - 1;
+            cur_len = 0;
+        }
+        i = i + 1;
+    }
+    if (best_len < 2) { best_base = 0 - 1; best_len = 0; }
+
+    var use_v4 = 0;
+    if (best_base == 0) {
+        if (best_len == 6) { use_v4 = 1; }
+        if (best_len == 7) { if (load16(&w + 14) != 1) { use_v4 = 1; } }
+        if (best_len == 5) { if (load16(&w + 10) == 0xFFFF) { use_v4 = 1; } }
+    }
+
+    var o = 0;
+    i = 0;
+    while (i < 8) {
+        var in_run = 0;
+        if (best_base >= 0) {
+            if (i >= best_base) { if (i < best_base + best_len) { in_run = 1; } }
+        }
+        if (in_run == 1) {
+            if (i == best_base) { store8(dst + o, 58); o = o + 1; }
+        } else {
+            if (i != 0) { store8(dst + o, 58); o = o + 1; }
+            if ((use_v4 == 1) && (i == 6)) {
+                var packed = (load8(msg + rdoff + 12) << 24)
+                | (load8(msg + rdoff + 13) << 16)
+                | (load8(msg + rdoff + 14) << 8)
+                |  load8(msg + rdoff + 15);
+                o = o + ipv4_format_to_buf(packed, dst + o);
+                i = 8;
+            } else {
+                o = o + fmt_hex_buf(load16(&w + i * 2), dst + o);
+            }
+        }
+        i = i + 1;
+    }
+    if (best_base >= 0) {
+        if (best_base + best_len == 8) { store8(dst + o, 58); o = o + 1; }
+    }
+    store8(dst + o, 0);
+    return o;
+}
+
+fn _out_aaaa(msg, rdoff): i64 {
+    var b[64];
+    var n = _aaaa_to_buf(&b, msg, rdoff);
+    sys_write(1, &b, n);
+    return 0;
+}
+
+# Render an unhandled RR type per RFC 3597 §5: `\# <rdlength> <hex>`.
+#
+# Through 0.3.7 this was a bare `fmt_hex` per byte, and fmt_hex is
+# VARIABLE-width — so distinct rdata collided: {00 01 0a 05}, {00 1a 05} and
+# {00 01 a5} all rendered `01a5`. The same file was already doing this correctly
+# for AAAA with the fixed-width fmt_byte. The `\# len` prefix makes the length
+# explicit and kills cross-length collisions outright.
+fn output_print_rdata_unknown(msg, rdoff, rdlen): i64 {
+    _out_puts("\\# ");
+    fmt_int(rdlen);
+    var i2 = 0;
+    while (i2 < rdlen) {
+        if (i2 == 0) { _out_puts(" "); }
+        fmt_byte(load8(msg + rdoff + i2));
+        i2 = i2 + 1;
+    }
+    return 0;
+}
+
+# Print one RR's rdata. Returns 0, or -1 if the rdata is malformed for its type.
+#
+# TWO INVARIANTS, both added at 0.3.8 after the audit, both load-bearing:
+#
+#  1. VALIDATE BEFORE EMITTING. Every arm now completes its checks before the
+#     first byte goes out. MX, SRV and SOA used to write their fixed fields (and
+#     for SOA both names) and only then discover the rdata was short, leaving a
+#     half-rendered record on stdout followed by a -1 nobody read.
+#
+#  2. NAMES ARE BOUNDED BY RDLENGTH, NOT msg_len. dns_parse_rr guarantees
+#     rdata+rdlen <= msg_len, so decoding against msg_len was memory-SAFE — but
+#     it read the name out of the NEXT record's bytes and printed it as this
+#     record's authoritative content, returning success. Measured: an NS with
+#     rdlen=0 rendered a neighbouring name at rc=0. The check is `!=`, not `<=`:
+#     BIND treats unconsumed trailing rdata as FORMERR too, and every legal
+#     encoding (uncompressed, fully compressed, partially compressed) lands
+#     exactly on rdoff+rdlen.
+#
+#     Note we do NOT pass rdoff+rdlen as dns_decode_name's msg_len — compression
+#     pointers legitimately target earlier bytes outside this rdata (RFC 1035
+#     §4.1.4) and the decoder uses the same limit for both. The end-offset
+#     post-check is the correct predicate and leaves the decoder untouched.
 fn output_print_rdata(msg, msg_len, rr, next_off): i64 {
     var t = dns_rr_type(rr);
     var rdoff = dns_rr_rdata_off(rr);
     var rdlen = next_off - rdoff;
+    var rdend = rdoff + rdlen;
 
     if (t == DNS_TYPE_A) {
         if (rdlen != 4) { return 0 - 1; }
@@ -146,73 +313,72 @@ fn output_print_rdata(msg, msg_len, rr, next_off): i64 {
         | (load8(msg + rdoff + 2) << 8)
         |  load8(msg + rdoff + 3);
         var n = ipv4_format_to_buf(packed, &buf);
-        syscall(1, 1, &buf, n);
+        sys_write(1, &buf, n);
         return 0;
     }
     if (t == DNS_TYPE_AAAA) {
         if (rdlen != 16) { return 0 - 1; }
-        # Minimal AAAA print: 8 groups of 4 hex digits, no compression
-        # of zero runs. Functional for 0.3.x; the canonical RFC 5952
-        # rendering with "::" run-compression can come at 0.4.x.
-        # fmt_byte() prints 2-digit zero-padded hex (lib/fmt.cyr:86).
-        var i = 0;
-        while (i < 8) {
-            fmt_byte(load8(msg + rdoff + i * 2));
-            fmt_byte(load8(msg + rdoff + i * 2 + 1));
-            if (i < 7) { _out_puts(":"); }
-            i = i + 1;
-        }
-        return 0;
+        return _out_aaaa(msg, rdoff);
     }
     if (t == DNS_TYPE_MX) {
         if (rdlen < 3) { return 0 - 1; }
-        var prio = _dns_load_u16(msg, rdoff);
-        fmt_int(prio);
-        _out_puts(" ");
-        var nbuf[256];
+        var nbuf[DNS_NAME_BUF_LEN];
         var nl0[8];
         var nend = dns_decode_name(msg, msg_len, rdoff + 2, &nbuf, &nl0);
         if (nend == 0) { return 0 - 1; }
+        if (nend != rdend) { return 0 - 1; }
+        fmt_int(_dns_load_u16(msg, rdoff));
+        _out_puts(" ");
         _out_escaped(&nbuf, load64(&nl0), 1);
         _out_puts(".");
         return 0;
     }
     if (t == DNS_TYPE_NS) {
-        var nb1[256];
+        var nb1[DNS_NAME_BUF_LEN];
         var nl1[8];
         var ne1 = dns_decode_name(msg, msg_len, rdoff, &nb1, &nl1);
         if (ne1 == 0) { return 0 - 1; }
+        if (ne1 != rdend) { return 0 - 1; }
         _out_escaped(&nb1, load64(&nl1), 1);
         _out_puts(".");
         return 0;
     }
     if (t == DNS_TYPE_CNAME) {
-        var nb2[256];
+        var nb2[DNS_NAME_BUF_LEN];
         var nl2[8];
         var ne2 = dns_decode_name(msg, msg_len, rdoff, &nb2, &nl2);
         if (ne2 == 0) { return 0 - 1; }
+        if (ne2 != rdend) { return 0 - 1; }
         _out_escaped(&nb2, load64(&nl2), 1);
         _out_puts(".");
         return 0;
     }
     if (t == DNS_TYPE_PTR) {
-        var nb3[256];
+        var nb3[DNS_NAME_BUF_LEN];
         var nl3[8];
         var ne3 = dns_decode_name(msg, msg_len, rdoff, &nb3, &nl3);
         if (ne3 == 0) { return 0 - 1; }
+        if (ne3 != rdend) { return 0 - 1; }
         _out_escaped(&nb3, load64(&nl3), 1);
         _out_puts(".");
         return 0;
     }
     if (t == DNS_TYPE_TXT) {
-        # TXT is a sequence of length-prefixed strings within rdata.
-        # Print each as a quoted segment, space-separated.
+        # Two passes. TXT cannot be reordered into validate-then-emit in one
+        # sweep, because each segment is only discoverable by walking the one
+        # before it — so a later overrun used to land after earlier segments had
+        # already been printed. Walk the whole length-prefix chain first.
+        var vp = rdoff;
+        while (vp < rdend) {
+            var vl = load8(msg + vp);
+            if (vp + 1 + vl > rdend) { return 0 - 1; }
+            vp = vp + 1 + vl;
+        }
+        if (vp != rdend) { return 0 - 1; }
         var p = rdoff;
-        var end = rdoff + rdlen;
         var first = 1;
-        while (p < end) {
+        while (p < rdend) {
             var l = load8(msg + p);
-            if (p + 1 + l > end) { return 0 - 1; }
             if (first == 0) { _out_puts(" "); }
             _out_puts("\"");
             if (l > 0) { _out_escaped(msg + p + 1, l, 0); }
@@ -223,17 +389,17 @@ fn output_print_rdata(msg, msg_len, rr, next_off): i64 {
         return 0;
     }
     if (t == DNS_TYPE_SOA) {
-        var nb4[256];
+        var nb4[DNS_NAME_BUF_LEN];
         var nl4[8];
         var ne4 = dns_decode_name(msg, msg_len, rdoff, &nb4, &nl4);
         if (ne4 == 0) { return 0 - 1; }
-        _out_escaped(&nb4, load64(&nl4), 1); _out_puts(". ");
-        var nb5[256];
+        var nb5[DNS_NAME_BUF_LEN];
         var nl5[8];
         var ne5 = dns_decode_name(msg, msg_len, ne4, &nb5, &nl5);
         if (ne5 == 0) { return 0 - 1; }
+        if (ne5 + 20 != rdend) { return 0 - 1; }
+        _out_escaped(&nb4, load64(&nl4), 1); _out_puts(". ");
         _out_escaped(&nb5, load64(&nl5), 1); _out_puts(". ");
-        if (ne5 + 20 > rdoff + rdlen) { return 0 - 1; }
         fmt_int(_dns_load_u32(msg, ne5));       _out_puts(" ");
         fmt_int(_dns_load_u32(msg, ne5 + 4));   _out_puts(" ");
         fmt_int(_dns_load_u32(msg, ne5 + 8));   _out_puts(" ");
@@ -243,26 +409,19 @@ fn output_print_rdata(msg, msg_len, rr, next_off): i64 {
     }
     if (t == DNS_TYPE_SRV) {
         if (rdlen < 7) { return 0 - 1; }
-        var prio2 = _dns_load_u16(msg, rdoff);
-        var weight = _dns_load_u16(msg, rdoff + 2);
-        var port = _dns_load_u16(msg, rdoff + 4);
-        fmt_int(prio2);  _out_puts(" ");
-        fmt_int(weight); _out_puts(" ");
-        fmt_int(port);   _out_puts(" ");
-        var nb6[256];
+        var nb6[DNS_NAME_BUF_LEN];
         var nl6[8];
         var ne6 = dns_decode_name(msg, msg_len, rdoff + 6, &nb6, &nl6);
         if (ne6 == 0) { return 0 - 1; }
-        _out_escaped(&nb6, load64(&nl6), 1); _out_puts(".");
+        if (ne6 != rdend) { return 0 - 1; }
+        fmt_int(_dns_load_u16(msg, rdoff));     _out_puts(" ");
+        fmt_int(_dns_load_u16(msg, rdoff + 2)); _out_puts(" ");
+        fmt_int(_dns_load_u16(msg, rdoff + 4)); _out_puts(" ");
+        _out_escaped(&nb6, load64(&nl6), 1);
+        _out_puts(".");
         return 0;
     }
-    # Unknown type — print raw bytes as a hex dump fallback.
-    var i2 = 0;
-    while (i2 < rdlen) {
-        fmt_hex(load8(msg + rdoff + i2));
-        i2 = i2 + 1;
-    }
-    return 0;
+    return output_print_rdata_unknown(msg, rdoff, rdlen);
 }
 
 # Print the BIND-shape header (`; <<>> dig X.Y.Z <<>> name`).
@@ -279,34 +438,57 @@ fn output_print_header(name): i64 {
 fn output_print_question(name, qtype): i64 {
     _out_puts(";; QUESTION\n;");
     _out_puts(name);
-    _out_puts(".\t\tIN\t");
-    _out_puts(output_type_str(qtype));
+    # `dig example.com.` used to print `;example.com..` — the name already ends
+    # absolute, so appending another dot doubled it. The wire query was always
+    # correct (dns_encode_name absorbs the trailing dot); this was display only.
+    # `name` is never empty: cli.cyr skips zero-length tokens.
+    var nlen = strlen(name);
+    if (load8(name + nlen - 1) != 46) { _out_puts("."); }
+    # dig only ever sends QCLASS=IN (dns.cyr), so this literal is truthful by
+    # construction — unlike the answer line's, which had to start reading the
+    # reply's own class.
+    _out_puts("\t\tIN\t");
+    output_print_type(qtype);
     _out_puts("\n");
     return 0;
 }
 
 # Print one ANSWER RR line: `name. ttl IN TYPE rdata`.
 fn output_print_answer_rr(msg, msg_len, rr, next_off): i64 {
-    var nbuf[256];
+    var nbuf[DNS_NAME_BUF_LEN];
     var nl7[8];
     var ne = dns_decode_name(msg, msg_len, dns_rr_name_off(rr), &nbuf, &nl7);
     if (ne == 0) { return 0 - 1; }
     _out_escaped(&nbuf, load64(&nl7), 1);
     _out_puts(".\t");
     fmt_int(dns_rr_ttl(rr));
-    _out_puts("\tIN\t");
-    _out_puts(output_type_str(dns_rr_type(rr)));
     _out_puts("\t");
-    output_print_rdata(msg, msg_len, rr, next_off);
+    # The reply's OWN class, not a hardcoded "IN". dns_rr_class has been
+    # populated since 0.3.0 and read by no production code, so a reply whose
+    # answer RR carried CLASS=CH was displayed as IN.
+    output_print_class(dns_rr_class(rr));
+    _out_puts("\t");
+    output_print_type(dns_rr_type(rr));
+    _out_puts("\t");
+    var r2 = output_print_rdata(msg, msg_len, rr, next_off);
+    if (r2 < 0) { _out_eputs(";; WARNING: malformed rdata\n"); }
     _out_puts("\n");
-    return 0;
+    return r2;
 }
 
 # +short mode: rdata only, one per line. Newline appended.
 fn output_print_short_rr(msg, msg_len, rr, next_off): i64 {
-    output_print_rdata(msg, msg_len, rr, next_off);
+    var r = output_print_rdata(msg, msg_len, rr, next_off);
+    if (r < 0) {
+        # stderr, never stdout: a marker on stdout would corrupt the very
+        # +short stream scripts parse. Through 0.3.7 this return was discarded
+        # and the newline printed regardless, so a malformed A record emitted a
+        # BARE BLANK LINE and exit 0 — `ip=$(dig +short host)` yielded "" and
+        # the caller was told it had succeeded.
+        _out_eputs(";; WARNING: malformed rdata\n");
+    }
     _out_puts("\n");
-    return 0;
+    return r;
 }
 
 # Footer line: `;; Query time: N ms · server: A.B.C.D · proto: udp`.
@@ -316,7 +498,7 @@ fn output_print_footer(query_us, server_addr, tcp_used): i64 {
     _out_puts(" ms · server: ");
     var buf[16];
     var n = ipv4_format_to_buf(server_addr, &buf);
-    syscall(1, 1, &buf, n);
+    sys_write(1, &buf, n);
     _out_puts(" · proto: ");
     if (tcp_used == 1) { _out_puts("tcp"); }
     else { _out_puts("udp"); }
