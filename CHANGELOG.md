@@ -4,6 +4,114 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-08-28 (EDNS(0) + DNS over TCP — `dig TXT` finally returns the records)
+
+First feature cut since the MVP line. The 0.4.x hold lifted, and this takes the
+two items that gate everything after them: `+trace` needs a working transport
+and `+dnssec` needs somewhere to put the DO bit.
+
+The user-visible headline is that **`dig google.com TXT` returns 16 records
+instead of none.** Through 0.3.8 it printed `;; (no answer)` and a truncation
+warning, because the reply exceeded 512 bytes and dig had no way to ask for
+more. That is eight releases of a common query silently returning nothing.
+
+### Added
+- **EDNS(0) (RFC 6891).** Queries carry an OPT pseudo-RR advertising the UDP
+  payload dig can reassemble, so responders stop clamping to 512.
+
+  **The advertised default is 1232, not 4096.** 4096 is the number most tutorials
+  give and it is the wrong one: it exceeds the ~1400-byte path MTU almost
+  everywhere, so replies fragment, and fragmented UDP DNS both drops on
+  middleboxes and is the classic reflection-amplification lever. 1232 is the DNS
+  Flag Day 2020 consensus — the largest that clears a 1280-byte IPv6 MTU intact.
+  `+bufsize=N` overrides it, clamped to `[512, 65535]`.
+- **`+noedns` / `+edns=0` / `+bufsize=N`.** `+noedns` sends no OPT at all, which
+  is how you talk to a resolver that chokes on one — and is also how to see the
+  TCP fallback fire, since without EDNS a large answer truncates. `+edns=N` for
+  N > 0 is a usage error rather than a silent downgrade: dig speaks version 0.
+- **The extended RCODE is folded in.** OPT's TTL high byte supplies the upper 8
+  bits of the 12-bit code (RFC 6891 §6.1.3). This is not cosmetic: **BADVERS is
+  16, whose low nibble is zero**, so a responder rejecting our EDNS version read
+  as `NOERROR` — "everything is fine, here are no records" — and BADVERS is
+  precisely the extended code a query dig actually sends can provoke.
+- **DNS over TCP-53 (RFC 1035 §4.2.2)**, with the 2-byte big-endian length
+  prefix. Reached two ways: automatically when a UDP reply comes back with TC=1,
+  and up front with `+tcp`, which now does what it has claimed since 0.3.0
+  instead of being accepted and ignored.
+
+  A declared response length larger than the receive buffer is **refused, not
+  truncated** — a truncated DNS message parses as a valid shorter one, so
+  accepting it would hand the record walker a message the responder never sent.
+- **`+notcp` is honoured.** The transport preference is a tri-state now — two
+  flags carry three meanings, and a bool could not tell "default" from
+  `+notcp`, so the fallback fired regardless of it. With `+notcp` dig stays on
+  UDP and says so: the truncation warning names WHICH reason applies, because
+  "the TCP retry failed" sends a reader hunting a network fault they do not have.
+- **`+dnssec` sets the DO bit** and dig prints the RRSIG/DNSKEY records that come
+  back. It does **not** validate the chain — that is later in 0.4.x, and the
+  flag's help text says so. `+dnssec` re-enables EDNS if `+noedns` preceded it,
+  since DO has nowhere else to live and silently doing nothing would be worse.
+
+### Fixed
+- **The footer reported `proto: udp` for every TCP query.** Found while testing
+  the fallback, and it is not a typo: in `output_print_footer`, `var buf[16]`
+  was placed overlapping the `tcp_used` parameter's stack slot, so
+  `ipv4_format_to_buf` writing `"8.8.8.8"` left the parameter as
+  `0x3800000000000001` — low byte still 1, byte 7 replaced by the ASCII `'8'`.
+  The `== 1` test then failed. Worked around by reading the parameter into a
+  local before the buffer is touched. **A minimal reproduction has not been
+  isolated** — the obvious shapes (array-first, call-then-array) do not
+  reproduce it — so this is a workaround with a precisely known symptom rather
+  than a diagnosis, and it is filed upstream rather than claimed as understood.
+
+### Changed
+- **The receive buffer is sized for what dig advertises.** Advertising a payload
+  larger than the buffer would be a lie the responder acts on. The UDP cap now
+  tracks `+bufsize`, and the buffer itself is sized for TCP's 65535 ceiling
+  since the TC fallback is automatic.
+- **The TC=1 warning now fires only when the TCP retry also failed**, and says
+  what it means: the answer in hand is a prefix, not the whole record set. A
+  successful fallback replaces the truncated reply, so the warning is no longer
+  the normal case. A failed retry leaves the partial UDP answer in place rather
+  than discarding what we have.
+- **The footer's `proto:` reflects what actually carried the answer**, not which
+  flag was passed.
+- **`src/tcp.cyr` builds on `taar`'s socket primitives rather than dig's
+  `platform_*` layer.** This is the migration the 0.6.x roadmap entry parked
+  "for when `+tcp` lands", and the answer is: adopt taar for the NEW transport,
+  leave the hardened UDP arm alone. taar ships both a POSIX and an AGNOS arm for
+  TCP, so dig gets DNS-over-TCP on AGNOS without touching `platform_agnos.cyr` —
+  which is parked pending kernel work and must not be disturbed. taar's *DNS*
+  layer is deliberately not adopted: `taar_resolve_ipv4` answers one question
+  (an A record) and returns a packed address, where dig needs arbitrary qtypes
+  and the response bytes.
+- **TCP replies go through the same acceptance checks as UDP** — ID echo, QR
+  bit, question match. A stream reply is not trustworthy merely because it
+  arrived on a connection dig opened: `@server` may be hostile even when the
+  transport is honest.
+
+### Tests
+- **198 → 260 assertions**, in four new groups: `edns_query` (OPT wire layout
+  byte by byte, DO bit placement), `edns_response` (OPT location, accessors,
+  BADVERS folding, the no-OPT responder), `tcp_frame` (including that the length
+  prefix is big-endian, which a byte-swap mutation catches), `cli_edns_flags`.
+- Seven mutations checked, all caught: unfolded extended RCODE, OPT payload read
+  from the wrong offset, dropped DO bit, unset ARCOUNT, byte-swapped TCP length
+  prefix, removed `+bufsize` clamp, and `+dnssec` no longer re-enabling EDNS.
+- Fuzz harness still green at 1,560,376.
+
+### Notes
+- x86_64, `--aarch64` and `--agnos` all build; x86_64 and aarch64 resolve live
+  over both UDP and TCP. `cyrius audit` green on all four dimensions.
+- **The AGNOS TCP arm is unexercised.** It comes from taar and compiles, but
+  nothing runs it — same standing caveat as the rest of that backend, which is
+  parked by user direction pending kernel work.
+- The toolchain moved to **6.5.36** mid-cut while `cyrius.cyml` pins 6.5.35, so
+  builds warn about drift. Deliberately not bumped here — a pin bump is its own
+  change, not a rider on a feature cut.
+- Next in 0.4.x: `+trace`, then the DNSSEC validation ladder.
+
+
 ## [0.3.8] — 2026-08-28 (the rest of the audit: 23 findings closed, and a real fuzz harness)
 
 0.3.7 repaired both P1s the audit found and left 23 P2/P3 items on the roadmap.

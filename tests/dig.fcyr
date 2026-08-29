@@ -41,6 +41,7 @@ include "src/resolv.cyr"
 include "src/cli.cyr"
 include "src/output.cyr"
 include "src/query.cyr"
+include "src/tcp.cyr"
 
 var FZ_CAP = 512;          # DNS_MAX_UDP_PAYLOAD — the real rx buffer size
 

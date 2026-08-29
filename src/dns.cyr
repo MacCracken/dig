@@ -76,7 +76,20 @@ var DNS_MAX_NAME_LEN        = 255;    # RFC 1035 §2.3.4
 # from DNS_MAX_NAME_LEN cannot be written down. `tests/dig.tcyr` therefore
 # asserts the two agree — that assertion is the only thing coupling them.
 enum DnsNameBuf { DNS_NAME_BUF_LEN = 256; }
-var DNS_MAX_UDP_PAYLOAD     = 512;    # RFC 1035 §2.3.4 (no EDNS yet)
+var DNS_MAX_UDP_PAYLOAD     = 512;    # RFC 1035 §2.3.4 — the pre-EDNS ceiling
+
+# EDNS(0), RFC 6891. `DNS_EDNS_PAYLOAD` is what dig ADVERTISES it can reassemble;
+# 1232 is the DNS Flag Day 2020 consensus value (the largest that reliably clears
+# a 1280-byte IPv6 MTU without fragmenting), not 4096, which fragments on many
+# real paths and is a reflection-amplification gift.
+var DNS_EDNS_PAYLOAD        = 1232;
+var DNS_EDNS_VERSION        = 0;
+var DNS_EDNS_FLAG_DO        = 0x8000;   # DNSSEC OK (RFC 3225)
+var DNS_OPT_RR_LEN          = 11;       # root name(1) + type(2) + class(2) + ttl(4) + rdlength(2)
+
+# A DNS message over TCP is length-prefixed with a u16, so 65535 is the hard
+# ceiling (RFC 1035 §4.2.2).
+var DNS_MAX_TCP_PAYLOAD     = 65535;
 var NAME_DECODE_MAX_HOPS    = 32;     # cycle-detection budget
 
 # Encode a domain name (`example.com\0`) into wire-format qname at
@@ -324,18 +337,41 @@ fn _dns_load_u32(buf, off): i64 {
 # so the platform layer reads /dev/urandom and passes it in). QR=0,
 # Opcode=0, AA=0, TC=0, RD=1, RA=0, Z=0, RCODE=0. QDCOUNT=1,
 # ANCOUNT=NSCOUNT=ARCOUNT=0.
-fn dns_build_query(buf, id, name, qtype): i64 {
+fn dns_build_query(buf, id, name, qtype, edns_payload, do_bit): i64 {
     _dns_store_u16(buf, 0, id);
     _dns_store_u16(buf, 2, DNS_FLAG_RD);
     _dns_store_u16(buf, 4, 1);    # QDCOUNT
     _dns_store_u16(buf, 6, 0);
     _dns_store_u16(buf, 8, 0);
-    _dns_store_u16(buf, 10, 0);
+    _dns_store_u16(buf, 10, 0);   # ARCOUNT — patched below if we add OPT
     var n = dns_encode_name(name, buf + DNS_HEADER_LEN);
     if (n == 0) { return 0; }
     _dns_store_u16(buf, DNS_HEADER_LEN + n, qtype);
     _dns_store_u16(buf, DNS_HEADER_LEN + n + 2, DNS_CLASS_IN);
-    return DNS_HEADER_LEN + n + 4;
+    var len = DNS_HEADER_LEN + n + 4;
+    if (edns_payload <= 0) { return len; }
+
+    # The OPT pseudo-RR (RFC 6891 §6.1.2). It is not a record about a name — it
+    # is a per-message transport annotation that happens to be spelled as an RR,
+    # which is why its NAME is always the root and its CLASS field is repurposed
+    # to carry the requestor's UDP payload size rather than a class.
+    #
+    #   +0  NAME      0        root, one byte
+    #   +1  TYPE      41       OPT
+    #   +3  CLASS     payload  what WE can reassemble, not what we will send
+    #   +5  TTL       ext-rcode(1) | version(1) | DO+Z(2)
+    #   +9  RDLENGTH  0        no options; dig sends none
+    store8(buf + len, 0);
+    _dns_store_u16(buf, len + 1, DNS_TYPE_OPT);
+    _dns_store_u16(buf, len + 3, edns_payload);
+    store8(buf + len + 5, 0);                    # extended RCODE, always 0 in a query
+    store8(buf + len + 6, DNS_EDNS_VERSION);
+    var flags = 0;
+    if (do_bit == 1) { flags = DNS_EDNS_FLAG_DO; }
+    _dns_store_u16(buf, len + 7, flags);
+    _dns_store_u16(buf, len + 9, 0);             # RDLENGTH
+    _dns_store_u16(buf, 10, 1);                  # ARCOUNT = 1
+    return len + DNS_OPT_RR_LEN;
 }
 
 # Walk past a single question section, return next offset (start of
@@ -384,6 +420,92 @@ fn dns_question_matches(msg, msg_len, name, qtype): i64 {
     if (_dns_load_u16(msg, DNS_HEADER_LEN + wlen) != qtype) { return 0; }
     if (_dns_load_u16(msg, DNS_HEADER_LEN + wlen + 2) != DNS_CLASS_IN) { return 0; }
     return 1;
+}
+
+# Skip `count` resource records starting at `off`. Returns the offset after the
+# last one, or 0 if any of them fails to parse or `count` outruns the message.
+#
+# `count` comes off the wire and is attacker-chosen, so the msg_len bound in
+# dns_parse_rr is what actually terminates this — not the counter.
+fn dns_skip_rrs(msg, msg_len, off, count): i64 {
+    var rr = alloc(DNS_RR_SIZE);
+    var i = 0;
+    var cur = off;
+    while (i < count) {
+        var nx = dns_parse_rr(msg, msg_len, cur, rr);
+        if (nx == 0) { return 0; }
+        cur = nx;
+        i = i + 1;
+    }
+    return cur;
+}
+
+# Offset of the OPT pseudo-RR in the ADDITIONAL section, or 0 if the responder
+# sent none (which is how a non-EDNS server answers, and is not an error).
+#
+# Walking there means stepping over every answer and authority record first, so
+# this is only worth calling once per response. Returns the offset of the RR's
+# NAME, so the accessors below index from there.
+fn dns_find_opt(msg, msg_len): i64 {
+    if (dns_hdr_arcount(msg) == 0) { return 0; }
+    var off = dns_answer_section_start(msg, msg_len);
+    if (off == 0) { return 0; }
+    off = dns_skip_rrs(msg, msg_len, off, dns_hdr_ancount(msg));
+    if (off == 0) { return 0; }
+    off = dns_skip_rrs(msg, msg_len, off, dns_hdr_nscount(msg));
+    if (off == 0) { return 0; }
+    var rr = alloc(DNS_RR_SIZE);
+    var k = 0;
+    var arcount = dns_hdr_arcount(msg);
+    while (k < arcount) {
+        var start = off;
+        var nx = dns_parse_rr(msg, msg_len, off, rr);
+        if (nx == 0) { return 0; }
+        # OPT's NAME must be the root — a single zero byte. Anything else is not
+        # a well-formed OPT and we decline to read transport meaning out of it.
+        if (dns_rr_type(rr) == DNS_TYPE_OPT) {
+            if (load8(msg + dns_rr_name_off(rr)) == 0) { return start; }
+        }
+        off = nx;
+        k = k + 1;
+    }
+    return 0;
+}
+
+# The UDP payload size the RESPONDER advertised, from OPT's repurposed CLASS
+# field. Only meaningful when dns_find_opt returned non-zero.
+fn dns_opt_payload(msg, opt_off): i64 {
+    return _dns_load_u16(msg, opt_off + 3);
+}
+
+# The upper 8 bits of the 12-bit extended RCODE, from OPT's TTL high byte.
+fn dns_opt_ext_rcode(msg, opt_off): i64 {
+    return load8(msg + opt_off + 5);
+}
+
+# The EDNS version the responder speaks. A responder that does not understand
+# our version answers BADVERS with its own version here (RFC 6891 §6.1.3).
+fn dns_opt_version(msg, opt_off): i64 {
+    return load8(msg + opt_off + 6);
+}
+
+# 1 if the responder set DO (DNSSEC OK), else 0.
+fn dns_opt_do(msg, opt_off): i64 {
+    if ((_dns_load_u16(msg, opt_off + 7) & DNS_EDNS_FLAG_DO) != 0) { return 1; }
+    return 0;
+}
+
+# The FULL 12-bit RCODE: OPT's TTL high byte supplies the upper 8 bits, the
+# header nibble the lower 4 (RFC 6891 §6.1.3). Without this, BADVERS (16) reads
+# as 0 — NOERROR — because the low nibble of 16 is zero. That is the one
+# extended code a query dig actually sends can provoke, so folding it in is not
+# hypothetical: it is the difference between "your EDNS version was rejected"
+# and "everything is fine, here are no records".
+fn dns_full_rcode(msg, msg_len): i64 {
+    var base = dns_hdr_rcode(msg);
+    var opt = dns_find_opt(msg, msg_len);
+    if (opt == 0) { return base; }
+    return (dns_opt_ext_rcode(msg, opt) << 4) | base;
 }
 
 # Offset of the first ANSWER record, i.e. just past the header and the question

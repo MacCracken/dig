@@ -1,0 +1,125 @@
+# tcp.cyr — DNS over TCP-53 (RFC 1035 §4.2.2).
+#
+# WHY THIS SITS ON taar RATHER THAN dig's platform_* LAYER.
+#
+# dig's UDP path goes through src/platform_{linux,agnos}.cyr, a nine-function
+# contract dig owns and implements twice. TCP deliberately does not: it calls
+# taar's `taar_tcp_*` primitives directly. Three reasons, in order of weight:
+#
+#   1. taar ships BOTH arms already — a POSIX arm and an AGNOS arm over the
+#      sovereign sock_connect/send/recv/close (#47-50). Reimplementing them in
+#      dig's platform layer would mean writing an AGNOS arm that nothing
+#      executes, for a protocol dig has never spoken, in a file that is
+#      currently parked pending kernel work. Consuming taar's gets dig TCP on
+#      AGNOS without touching that file at all.
+#   2. This is the migration the 0.6.x roadmap entry parked "for when `+tcp`
+#      lands". It has landed, and the answer is: adopt taar for the NEW
+#      transport, leave the hardened UDP arm where it is. Migrating UDP too
+#      would mean re-verifying the AGNOS UDP arm, which is exactly what is
+#      deferred.
+#   3. taar's TCP recv already distinguishes a deadline expiry from a clean
+#      close on both arms — a distinction taar 0.5.0 spent a release getting
+#      right, and one this file depends on to tell a stalled peer from a
+#      finished response.
+#
+# What dig does NOT take from taar is its DNS layer: `taar_resolve_ipv4` answers
+# one question (an A record for a host) and returns a packed address. dig needs
+# arbitrary qtypes and the response bytes themselves, so the framing below is
+# dig's own — it is ~40 lines and the alternative is bending taar's API to a
+# shape only dig wants.
+
+# Spin bound for the send loop. A peer that accepts zero bytes forever would
+# otherwise hang us; a peer making genuine progress never approaches this.
+var TCP_MAX_SPINS = 1024;
+
+# Frame a query for the stream: RFC 1035 §4.2.2 prefixes every TCP DNS message
+# with its length as a big-endian u16. Writes `qlen` + 2 bytes into `out` and
+# returns the total. Pure — the unit tests drive it directly.
+fn tcp_frame(qbuf, qlen, out): i64 {
+    store8(out,     (qlen >> 8) & 0xFF);
+    store8(out + 1, qlen & 0xFF);
+    var i = 0;
+    while (i < qlen) {
+        store8(out + 2 + i, load8(qbuf + i));
+        i = i + 1;
+    }
+    return qlen + 2;
+}
+
+# Write all `len` bytes. TCP is a stream: a single send may accept only part of
+# the buffer, so this loops. Returns 0, or a negative errno.
+fn tcp_send_all(fd, buf, len): i64 {
+    var sent = 0;
+    var spins = 0;
+    while (sent < len) {
+        var n = taar_tcp_send(fd, buf + sent, len - sent);
+        if (n < 0) { return n; }
+        if (n == 0) {
+            spins = spins + 1;
+            if (spins > TCP_MAX_SPINS) { return 0 - 1; }
+        } else {
+            spins = 0;
+            sent = sent + n;
+        }
+    }
+    return 0;
+}
+
+# Read exactly `want` bytes into `buf`. Returns the count, or a negative errno.
+# Terminates unconditionally: every pass either advances `got` or returns.
+fn tcp_read_all(fd, buf, want): i64 {
+    var got = 0;
+    while (got < want) {
+        var n = taar_tcp_recv(fd, buf + got, want - got);
+        # 0 is a clean close, which mid-message means the peer gave up on us —
+        # a short read, not a finished response. Negative is a timeout or error.
+        # taar distinguishes these on both arms; that is the whole reason this
+        # loop can tell "done" from "stalled".
+        if (n <= 0) { return n; }
+        got = got + n;
+    }
+    return got;
+}
+
+# Ask `server_addr` over TCP-53. Returns the response length in `rbuf`, or a
+# negative value on any failure.
+#
+# The declared response length is checked against the caller's buffer and
+# REFUSED outright if it does not fit, rather than truncated: a truncated DNS
+# message parses as a valid shorter one, so silently accepting it would hand the
+# record walker a message the responder never sent.
+fn tcp_query(server_addr, qbuf, qlen, rbuf, rmax, timeout_s): i64 {
+    var fd = taar_tcp_open();
+    if (fd < 0) { return fd; }
+    if (taar_tcp_set_timeout_ms(fd, timeout_s * 1000) < 0) {
+        taar_sock_close(fd);
+        return 0 - 1;
+    }
+    if (taar_tcp_connect(fd, server_addr, DNS_PORT) < 0) {
+        taar_sock_close(fd);
+        return 0 - 1;
+    }
+
+    var framed = alloc(qlen + 2);
+    var flen = tcp_frame(qbuf, qlen, framed);
+    if (tcp_send_all(fd, framed, flen) < 0) {
+        taar_sock_close(fd);
+        return 0 - 1;
+    }
+
+    var lenbuf[2];
+    if (tcp_read_all(fd, &lenbuf, 2) != 2) {
+        taar_sock_close(fd);
+        return 0 - 1;
+    }
+    var rlen = (load8(&lenbuf) << 8) | load8(&lenbuf + 1);
+    if (rlen == 0) { taar_sock_close(fd); return 0 - 1; }
+    if (rlen > rmax) { taar_sock_close(fd); return 0 - 1; }
+
+    if (tcp_read_all(fd, rbuf, rlen) != rlen) {
+        taar_sock_close(fd);
+        return 0 - 1;
+    }
+    taar_sock_close(fd);
+    return rlen;
+}

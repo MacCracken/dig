@@ -65,7 +65,7 @@ fn query_reply_acceptable(rx, n, id, name, qtype): i64 {
 # `*resp_len` is the authoritative length for every downstream parse — pass it,
 # not `rx_cap`, to `dns_parse_rr` and friends, or a short reply will be parsed
 # against stale buffer contents.
-fn query_send_recv(server_addr, name, qtype, timeout_s, retry, rx, rx_cap, resp_len, query_us): i64 {
+fn query_send_recv(server_addr, name, qtype, timeout_s, retry, rx, rx_cap, resp_len, query_us, edns, do_bit): i64 {
     var fd = platform_udp_open();
     if (fd < 0) { return QRY_SOCKET; }
 
@@ -94,7 +94,7 @@ fn query_send_recv(server_addr, name, qtype, timeout_s, retry, rx, rx_cap, resp_
             return QRY_SOCKET;
         }
 
-        var tx_len = dns_build_query(tx, id, name, qtype);
+        var tx_len = dns_build_query(tx, id, name, qtype, edns, do_bit);
         # A name we cannot encode will not encode on the next try either.
         if (tx_len == 0) {
             platform_close(fd);
@@ -146,4 +146,37 @@ fn query_send_recv(server_addr, name, qtype, timeout_s, retry, rx, rx_cap, resp_
 
     platform_close(fd);
     return QRY_TIMEOUT;
+}
+
+# Ask over TCP-53 instead of UDP. Same contract as query_send_recv, minus the
+# retry loop: TCP either connects and answers or it does not, and re-dialling a
+# refused port three times is just three refusals.
+#
+# Reached two ways — `+tcp`, and automatically when a UDP reply comes back with
+# TC=1 (RFC 1035 §4.2.2). The acceptance checks are the SAME ones the UDP path
+# uses, which matters more than it looks: a stream reply is not automatically
+# trustworthy just because it arrived over a connection dig opened. The ID must
+# still echo, QR must still be set, and the question must still match, because
+# `@server` may be hostile even when the transport is honest.
+#
+# Defined here rather than in tcp.cyr so the acceptance policy has exactly one
+# home; tcp.cyr owns framing and sockets, this owns "is this our answer".
+fn query_send_recv_tcp(server_addr, name, qtype, timeout_s, rx, rx_cap, resp_len, query_us, edns, do_bit): i64 {
+    var id = platform_random_u16();
+    if (id < 0) { return QRY_SOCKET; }
+
+    var tx = alloc(DNS_MAX_UDP_PAYLOAD);
+    var tx_len = dns_build_query(tx, id, name, qtype, edns, do_bit);
+    if (tx_len == 0) { return QRY_BAD; }
+
+    var t0 = platform_now_us();
+    var n = tcp_query(server_addr, tx, tx_len, rx, rx_cap, timeout_s);
+    if (n < 0) { return QRY_TIMEOUT; }
+    var t1 = platform_now_us();
+
+    if (query_reply_acceptable(rx, n, id, name, qtype) == 0) { return QRY_TIMEOUT; }
+
+    store64(resp_len, n);
+    store64(query_us, t1 - t0);
+    return QRY_OK;
 }

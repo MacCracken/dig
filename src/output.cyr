@@ -493,6 +493,19 @@ fn output_print_short_rr(msg, msg_len, rr, next_off): i64 {
 
 # Footer line: `;; Query time: N ms · server: A.B.C.D · proto: udp`.
 fn output_print_footer(query_us, server_addr, tcp_used): i64 {
+    # Decide the proto label BEFORE touching the address buffer.
+    #
+    # Not style: with `var buf[16]` declared first, the compiler placed it
+    # overlapping this parameter's stack slot, and `ipv4_format_to_buf` writing
+    # "8.8.8.8" into it left `tcp_used` as 0x3800000000000001 — its low byte
+    # still 1, byte 7 replaced by the ASCII '8'. So `tcp_used == 1` was false
+    # and every TCP query reported `proto: udp`. Reading the parameter into a
+    # local first sidesteps it; a minimal reproduction has NOT been isolated
+    # yet, so this is a workaround with a known symptom, not a diagnosis.
+    # Filed for cyrius in roadmap.md § upstream.
+    var proto = "udp";
+    if (tcp_used == 1) { proto = "tcp"; }
+
     _out_puts(";; Query time: ");
     fmt_int((query_us + 500) / 1000);   # us → ms, half-up
     _out_puts(" ms · server: ");
@@ -500,8 +513,7 @@ fn output_print_footer(query_us, server_addr, tcp_used): i64 {
     var n = ipv4_format_to_buf(server_addr, &buf);
     sys_write(1, &buf, n);
     _out_puts(" · proto: ");
-    if (tcp_used == 1) { _out_puts("tcp"); }
-    else { _out_puts("udp"); }
+    _out_puts(proto);
     _out_puts("\n");
     return 0;
 }

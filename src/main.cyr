@@ -9,6 +9,7 @@ include "src/resolv.cyr"
 include "src/cli.cyr"
 include "src/output.cyr"
 include "src/query.cyr"
+include "src/tcp.cyr"
 
 # Write a cstr to stderr.
 fn _eputs(s): i64 { sys_write(2, s, strlen(s)); return 0; }
@@ -106,19 +107,67 @@ fn main() {
 
     var qtype = dig_cli_qtype(reg);
 
-    var rx = alloc(DNS_MAX_UDP_PAYLOAD);
+    var edns = dig_cli_bufsize(reg);
+    var do_bit = dig_cli_dnssec(reg);
+
+    # The receive buffer must be able to hold what we ADVERTISE we can hold, or
+    # the advertisement is a lie the responder will act on. With +noedns it
+    # falls back to the classic 512. TCP can carry up to 65535, so the buffer is
+    # sized for that whenever TCP is reachable — which is always, since TC=1
+    # fallback is automatic.
+    var rx_cap = DNS_MAX_TCP_PAYLOAD;
+    var rx = alloc(rx_cap);
+    var udp_cap = DNS_MAX_UDP_PAYLOAD;
+    if (edns > 0) { udp_cap = edns; }
     var resp_len_slot = alloc(8);
     var query_us_slot = alloc(8);
     store64(resp_len_slot, 0);
     store64(query_us_slot, 0);
 
-    var qr = query_send_recv(
-      server, name, qtype,
-      dig_cli_timeout_s(reg),
-      dig_cli_retry(reg),
-      rx, DNS_MAX_UDP_PAYLOAD,
-      resp_len_slot, query_us_slot
-      );
+    var used_tcp = 0;
+    var qr = QRY_TIMEOUT;
+
+    if (dig_cli_tcp(reg) == DIG_TCP_FORCE) {
+        # `+tcp` forces TCP from the start — no UDP attempt at all, matching BIND.
+        qr = query_send_recv_tcp(server, name, qtype, dig_cli_timeout_s(reg),
+          rx, rx_cap, resp_len_slot, query_us_slot,
+          edns, do_bit);
+        used_tcp = 1;
+    } else {
+        qr = query_send_recv(
+          server, name, qtype,
+          dig_cli_timeout_s(reg),
+          dig_cli_retry(reg),
+          rx, udp_cap,
+          resp_len_slot, query_us_slot,
+          edns, do_bit
+          );
+
+        # RFC 1035 §4.2.2: a TC=1 reply is a PREFIX of the real answer, not a
+        # whole one. Through 0.3.8 dig printed the prefix with a warning and
+        # called it an answer — which is how `dig TXT` silently lost records for
+        # eight releases. Now it re-asks over TCP, which has no 512-byte ceiling.
+        if (qr == QRY_OK) {
+            # `+notcp` means exactly that: stay on UDP and live with the prefix.
+            if ((dns_hdr_truncated(rx) == 1) && (dig_cli_tcp(reg) != DIG_TCP_NEVER)) {
+                var tcp_us = alloc(8);
+                store64(tcp_us, 0);
+                var tqr = query_send_recv_tcp(server, name, qtype,
+                  dig_cli_timeout_s(reg),
+                  rx, rx_cap, resp_len_slot, tcp_us,
+                  edns, do_bit);
+                if (tqr == QRY_OK) {
+                    # Report the TOTAL time the answer cost, UDP attempt
+                    # included — that is what the user waited.
+                    store64(query_us_slot, load64(query_us_slot) + load64(tcp_us));
+                    used_tcp = 1;
+                }
+                # A failed TCP retry leaves the truncated UDP reply in place and
+                # the TC warning below still fires, which is strictly better
+                # than discarding the partial answer we already have.
+            }
+        }
+    }
 
     if (qr == QRY_SOCKET) {
         _eputs("dig: cannot open UDP socket\n");
@@ -141,7 +190,7 @@ fn main() {
     var resp_len = load64(resp_len_slot);
     var query_us = load64(query_us_slot);
 
-    var rcode = dns_hdr_rcode(rx);
+    var rcode = dns_full_rcode(rx, resp_len);
     var ancount = dns_hdr_ancount(rx);
 
     # Sticky status flags. Set by the record loops below, folded into the exit
@@ -196,8 +245,17 @@ fn main() {
     output_print_question(name, qtype);
 
     if (dns_hdr_truncated(rx) == 1) {
-        _out_puts(";; WARNING: response truncated (TC=1) — retry over TCP");
-        _out_puts(" (0.4.x: +tcp will do this automatically)\n");
+        # Only reachable when no TCP answer replaced this one — a successful
+        # fallback swaps rx for the untruncated reply. Say WHICH of the two
+        # reasons applies: "the retry failed" is a different problem from "you
+        # told me not to retry", and reporting the first for the second sends
+        # the reader hunting a network fault they do not have.
+        _out_puts(";; WARNING: response truncated (TC=1) — this answer is a PREFIX");
+        if (dig_cli_tcp(reg) == DIG_TCP_NEVER) {
+            _out_puts(", and +notcp forbade the TCP retry\n");
+        } else {
+            _out_puts(", and the TCP retry failed\n");
+        }
     }
     if (ancount > 0) {
         _out_puts(";; ANSWER\n");
@@ -234,7 +292,7 @@ fn main() {
         _out_puts(";; (no answer)\n");
     }
 
-    output_print_footer(query_us, server, dig_cli_tcp(reg));
+    output_print_footer(query_us, server, used_tcp);
 
     # A well-formed reply that was received and printed is a SUCCESS, whatever
     # the RCODE says — BIND returns 0 for NXDOMAIN and the status is already

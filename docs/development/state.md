@@ -2,7 +2,7 @@
 
 > **⚠ NOT A LOG.** Live state with pointers — current truth only. Per-release history → [`../../CHANGELOG.md`](../../CHANGELOG.md). Milestone path → [`roadmap.md`](roadmap.md).
 >
-> **Last refresh**: 2026-08-28 (0.3.8 — audit backlog closed).
+> **Last refresh**: 2026-08-28 (0.4.0 — EDNS(0) + DNS over TCP).
 
 ---
 
@@ -10,15 +10,16 @@
 
 | Field | Value |
 |---|---|
-| Current version | **0.3.8** (MVP line; audit backlog closed) |
-| Status | MVP shipping. Real DNS queries fly against arbitrary resolvers; 9 RR types parse. |
+| Current version | **0.4.0** (first feature cut past the MVP line) |
+| Status | Shipping. Real DNS queries against arbitrary resolvers over **UDP and TCP**, EDNS(0) advertised by default; 9 RR types parse. |
 | Build size | 163 KB host (167,376 B), 167 KB `--agnos` (171,344 B). The step up at 0.3.7 was the cmdit bundle, which DCE at 6.5.35 NOPs in place rather than removing |
 | Module footprint | 9 src/ modules, 2242 lines (output 507, dns 459, cli 330, main 253, platform_linux 179, resolv 174, platform_agnos 167, query 149, platform 24) — excludes the 14-line `test.cyr` entry. Growth across 0.3.7/0.3.8 is doc comments, validation guards and RFC 5952 rendering, not features |
 | Cyrius pin | 6.5.35 (family-wide — `taar`, `yo` and `whirl` match) |
 | taar dep | `[deps.taar]` tag **0.5.0** (`dist/taar.cyr`) — dig consumes the `ipv4_*` codec only; taar's socket/dns modules ride along unreachable |
+| Transport | UDP-53 via dig's own `platform_*` arms; **TCP-53 via taar's socket primitives** (`src/tcp.cyr`) — taar ships both a POSIX and an AGNOS arm, so TCP works on AGNOS without touching the parked `platform_agnos.cyr`. taar's *DNS* layer is deliberately not adopted |
 | cmdit dep | `[deps.cmdit]` tag **1.2.4** (`dist/cmdit.cyr`) — adopted 0.3.7 for `--help`/`--version`/argv-materialize/exit codes. The `@server`/`+flag` tokenizer stays in `src/cli.cyr`: dig's grammar is not getopt-long, and cmdit names dig as its `cmdit_raw_argv` escape-hatch case |
 | Quality gates | `cyrius audit` green on all four dimensions (fmt / lint / docs / tests) since 0.3.7 |
-| Tests | **198** assertions in `tests/dig.tcyr` (70 → 128 → 198 across 0.3.7/0.3.8), plus **1,560,376** in the `tests/dig.fcyr` fuzz harness, which was a two-line stub until 0.3.8. Security-critical coverage: name-compression cycle detection, RFC 5452 §9.1 question matching and its *use*, RFC 1035 §5.1 presentation escaping, rdata RDLENGTH bounds, name wire-length caps. Every repair in both cuts is mutation-checked |
+| Tests | **260** assertions in `tests/dig.tcyr`, plus **1,560,376** in the `tests/dig.fcyr` fuzz harness. Security-critical coverage: name-compression cycle detection, RFC 5452 §9.1 question matching and its use, RFC 1035 §5.1 presentation escaping, rdata RDLENGTH bounds, name wire-length caps, EDNS OPT wire layout, TCP length framing. Every repair and feature since 0.3.7 is mutation-checked |
 | Iron-validation host | archaemenid (Beelink SER, AMD) — same machine as the agnosticos iron-burn surface |
 | Family position | Second entry in network-tools family (after yo) — **`taar` extraction trigger FIRED 2026-06-15** (shared `ipv4` codec folded at dig 0.3.3 / yo 0.5.5) |
 
@@ -26,9 +27,11 @@
 
 0.3.x MVP landed 2026-05-23. Real DNS queries verified live against `8.8.8.8`, `1.1.1.1`, and `/etc/resolv.conf`-discovered local resolvers (systemd-resolved at `127.0.0.53`). Per-type rdata formatting verified end-to-end for A / AAAA / MX / NS / CNAME / SOA / PTR / SRV (TXT bounces off the 512-byte UDP cap until `+tcp` lands at 0.4.x — TC=1 warning surfaces in the meantime).
 
-**0.3.7 and 0.3.8 were audit cuts, not feature cuts.** An eight-lens sweep over the 0.3.6 tree confirmed **61** findings against adversarial refutation (0 refuted). 0.3.7 took both P1s — `--aarch64` had been building binaries that called the wrong syscalls entirely, and any zone owner could write raw terminal control bytes to the screen of anyone who looked them up — plus the highest-value P2s. **0.3.8 closed the remaining 23.** See CHANGELOG [0.3.7] and [0.3.8]. The audit backlog is now empty; what remains open is coverage, not defects: the AGNOS arm still executes nowhere, CI still builds only host x86_64, and `docs/adr/` is still empty.
+**0.4.0 (2026-08-28) is the first feature cut past the MVP line.** The 0.4.x hold — which had held since 0.3.0, gated on the agnos kernel UDP path settling — was lifted by user direction, and 0.4.0 took the two items that gate everything after them: EDNS(0) and DNS over TCP. `dig google.com TXT` returns 16 records where it returned none for eight releases.
 
-Next bite per `roadmap.md`: **0.4.x — full RR-type coverage + advanced flags**. TCP fallback on TC=1, EDNS(0) (4096-byte UDP buffers + DO bit), `+trace` recursive walk from root, DNSSEC validation primitives (RRSIG/DNSKEY/DS/NSEC/NSEC3 parse + chain validation). IPv6 transport once the platform layer grows AAAA-sockaddr.
+Before that, **0.3.7 and 0.3.8 were audit cuts.** An eight-lens sweep over 0.3.6 confirmed 61 findings against adversarial refutation (0 refuted); 0.3.7 took both P1s (aarch64 was building binaries that called the wrong syscalls; any zone owner could write raw terminal control bytes to a looker-up's screen) and 0.3.8 closed the remaining 23. That backlog is empty.
+
+Next bite per `roadmap.md`: the rest of **0.4.x** — `+trace` (the recursive walk from root, unblocked by 0.3.8's NOERROR/ANCOUNT=0 exit-0 fix, since every delegation hop is exactly that shape), then the DNSSEC validation ladder (RRSIG/DNSKEY/DS/NSEC/NSEC3 parse + chain validation against the root KSK). IPv6 transport once the platform layer grows an AAAA sockaddr.
 
 ## Dependencies (current — `cyrius.cyml [deps].stdlib`)
 

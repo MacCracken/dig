@@ -16,6 +16,7 @@ include "src/resolv.cyr"
 include "src/cli.cyr"
 include "src/output.cyr"
 include "src/query.cyr"
+include "src/tcp.cyr"
 
 # === IPv4 parser ===
 # The one thing coupling DNS_NAME_BUF_LEN to DNS_MAX_NAME_LEN. cyrius cannot
@@ -48,7 +49,7 @@ fn test_ipv4() {
 fn test_dns_query_build() {
     test_group("dns_query_build");
     var buf[300];
-    var n = dns_build_query(&buf, 0x1234, "example.com", DNS_TYPE_A);
+    var n = dns_build_query(&buf, 0x1234, "example.com", DNS_TYPE_A, 0, 0);
     # Header(12) + qname(13 = 7+5+1) + qtype(2) + qclass(2) = 29 bytes
     # qname encoding of "example.com": 07 'example' 03 'com' 00
     assert_eq(n, 29, "query length");
@@ -857,6 +858,207 @@ fn test_rcode_names() {
     return 0;
 }
 
+
+# === EDNS(0), RFC 6891 (0.4.0) ===
+fn test_edns_query() {
+    test_group("edns_query");
+    var buf[300];
+
+    # No EDNS: byte-identical to what 0.3.x built, and ARCOUNT stays 0.
+    var n0 = dns_build_query(&buf, 0x1234, "example.com", DNS_TYPE_A, 0, 0);
+    assert_eq(n0, 29, "no-EDNS query length unchanged");
+    assert_eq(load8(&buf + 11), 0, "no-EDNS arcount is 0");
+
+    # With EDNS: the OPT pseudo-RR is 11 bytes and ARCOUNT becomes 1.
+    var n1 = dns_build_query(&buf, 0x1234, "example.com", DNS_TYPE_A, 1232, 0);
+    assert_eq(n1, 29 + DNS_OPT_RR_LEN, "EDNS query is 11 bytes longer");
+    assert_eq(load8(&buf + 11), 1, "arcount becomes 1");
+    assert_eq(load8(&buf + 29), 0, "OPT name is the root label");
+    assert_eq(load8(&buf + 30), 0, "OPT type hi");
+    assert_eq(load8(&buf + 31), 41, "OPT type lo = 41");
+    # CLASS carries the payload size, not a class. 1232 = 0x04D0.
+    assert_eq(load8(&buf + 32), 0x04, "payload size hi");
+    assert_eq(load8(&buf + 33), 0xD0, "payload size lo");
+    assert_eq(load8(&buf + 34), 0, "extended rcode is 0 in a query");
+    assert_eq(load8(&buf + 35), 0, "EDNS version 0");
+    assert_eq(load8(&buf + 36), 0, "DO clear without +dnssec");
+    assert_eq(load8(&buf + 37), 0, "Z clear");
+    assert_eq(load8(&buf + 38), 0, "rdlength hi");
+    assert_eq(load8(&buf + 39), 0, "rdlength lo — dig sends no options");
+
+    # DO is the top bit of the flags word (RFC 3225).
+    var n2 = dns_build_query(&buf, 0x1234, "example.com", DNS_TYPE_A, 1232, 1);
+    assert_eq(n2, 29 + DNS_OPT_RR_LEN, "DO does not change the length");
+    assert_eq(load8(&buf + 36), 0x80, "DO bit set");
+    assert_eq(load8(&buf + 37), 0, "Z still clear alongside DO");
+    return 0;
+}
+
+# Build a response carrying an OPT in the additional section.
+# Returns the total length.
+fn _edns_resp(msg, ext_rcode, version, payload) {
+    memset(msg, 0, 128);
+    store8(msg + 2, 0x81); store8(msg + 3, 0x80);      # QR RD RA, rcode 0
+    store8(msg + 5, 1);                                 # qdcount 1
+    store8(msg + 11, 1);                                # arcount 1
+    # question "a.com" A IN at 12..22
+    store8(msg + 12, 1); store8(msg + 13, 97);
+    store8(msg + 14, 3); store8(msg + 15, 99);
+    store8(msg + 16, 111); store8(msg + 17, 109);
+    store8(msg + 18, 0);
+    store8(msg + 20, 1);                                # qtype A
+    store8(msg + 22, 1);                                # qclass IN
+    # OPT at 23: root name, type 41, class = payload, ttl = ext|ver|flags
+    store8(msg + 23, 0);
+    store8(msg + 24, 0); store8(msg + 25, 41);
+    store8(msg + 26, (payload >> 8) & 0xFF); store8(msg + 27, payload & 0xFF);
+    store8(msg + 28, ext_rcode);
+    store8(msg + 29, version);
+    store8(msg + 30, 0); store8(msg + 31, 0);
+    store8(msg + 32, 0); store8(msg + 33, 0);           # rdlength 0
+    return 34;
+}
+
+fn test_edns_response() {
+    test_group("edns_response");
+    var msg[128];
+
+    var n = _edns_resp(&msg, 0, 0, 4096);
+    var opt = dns_find_opt(&msg, n);
+    assert_eq(opt, 23, "OPT located in the additional section");
+    assert_eq(dns_opt_payload(&msg, opt), 4096, "responder advertised 4096");
+    assert_eq(dns_opt_version(&msg, opt), 0, "responder speaks EDNS 0");
+    assert_eq(dns_opt_do(&msg, opt), 0, "DO clear");
+    assert_eq(dns_opt_ext_rcode(&msg, opt), 0, "extended rcode 0");
+    assert_eq(dns_full_rcode(&msg, n), 0, "full rcode is NOERROR");
+
+    # BADVERS is 16 — and its LOW NIBBLE IS ZERO. Without folding OPT's TTL high
+    # byte in, a responder rejecting our EDNS version reads as NOERROR, i.e.
+    # "everything is fine, here are no records". This is the one extended code a
+    # query dig actually sends can provoke, so it is not hypothetical.
+    var n2 = _edns_resp(&msg, 1, 0, 512);
+    assert_eq(dns_hdr_rcode(&msg), 0, "header nibble alone says NOERROR");
+    assert_eq(dns_full_rcode(&msg, n2), 16, "full rcode is BADVERS");
+
+    # DO echoed back.
+    var n3 = _edns_resp(&msg, 0, 0, 1232);
+    store8(&msg + 30, 0x80);
+    var opt3 = dns_find_opt(&msg, n3);
+    assert_eq(dns_opt_do(&msg, opt3), 1, "responder echoed DO");
+
+    # No OPT at all — the non-EDNS responder case, which is not an error.
+    memset(&msg, 0, 128);
+    store8(&msg + 2, 0x81); store8(&msg + 3, 0x80);
+    store8(&msg + 5, 1);
+    store8(&msg + 12, 1); store8(&msg + 13, 97);
+    store8(&msg + 14, 3); store8(&msg + 15, 99);
+    store8(&msg + 16, 111); store8(&msg + 17, 109);
+    store8(&msg + 18, 0); store8(&msg + 20, 1); store8(&msg + 22, 1);
+    assert_eq(dns_find_opt(&msg, 23), 0, "no OPT when arcount is 0");
+    assert_eq(dns_full_rcode(&msg, 23), 0, "full rcode falls back to the header nibble");
+    return 0;
+}
+
+# === DNS-over-TCP framing, RFC 1035 §4.2.2 (0.4.0) ===
+fn test_tcp_frame() {
+    test_group("tcp_frame");
+    var q[8];
+    store8(&q, 0xAA); store8(&q + 1, 0xBB); store8(&q + 2, 0xCC);
+    var out[16];
+    var n = tcp_frame(&q, 3, &out);
+    assert_eq(n, 5, "framed length is payload + 2");
+    assert_eq(load8(&out), 0, "length prefix hi");
+    assert_eq(load8(&out + 1), 3, "length prefix lo");
+    assert_eq(load8(&out + 2), 0xAA, "payload byte 0 follows the prefix");
+    assert_eq(load8(&out + 4), 0xCC, "payload byte 2");
+
+    # The prefix is big-endian, so a length over 255 must not be byte-swapped.
+    var big[600];
+    var out2[600];
+    var n2 = tcp_frame(&big, 300, &out2);
+    assert_eq(n2, 302, "large framed length");
+    assert_eq(load8(&out2), 1, "300 >> 8 == 1");
+    assert_eq(load8(&out2 + 1), 44, "300 & 0xFF == 44");
+    return 0;
+}
+
+# === EDNS / TCP CLI flags (0.4.0) ===
+fn test_cli_edns_flags() {
+    test_group("cli_edns_flags");
+    var av[64];
+    store64(&av, "dig");
+    store64(&av + 16, "example.com");
+
+    # EDNS is ON by default — dig advertises rather than silently accepting 512.
+    var r0 = dig_cli_new();
+    assert_eq(dig_cli_parse_argv(r0, 2, &av), DIG_CLI_OK, "bare query parses");
+    assert_eq(dig_cli_bufsize(r0), DNS_EDNS_PAYLOAD, "EDNS on by default");
+    assert_eq(dig_cli_dnssec(r0), 0, "DO clear by default");
+
+    var r1 = dig_cli_new();
+    store64(&av + 8, "+noedns");
+    assert_eq(dig_cli_parse_argv(r1, 3, &av), DIG_CLI_OK, "+noedns parses");
+    assert_eq(dig_cli_bufsize(r1), 0, "+noedns sends no OPT");
+
+    var r2 = dig_cli_new();
+    store64(&av + 8, "+bufsize=4096");
+    assert_eq(dig_cli_parse_argv(r2, 3, &av), DIG_CLI_OK, "+bufsize parses");
+    assert_eq(dig_cli_bufsize(r2), 4096, "+bufsize honoured");
+
+    # Clamped, not rejected — same posture as +timeout.
+    var r3 = dig_cli_new();
+    store64(&av + 8, "+bufsize=1");
+    assert_eq(dig_cli_parse_argv(r3, 3, &av), DIG_CLI_OK, "tiny +bufsize parses");
+    assert_eq(dig_cli_bufsize(r3), DIG_MIN_BUFSIZE, "tiny +bufsize clamps up to 512");
+
+    var r4 = dig_cli_new();
+    store64(&av + 8, "+bufsize=999999");
+    assert_eq(dig_cli_parse_argv(r4, 3, &av), DIG_CLI_OK, "huge +bufsize parses");
+    assert_eq(dig_cli_bufsize(r4), DIG_MAX_BUFSIZE, "huge +bufsize clamps down");
+
+    # 0 means the same as +noedns.
+    var r5 = dig_cli_new();
+    store64(&av + 8, "+bufsize=0");
+    assert_eq(dig_cli_parse_argv(r5, 3, &av), DIG_CLI_OK, "+bufsize=0 parses");
+    assert_eq(dig_cli_bufsize(r5), 0, "+bufsize=0 disables EDNS");
+
+    # +dnssec needs EDNS to carry DO, so it re-enables it rather than silently
+    # doing nothing.
+    var r6 = dig_cli_new();
+    store64(&av + 8, "+noedns");
+    store64(&av + 16, "+dnssec");
+    store64(&av + 24, "example.com");
+    assert_eq(dig_cli_parse_argv(r6, 4, &av), DIG_CLI_OK, "+noedns +dnssec parses");
+    assert_eq(dig_cli_dnssec(r6), 1, "+dnssec sets DO");
+    assert_eq(dig_cli_bufsize(r6), DNS_EDNS_PAYLOAD, "+dnssec re-enables EDNS");
+
+    # dig speaks EDNS version 0 only; advertising another is a usage error, not
+    # a silent downgrade.
+    store64(&av + 16, "example.com");
+    # Transport is a TRI-state: two flags, three meanings. A bool cannot tell
+    # "default" from "+notcp", and the help text promises it can.
+    var t0 = dig_cli_new();
+    assert_eq(dig_cli_parse_argv(t0, 2, &av), DIG_CLI_OK, "no transport flag parses");
+    assert_eq(dig_cli_tcp(t0), DIG_TCP_AUTO, "default is fall-back-on-TC");
+    var t1 = dig_cli_new();
+    store64(&av + 8, "+tcp");
+    assert_eq(dig_cli_parse_argv(t1, 3, &av), DIG_CLI_OK, "+tcp parses");
+    assert_eq(dig_cli_tcp(t1), DIG_TCP_FORCE, "+tcp forces TCP");
+    var t2 = dig_cli_new();
+    store64(&av + 8, "+notcp");
+    assert_eq(dig_cli_parse_argv(t2, 3, &av), DIG_CLI_OK, "+notcp parses");
+    assert_eq(dig_cli_tcp(t2), DIG_TCP_NEVER, "+notcp is distinct from the default");
+
+    var r7 = dig_cli_new();
+    store64(&av + 8, "+edns=1");
+    assert_eq(dig_cli_parse_argv(r7, 3, &av), DIG_CLI_ERR_PARSE, "+edns=1 rejected");
+    var r8 = dig_cli_new();
+    store64(&av + 8, "+edns=0");
+    assert_eq(dig_cli_parse_argv(r8, 3, &av), DIG_CLI_OK, "+edns=0 accepted");
+    assert_eq(dig_cli_bufsize(r8), DNS_EDNS_PAYLOAD, "+edns=0 enables EDNS");
+    return 0;
+}
+
 # === Truncated response (TC=1) detection ===
 fn test_dns_truncated() {
     test_group("dns_truncated");
@@ -887,6 +1089,10 @@ fn main() {
     test_resolv();
     test_dns_parse_a_response();
     test_dns_truncated();
+    test_edns_query();
+    test_edns_response();
+    test_tcp_frame();
+    test_cli_edns_flags();
     test_aaaa_rfc5952();
     test_rdata_validation();
     test_rcode_names();

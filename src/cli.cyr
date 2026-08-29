@@ -31,6 +31,18 @@ var DIG_MIN_TIMEOUT_S = 1;
 var DIG_MAX_TIMEOUT_S = 3600;
 var DIG_MIN_RETRY     = 1;
 var DIG_MAX_RETRY     = 100;
+
+# EDNS(0) advertised payload bounds. The floor is RFC 1035's classic 512: a
+# smaller advertisement is meaningless, since a responder may always send that
+# much. The ceiling is the TCP message limit, though anything over ~1400 will
+# fragment on most real paths — see DNS_EDNS_PAYLOAD's note on Flag Day 2020.
+# Transport preference (registry +48).
+var DIG_TCP_AUTO  = 0;   # UDP, fall back to TCP on TC=1 — the default
+var DIG_TCP_FORCE = 1;   # +tcp
+var DIG_TCP_NEVER = 2;   # +notcp
+
+var DIG_MIN_BUFSIZE   = 512;
+var DIG_MAX_BUFSIZE   = 65535;
 var DIG_DEFAULT_TYPE      = 1;    # A — DNS_TYPE_A
 
 enum DigCliResult {
@@ -48,15 +60,21 @@ enum DigCliResult {
 #   +24  timeout_s  : i64
 #   +32  retry      : i64
 #   +40  short      : i64 (0/1)
-#   +48  tcp        : i64 (0/1)
+#   +48  tcp        : i64 tri-state — 0 default (UDP, fall back on TC=1),
+#                       1 `+tcp` (TCP from the start), 2 `+notcp` (UDP only,
+#                       never fall back). Two flags with three meanings needs
+#                       three values; a bool cannot tell "default" from
+#                       "+notcp", and the help text promises it can.
 #   +56  nodnssec   : i64 (0/1)
 #   +64  help       : i64 (0/1)
 #   +72  (reserved)  : i64 — was `type_seen`, write-only since 0.3.0 and
 #                       dropped at 0.3.8; the default-A path never read it
 #   +80  server_addr: i64 (parsed IPv4, 0 if none)
 #   +88  server_seen: i64 (0/1 — @server was supplied at all)
+#   +96  edns_bufsize: i64 (advertised EDNS UDP payload; 0 = send no OPT)
+#   +104 want_dnssec : i64 (0/1 — +dnssec asked for the DO bit)
 
-var DIG_CLI_SIZE = 96;
+var DIG_CLI_SIZE = 112;
 
 # Allocate a parse-result struct with the documented defaults already installed
 # (qtype=A, timeout=5s, retry=3). Never returns 0 — `alloc` aborts on exhaustion.
@@ -66,6 +84,7 @@ fn dig_cli_new(): i64 {
     store64(r + 16, DIG_DEFAULT_TYPE);
     store64(r + 24, DIG_DEFAULT_TIMEOUT_S);
     store64(r + 32, DIG_DEFAULT_RETRY);
+    store64(r + 96, DNS_EDNS_PAYLOAD);
     return r;
 }
 
@@ -84,9 +103,9 @@ fn dig_cli_timeout_s(r):  i64 { return load64(r + 24); }
 fn dig_cli_retry(r):      i64 { return load64(r + 32); }
 # 1 if `+short` was given (bare rdata, one per line), else 0.
 fn dig_cli_short(r):      i64 { return load64(r + 40); }
-# 1 if `+tcp` was given. Accepted and recorded but NOT acted on — dig is UDP-only
-# until the 0.4.x TCP fallback lands. Reading this today tells you what the user
-# asked for, not what the transport did.
+# Transport preference: DIG_TCP_AUTO / DIG_TCP_FORCE / DIG_TCP_NEVER. This is
+# what the user ASKED for; what actually carried the answer is tracked
+# separately in main and is what the footer reports.
 fn dig_cli_tcp(r):        i64 { return load64(r + 48); }
 # 1 if `+nodnssec` was given. Accepted and recorded; dig performs no DNSSEC
 # validation either way (0.4.x).
@@ -102,6 +121,12 @@ fn dig_cli_server_addr(r):i64 { return load64(r + 80); }
 # the sentinel meant `@0.0.0.0` parsed successfully, collided with "no server
 # given", and fell through to a bare `return 2` with nothing printed anywhere.
 fn dig_cli_server_seen(r):i64 { return load64(r + 88); }
+# The EDNS(0) UDP payload size to advertise, or 0 for `+noedns` — no OPT RR at
+# all, which is how you talk to a resolver that chokes on one.
+fn dig_cli_bufsize(r):i64 { return load64(r + 96); }
+# 1 if `+dnssec` asked for the DO bit. dig sets DO and prints whatever comes
+# back; it does NOT validate the chain — that is later in 0.4.x.
+fn dig_cli_dnssec(r):i64 { return load64(r + 104); }
 
 # Lowercase a single ASCII byte. Non-ASCII passes through.
 fn _dig_lc(c): i64 {
@@ -198,10 +223,48 @@ fn _dig_apply_plus(reg, tok): i64 {
     var n = tok + 1;
     if (_dig_streq_n(n, "short", 5, name_len) == 1)    { store64(reg + 40, 1); return 0; }
     if (_dig_streq_n(n, "noshort", 7, name_len) == 1)  { store64(reg + 40, 0); return 0; }
-    if (_dig_streq_n(n, "tcp", 3, name_len) == 1)      { store64(reg + 48, 1); return 0; }
-    if (_dig_streq_n(n, "notcp", 5, name_len) == 1)    { store64(reg + 48, 0); return 0; }
-    if (_dig_streq_n(n, "nodnssec", 8, name_len) == 1) { store64(reg + 56, 1); return 0; }
-    if (_dig_streq_n(n, "dnssec", 6, name_len) == 1)   { store64(reg + 56, 0); return 0; }
+    if (_dig_streq_n(n, "tcp", 3, name_len) == 1)      { store64(reg + 48, DIG_TCP_FORCE); return 0; }
+    if (_dig_streq_n(n, "notcp", 5, name_len) == 1)    { store64(reg + 48, DIG_TCP_NEVER); return 0; }
+    if (_dig_streq_n(n, "nodnssec", 8, name_len) == 1) {
+        store64(reg + 56, 1); store64(reg + 104, 0); return 0;
+    }
+    if (_dig_streq_n(n, "dnssec", 6, name_len) == 1) {
+        # +dnssec sets the DO bit, which requires EDNS — there is nowhere else
+        # to put it. Asking for DNSSEC records with +noedns is contradictory, so
+        # +dnssec re-enables EDNS at the default size rather than silently doing
+        # nothing.
+        store64(reg + 56, 0);
+        store64(reg + 104, 1);
+        if (load64(reg + 96) == 0) { store64(reg + 96, DNS_EDNS_PAYLOAD); }
+        return 0;
+    }
+    if (_dig_streq_n(n, "noedns", 6, name_len) == 1) {
+        store64(reg + 96, 0); store64(reg + 104, 0); return 0;
+    }
+    if (_dig_streq_n(n, "edns", 4, name_len) == 1) {
+        if (eq_off < 0) { store64(reg + 96, DNS_EDNS_PAYLOAD); return 0; }
+        var ev = _dig_parse_uint(tok + eq_off + 1);
+        if (ev < 0) { return 2; }
+        # dig only speaks EDNS version 0; `+edns=N` for N > 0 would advertise a
+        # version we cannot honour, so it is a usage error rather than a silent
+        # downgrade.
+        if (ev != 0) { return 2; }
+        store64(reg + 96, DNS_EDNS_PAYLOAD);
+        return 0;
+    }
+    if (_dig_streq_n(n, "bufsize", 7, name_len) == 1) {
+        if (eq_off < 0) { return 2; }
+        var bv = _dig_parse_uint(tok + eq_off + 1);
+        if (bv < 0) { return 2; }
+        # 0 means "no EDNS at all", matching +noedns. Anything else is clamped
+        # into the usable range rather than rejected, same posture as +timeout.
+        if (bv != 0) {
+            if (bv < DIG_MIN_BUFSIZE) { bv = DIG_MIN_BUFSIZE; }
+            if (bv > DIG_MAX_BUFSIZE) { bv = DIG_MAX_BUFSIZE; }
+        }
+        store64(reg + 96, bv);
+        return 0;
+    }
     if (_dig_streq_n(n, "timeout", 7, name_len) == 1) {
         if (eq_off < 0) { return 2; }
         var v = _dig_parse_uint(tok + eq_off + 1);
@@ -320,11 +383,16 @@ fn dig_cli_print_help(): i64 {
     println("Options (+flag form, BIND-compatible):");
     println("  +short                bare answer values, one per line");
     println("  +noshort              full BIND-shape output (default)");
-    println("  +tcp / +notcp         force/avoid TCP transport (accepted; UDP only in 0.3.x)");
-    println("  +timeout=N            per-query timeout, seconds (default 5)");
-    println("  +retry=N              tries before give-up (default 3)");
-    println("  +nodnssec / +dnssec   accepted, no validation yet (roadmap § 0.4.x)");
+    println("  +tcp                  query over TCP-53 from the start");
+    println("  +notcp                UDP only; do not fall back on TC=1 (default: fall back)");
+    println("  +timeout=N            per-try timeout, seconds (default 5, clamped 1-3600)");
+    println("  +retry=N              tries before give-up (default 3, clamped 1-100)");
+    println("  +bufsize=N            EDNS(0) UDP payload to advertise (default 1232, 0 = off)");
+    println("  +noedns / +edns=0     disable / enable EDNS(0) (default: enabled)");
+    println("  +dnssec               set the DO bit and print RRSIG/DNSKEY (no validation yet)");
+    println("  +nodnssec             clear the DO bit (default)");
     println("");
     println("  -h, --help            show this help");
+    println("  -V, --version         show the version");
     return 0;
 }

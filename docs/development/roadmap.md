@@ -1,6 +1,6 @@
 # dig — Roadmap
 
-> **Status**: Active | **Last Updated**: 2026-08-28 (0.3.8 — audit backlog closed)
+> **Status**: Active | **Last Updated**: 2026-08-28 (0.4.0 — EDNS(0) + TCP landed)
 >
 > Milestone path from scaffold (0.1.0) through v1.0 (full BIND `dig` parity + LAN-on-iron + `taar` extraction trigger fired). Per first-party-documentation roadmap shape: **Completed** / **Backlog** / **Future** / **v1.0 criteria**.
 >
@@ -14,6 +14,7 @@
 |---|---|---|
 | **0.1.0** | 2026-05-23 | Initial `cyrius init` scaffold. README + CLAUDE.md + LICENSE + CHANGELOG + cyrius.cyml + tests/dig.{tcyr,bcyr,fcyr} + `.github/workflows/{ci,release}.yml`. Stub `main.cyr` prints `hello from dig`. Stdlib vendored in `lib/` (81 modules incl. `net.cyr`). |
 | **0.3.0** | 2026-05-23 | **dig MVP — first end-to-end resolution.** Real UDP queries against arbitrary resolvers; A / AAAA / MX / NS / CNAME / SOA / PTR / TXT / SRV parsed; BIND-shape + `+short` output. 8 src/ modules (cli, dns, ipv4, output, platform/platform_linux, query, resolv) totaling 1410 LOC. 70 test assertions including name-compression cycle detection. Per-backend sovereignty posture: pragmatic POSIX on Linux, AGNOS backend deferred to v1.0 gate (same as yo). At the time, 0.2.x kernel UDP-53 syscall exposure was still pending (the Linux-backend-first bypass kept momentum); that surface has since landed (agnos 1.45.3, #51-54) and the AGNOS backend now resolves end-to-end. |
+| **0.4.0** | 2026-08-28 | **EDNS(0) + DNS over TCP.** First feature cut past the MVP line, after the 0.4.x hold lifted. `dig google.com TXT` returns 16 records where it returned none for eight releases. OPT pseudo-RR advertising 1232 (the Flag Day 2020 value, not 4096), `+bufsize` / `+noedns` / `+edns`, extended RCODE folded in so BADVERS stops reading as NOERROR, TCP-53 with RFC 1035 §4.2.2 length framing reached automatically on TC=1 or forced by `+tcp`, and `+dnssec` setting the DO bit. TCP is built on taar's socket primitives — the migration this roadmap parked for "when `+tcp` lands" — which brings the AGNOS arm along without touching the parked backend. Tests 198 → 260. |
 | **0.3.8** | 2026-08-28 | **Audit backlog closed** — the 23 P2/P3 findings 0.3.7 left open. Rendering (RFC 5952 AAAA, RFC 3597 unknown types, real CLASS/RCODE names, the doubled FQDN dot), validation (rdata bounded by RDLENGTH not `msg_len`, 13 discarded error returns now reaching the exit code, validate-before-emit), semantics (`dig . NS` works, NXDOMAIN exits 0 like BIND, `@0.0.0.0` no longer exits 2 in silence), resolv.conf (`0.0.0.0` skipped rather than fatal, CRLF, 16 KiB, an audible fallback), the 2x deadline extension from one well-timed packet, and partial answers keeping their footer. Dead code removed. Tests 128 → 198; `tests/dig.fcyr` went from a stub that reported PASS while including no source at all to 1,560,376 assertions across five strategies. |
 | **0.3.7** | 2026-08-28 | **P-1 audit / hardening sweep.** Repaired the aarch64 wrong-syscall defect (`platform_linux.cyr` hardcoded an x86_64 table used on every non-AGNOS target), the `+timeout=0` infinite hang, the silently-discarded unknown record type, and a walkable integer-overflow guard. Hardened the reply path: connected UDP socket, RFC 5452 §9.1 question matching, per-attempt query IDs, fail-closed entropy, and junk datagrams no longer consuming retries. Adopted `[deps.cmdit]` 1.2.4 and dropped the never-referenced stdlib `flags`. 70 → 102 assertions, all four repairs mutation-checked. `cyrius audit` green on all four dimensions for the first time. |
 
@@ -56,12 +57,61 @@ answers keeping their footer. Dead code removed; every `write(2)` routed through
 replacing a stub that reported PASS while including no source at all. See
 CHANGELOG [0.3.8].
 
+### Upstream — file against cyrius, do not patch locally
+
+- **Stack slot overlapping a parameter (found 0.4.0).** In
+  `output_print_footer`, `var buf[16]` was placed such that
+  `ipv4_format_to_buf` writing into it corrupted the function's third
+  PARAMETER: `tcp_used` went from `1` to `0x3800000000000001` — low byte intact,
+  byte 7 replaced by the ASCII `'8'` that the formatter wrote. Every TCP query
+  therefore reported `proto: udp`. Worked around by reading the parameter into a
+  local before the buffer is touched. **No minimal reproduction yet** — array
+  first, and call-then-array, both behave correctly — so what distinguishes the
+  failing shape is still unknown. Reproduce from `git show` of the 0.4.0 commit
+  before the workaround.
+- **No stdlib wrapper or named constant for `sendto` / `nanosleep` /
+  `clock_gettime`** on either Linux arch, so every consumer needing a monotonic
+  clock hardcodes a number — the thing that made dig's aarch64 builds call
+  `unlinkat` for their retry backoff. `lib/chrono.cyr` has the same latent bug:
+  its non-macOS non-Windows arm is a bare `syscall(228, ...)` with no aarch64
+  arm, and 228 is not `clock_gettime` there. Also filed in taar's roadmap; two
+  first-party consumers hitting one gap independently is the threshold.
+
+---
+
+### AGNOS-arm review — PARKED (user direction 2026-08-28)
+
+**Do not act on this without asking.** The AGNOS backend is still in active
+development on the kernel side, so dig's arm is a moving target and re-auditing
+it now would review something about to change shape.
+
+What is banked and awaiting that review:
+
+- The 0.3.7 parity fixes (`sys_getrandom` checked at both sites so
+  `query.cyr`'s fail-closed entropy contract is actually honoured on this arm;
+  peer filtering in `platform_udp_recv` emulating the connect(2) the kernel
+  cannot express; `platform_set_recv_timeout_ms` clamped) are **review-verified
+  only** — nothing executes this arm, which is how the divergence they close got
+  in.
+- Open question for the agnos side, filed not fixed: `platform_now_us` is
+  `sys_uptime_ms() * 1000`, and `lib/syscalls_x86_64_agnos.cyr` warns that a
+  foreground `run` program executes with IF cleared, so the 100 Hz timer never
+  fires and #40 is frozen for that program's run. If that holds, `;; Query time:`
+  prints 0 unconditionally and — far worse — the recv poll loop and
+  `query.cyr`'s deadline loop **never terminate**. The peer already ships
+  `sys_uptime_us()` (#95, rdtsc-based, works with interrupts disabled). Unverified
+  here: it cannot be checked without executing the arm.
+- Executed coverage remains the largest untested surface in the repo.
+
+---
+
 ### 0.4.x — Full record-type coverage + advanced flags
 
 - [ ] Additional RR types: TXT multi-string parsing, SOA (master/admin/serial/refresh/retry/expire/minimum), HINFO, RRSIG, DNSKEY, DS, NSEC, NSEC3 (the DNSSEC ladder).
 - [ ] `+trace` flag — manual recursion from root servers. Walks root → TLD → authoritative chain, prints each step. Useful for diagnosing delegation issues.
-- [ ] `+dnssec` flag — request DNSKEY + RRSIG; validate chain of trust against the root KSK (RFC 4034 + RFC 5155). Defer the cryptographic-validation work to a `taar.dnssec` submodule.
-- [ ] EDNS(0) support (RFC 6891) — OPT pseudo-RR, larger UDP buffer (4096), DO bit signaling DNSSEC-OK.
+- [~] `+dnssec` flag — **DO bit landed 0.4.0**; dig requests and prints RRSIG/DNSKEY. Chain-of-trust validation against the root KSK (RFC 4034 + RFC 5155) remains. Defer the cryptographic work to a `taar.dnssec` submodule.
+- [x] **EDNS(0) support (RFC 6891) — landed 0.4.0.** OPT pseudo-RR, `+bufsize=N`, `+noedns`, extended RCODE folded in (BADVERS was reading as NOERROR without it). Advertises **1232**, not the 4096 this line originally specified — 4096 fragments on most real paths and is a reflection-amplification lever; 1232 is the DNS Flag Day 2020 consensus.
+- [x] **TCP fallback on TC=1 (RFC 1035 §4.2.2) — landed 0.4.0.** Automatic on truncation, forced by `+tcp`. Built on taar's socket primitives, which ships both arms — so AGNOS gets TCP without touching the parked backend.
 - [ ] IPv6 transport: query via `udp_send` against `2001:4860:4860::8888` (Google) etc.; AAAA queries are already in 0.3.x record-type list.
 
 ### 0.5.x — Iron validation + parity check
