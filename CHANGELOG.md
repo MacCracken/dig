@@ -4,6 +4,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-11
+
+### Changed
+
+- **Toolchain `6.5.35` → `6.6.2`.** No source change; the value form needed none.
+  Build, tests, and any bench/fuzz/distlib target the repo ships re-verified at the new pin.
+
+
 ## [0.4.0] — 2026-08-28 (EDNS(0) + DNS over TCP — `dig TXT` finally returns the records)
 
 First feature cut since the MVP line. The 0.4.x hold lifted, and this takes the
