@@ -4,6 +4,61 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-08
+
+**Maintenance: toolchain `6.6.2` → `6.6.20`, both first-party deps moved to their 6.6.20-pinned
+tags, and the local build stops compiling different deps than CI.** No source change. 260/260
+assertions and 1,560,376/1,560,376 fuzz cases pass. The x86_64, `--agnos` and `--aarch64` builds
+are clean, and live queries (UDP, EDNS TXT, `+noedns` TC→TCP fallback, `+tcp`, resolv.conf
+discovery) answer.
+
+### Changed
+
+- **Toolchain pin `6.6.2` → `6.6.20`.** CI reads it from `cyrius.cyml`, so no workflow edit.
+- **`[deps.cmdit]` `1.2.4` → `1.2.6` and `[deps.taar]` `0.5.0` → `0.5.2`.** These are the last
+  tags of each library pinned to 6.6.20. Both are toolchain-only releases with no behaviour
+  change. Two shape changes reach dig:
+  - Each `dist/*.cyr` bundle now opens with a compile-verified `# Requires` block.
+  - Each `dist/*.deps` sidecar now lists only the leaves the bundle itself uses (cmdit: `alloc`,
+    `string`, `args`, `io`; taar: `syscalls`, `fmt`).
+
+  dig declares every one of those leaves in its own `[deps].stdlib`, so nothing changes for it.
+  `cyrius.lock` now commit-pins both deps (`cmdit` 1.2.6 = `c74cb7d`, `taar` 0.5.2 = `74cb83c`,
+  each checked against its tag) and carries the `cyrius 6.6.20` trailer.
+- **`lib/` re-vendored from the 6.6.20 snapshot.** `cyrius lib sync` copied the 23-file declared
+  subset, and `alloc_cx` and `poison` now come in transitively. The first resolve refused 3
+  rows (`atomic`, `fnptr`, `result`) as "DISAGREE under an unchanged pin". That is the known
+  gotcha when the pin has just moved: the lock still held the old pin's hashes. Each refused row
+  was checked byte-for-byte against `6.6.2/lib` before `cyrius deps --relock` accepted the new
+  content. `lib/flags.cyr` was removed: it had been orphaned since flags was dropped at 0.3.7,
+  but it was still vendored, so it carried a 6.6.2 lock row that a fresh resolve drops.
+  `cyrius deps --verify` now passes all 29 rows, and the lock is identical to the one a clean
+  CI resolve writes.
+- **`path = "../cmdit"` / `path = "../taar"` are commented out.** This is the second time the
+  override has masked a stale tag; 0.3.6 documents the first. `path` wins whenever the sibling
+  checkout exists, so local builds vendored whatever the sibling's working tree held. The 0.4.1
+  lock recorded cmdit **1.2.5** and taar **0.5.1** while the manifest said 1.2.4 and 0.5.0, and
+  CI, which has no sibling, built 1.2.4 and 0.5.0. By 0.4.2 the uncommitted lock had drifted to
+  cmdit **1.4.0**, a 6.7.9-pinned bundle. Today the override would pull cmdit 1.5.1 and taar
+  0.6.2, both pinned to 6.7.18. With it off, the local build resolves the same `git`+`tag` CI
+  does. A CI-faithful run (tracked tree only, no `lib/`, no siblings) produced a binary
+  sha256-identical to the local one, and its resolve reported `2 commit-pinned (2 re-verified)`,
+  which shows no override is masking a tag. Uncomment `path` only for deliberate co-development
+  against an unreleased sibling.
+
+### Binary size: +30 KB, almost all of it unreachable stdlib
+
+Host `dig` grew 176,064 → 206,664 B and `--agnos` grew 180,096 → 223,376 B. Both baselines are
+0.4.1 built CI-style, at its declared tags. With `CYRIUS_DCE=1` the **live** image went
+81,856 → 82,880 B (+1 KB). The rest is unreachable stdlib (431 → 518 unreachable fns), which the
+DCE pass drops. This is the same shape cmdit 1.2.6 measured for this pin move.
+
+### Not changed
+
+- `cyrius audit` reports **5 lint warnings** (consecutive blank lines in `tests/dig.tcyr`) and
+  **11 undocumented public fns**. 6.6.2 and 6.6.20 report the same counts. The bump did not add
+  them, and CI gates only on deps/build/test.
+
 ## [0.4.1] - 2026-09-11
 
 ### Changed

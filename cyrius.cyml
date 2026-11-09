@@ -4,7 +4,7 @@ version = "${file:VERSION}"
 description = "dig — DNS resolver (sovereign Cyrius reimplementation of BIND dig)"
 license = "GPL-3.0-only"
 language = "cyrius"
-cyrius = "6.6.2"
+cyrius = "6.6.20"
 
 [build]
 entry = "src/main.cyr"
@@ -25,7 +25,14 @@ stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "b
 # unreachable (DCE-eliminable). 0.5.0 grew DNS-over-TCP (TC fallback) and
 # the AGNOS recv-timeout/close split — both on taar's own DNS path, which
 # dig does not call, so its surface here is unchanged from 0.3.1.
-# `path` drives local dev resolution; `git`+`tag` is the published fallback.
+#
+# `path = "../<dep>"` is commented out on both deps (0.4.2). It wins over
+# `tag` whenever the sibling checkout exists, so a local build vendored the
+# sibling's *working tree*: through 0.4.1 that was cmdit 1.2.5 / 1.4.0 and
+# taar 0.5.1 while this file said 1.2.4 / 0.5.0, and today it would be
+# cmdit 1.5.1 / taar 0.6.2 (both pinned to cyrius 6.7.18). With it off, the
+# local build resolves the same `git`+`tag` CI does. Uncomment it only for
+# deliberate co-development against an unreleased sibling.
 # CLI substrate. dig's grammar is BIND's, not getopt-long — `@server` and
 # `+flag` are hand-tokenized in src/cli.cyr and stay that way; cmdit's own docs
 # name dig as the case its `cmdit_raw_argv` escape hatch exists for. What cmdit
@@ -35,13 +42,13 @@ stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "b
 # parsing work.
 [deps.cmdit]
 git = "https://github.com/MacCracken/cmdit.git"
-path = "../cmdit"
-tag = "1.2.4"
+# path = "../cmdit"
+tag = "1.2.6"
 modules = ["dist/cmdit.cyr"]
 
 [deps.taar]
 git = "https://github.com/MacCracken/taar.git"
-path = "../taar"
-tag = "0.5.0"
+# path = "../taar"
+tag = "0.5.2"
 modules = ["dist/taar.cyr"]
 ---
