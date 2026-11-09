@@ -7,6 +7,9 @@ on:
     branches: [main]
   workflow_call:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -16,7 +19,8 @@ jobs:
     name: Build & Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # SHA-pinned (0.5.2): a moving `@v4` tag runs whatever it points at today.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
 
       - name: Install Cyrius toolchain
         run: |
@@ -27,9 +31,11 @@ jobs:
           # $HOME/.cyrius/versions/<v>/ which `cyrius deps` pin-checks. The
           # old curl+cp into a flat ~/.cyrius/lib failed that check (and its
           # `|| true` masked a 404'd release asset → a silent 0s no-op).
+          # The installer itself is fetched AT THE PINNED TAG (0.5.2), not from
+          # `main`, so a later push to cyrius cannot change what this job runs.
           CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
           echo "Installing Cyrius $CYRIUS_VERSION"
-          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+          curl -sSf "https://raw.githubusercontent.com/MacCracken/cyrius/${CYRIUS_VERSION}/scripts/install.sh" | \
             CYRIUS_VERSION="$CYRIUS_VERSION" sh
           echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
 
@@ -48,3 +54,38 @@ jobs:
         # stub didn't exist (Issue 1) and also wouldn't ever exercise
         # tests/${proj}.tcyr.
         run: cyrius test
+
+  integration:
+    name: Network paths (integration)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4.3.1
+
+      - name: Install Cyrius toolchain
+        run: |
+          set -e
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          curl -sSf "https://raw.githubusercontent.com/MacCracken/cyrius/${CYRIUS_VERSION}/scripts/install.sh" | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+
+      - name: Probe for unprivileged user+net+mount namespaces
+        id: probe
+        # The fake server binds 127.0.0.1:53, which needs CAP_NET_BIND_SERVICE;
+        # `unshare -rnm` gives that, a private loopback and a mount namespace
+        # for the resolv.conf cases, without root. If a runner forbids it the
+        # cases cannot run, so warn loudly rather than fail on a sandbox policy.
+        run: |
+          if unshare -rnm true 2>/dev/null; then
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::unshare -rnm not permitted here — network-path cases skipped"
+          fi
+
+      - name: Resolve dependencies
+        run: cyrius deps
+
+      - name: Run tests/integration/net.sh
+        if: steps.probe.outputs.ok == '1'
+        run: tests/integration/net.sh

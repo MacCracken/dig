@@ -1,15 +1,15 @@
 # resolv.cyr — resolver discovery (/etc/resolv.conf parser).
 #
-# Pure code (no syscalls in here — the file-read is in platform.cyr).
-# Caller hands us the byte buffer + length; we return the first
-# `nameserver X.X.X.X` IPv4 we find, packed.
+# resolv_parse is pure code: the caller hands it bytes and gets back the first
+# `nameserver X.X.X.X` IPv4, packed. resolv_discover reads the file through the
+# platform shim and reports a fallback or a refusal on stderr (output.cyr).
 #
 # Grammar fragment (RFC 1033 / resolver(5)):
 #   nameserver <SP+> <addr>
 # Lines starting with '#' or ';' are comments. Other directives
 # (search, options, sortlist) are skipped. We only care about
-# nameserver lines pointing at IPv4 — IPv6 nameservers wait for
-# roadmap § 0.4.x.
+# nameserver lines pointing at IPv4; IPv6 waits for an IPv6 transport
+# (roadmap § 0.4.x), and a file naming only IPv6 resolvers fails closed.
 #
 # Discovery order, as the code actually walks it:
 #   1. platform_dns_server() — the AGNOS DHCP-leased on-subnet resolver
@@ -59,16 +59,23 @@ fn _resolv_match(buf, len, i, lit, lit_len): i64 {
     return 1;
 }
 
-# Parse `buf[0..len)` as resolv.conf. Returns the packed IPv4 of the
-# first valid `nameserver X.X.X.X` line, or 0 if none found / parse
-# fails. Caller dispatches the fallback.
+# resolv_parse's answer when the file NAMES nameservers but dig can use none of
+# them (IPv6, 0.0.0.0, garbage). Distinct from 0, "no nameserver line at all",
+# because the two now get different treatment: see resolv_discover.
+var RESOLV_UNUSABLE = 0 - 1;
+
+# Parse `buf[0..len)` as resolv.conf. Returns the packed IPv4 of the first valid
+# `nameserver X.X.X.X` line; RESOLV_UNUSABLE if there are nameserver lines but
+# none of them is usable; or 0 if there is no nameserver line at all. Caller
+# dispatches the fallback.
 fn resolv_parse(buf, len): i64 {
     if (buf == 0) { return 0; }
     if (len <= 0) { return 0; }
+    var named = 0;          # saw at least one `nameserver` line
     var i = 0;
     while (i < len) {
         i = _resolv_skip_blank(buf, len, i);
-        if (i >= len) { return 0; }
+        if (i >= len) { break; }
         var c = load8(buf + i);
         # Comment / empty line — skip
         if (c == 35) { i = _resolv_find_eol(buf, len, i) + 1; }
@@ -84,6 +91,7 @@ fn resolv_parse(buf, len): i64 {
                     if (nc == 32) { j = _resolv_skip_blank(buf, len, j); }
                     elif (nc == 9) { j = _resolv_skip_blank(buf, len, j); }
                     else { j = _resolv_find_eol(buf, len, i) + 1; i = j; continue; }
+                    named = 1;
                     # Extract the address token to a temp NUL-terminated
                     # buffer ipv4_parse can consume.
                     var eol = _resolv_find_eol(buf, len, j);
@@ -129,46 +137,72 @@ fn resolv_parse(buf, len): i64 {
                         }
                     }
                     i = eol + 1;
-                } else { return 0; }
+                } else { named = 1; break; }
             } else {
                 i = _resolv_find_eol(buf, len, i) + 1;
             }
         }
     }
+    if (named == 1) { return RESOLV_UNUSABLE; }
     return 0;
 }
 
 var RESOLV_CONF_MAX = 16384;
 
-# Top-level discovery wrapper. Reads /etc/resolv.conf via the platform
-# shim; on any failure (file missing, no nameserver line), falls back
-# to RESOLV_FALLBACK_PUBLIC (8.8.8.8). Caller can override entirely via the
-# `@server` CLI arg before this is called. On AGNOS the DHCP-leased on-subnet
-# resolver (net_config#61, via platform_dns_server) is preferred FIRST — the
-# 8.8.8.8 fallback is off-subnet and needs working gateway routing the kernel
-# can't guarantee on real iron (it froze bare-hostname net tools on archaemenid);
-# the leased resolver is on-subnet + directly reachable. Linux's platform_dns_server
-# returns 0, so the resolv.conf path is unchanged there.
+# resolv_discover's answer when it FAILS CLOSED: there is a resolv.conf that
+# names resolvers, but none dig can use. Negative, so no address collides.
+var RESOLV_NONE = 0 - 1;
+
+# Pick the resolver to ask. Returns a packed IPv4, or RESOLV_NONE. Caller can
+# override entirely via the `@server` CLI arg before this is called.
+#
+# On AGNOS the DHCP-leased on-subnet resolver (net_config#61, via
+# platform_dns_server) is preferred FIRST — the 8.8.8.8 fallback is off-subnet
+# and needs working gateway routing the kernel can't guarantee on real iron (it
+# froze bare-hostname net tools on archaemenid); the leased resolver is
+# on-subnet + directly reachable. Linux's platform_dns_server returns 0, so the
+# resolv.conf path is unchanged there.
+#
+# Then /etc/resolv.conf, and the policy for when it yields nothing (0.5.2, the
+# same posture as taar 0.6.2):
+#   - no file, or a file with no `nameserver` line at all: there is no host
+#     resolver to bypass, so fall back to RESOLV_FALLBACK_PUBLIC (8.8.8.8), with
+#     a warning on stderr;
+#   - a file that NAMES resolvers dig cannot use (IPv6, 0.0.0.0, garbage), or
+#     whose only candidate line was cut off at the read limit: FAIL CLOSED. The
+#     host chose its resolvers; quietly sending the query to a third party
+#     instead is the leak to avoid. Through 0.5.1 this case went to 8.8.8.8 too.
 fn resolv_discover(): i64 {
     var ksrv = platform_dns_server();
     if (ksrv > 0) { return ksrv; }
-    # 16 KiB, up from 4096. A single unchecked 4096-byte read silently truncated
-    # larger files: a nameserver line straddling offset 4096 yielded a DIFFERENT
-    # valid address (10.0.0.5 for 10.0.0.53), and a first nameserver line past
-    # 4096 yielded the public fallback. platform_read_file is one read(2), so the
-    # buffer has to cover the file rather than the loop covering the buffer.
-    var buf = alloc(RESOLV_CONF_MAX);
-    var n = platform_read_file("/etc/resolv.conf", buf, RESOLV_CONF_MAX);
-    if (n > 0) {
-        var addr = resolv_parse(buf, n);
-        if (addr > 0) { return addr; }
+    # Read ONE byte more than the cap, so a file that does not fit is KNOWN not
+    # to fit. Through 0.5.1 a file over the 16 KiB cap was cut silently, and a
+    # nameserver line straddling the cut parsed as a DIFFERENT valid address:
+    # `nameserver 10.0.0.53` with its `3` at byte 16384 queried 10.0.0.5, with no
+    # warning. (At 0.3.8 the same bug sat at 4096; raising the cap moved it.)
+    # Now the partial last line is dropped before parsing, never read.
+    var buf = alloc(RESOLV_CONF_MAX + 1);
+    var n = platform_read_file("/etc/resolv.conf", buf, RESOLV_CONF_MAX + 1);
+    var cut = 0;
+    if (n > RESOLV_CONF_MAX) {
+        cut = 1;
+        n = RESOLV_CONF_MAX;
+        while (n > 0) {
+            if (load8(buf + n - 1) == 10) { break; }
+            n = n - 1;
+        }
     }
-    # Say so. Every path that lands here — file missing, unreadable, CRLF,
-    # truncated, only-IPv6-nameservers, only 0.0.0.0 — used to leak identically
-    # and in silence, and `+short` and the timeout path never print the footer
-    # that would have shown `server: 8.8.8.8`. This one line on stderr is the
-    # shared backstop for all of them.
-    _out_eputs(";; WARNING: no usable nameserver in /etc/resolv.conf");
+    var addr = 0;
+    if (n > 0) { addr = resolv_parse(buf, n); }
+    if (addr > 0) { return addr; }
+    if ((addr == RESOLV_UNUSABLE) || (cut == 1)) {
+        _out_eputs(";; no usable nameserver in /etc/resolv.conf, which names some");
+        _out_eputs(" (not falling back to a public resolver); give one with @server\n");
+        return RESOLV_NONE;
+    }
+    # Say so. `+short` and the timeout path never print the footer that would
+    # show `server: 8.8.8.8`, so this line on stderr is the only notice.
+    _out_eputs(";; WARNING: no nameserver in /etc/resolv.conf");
     _out_eputs(" — falling back to 8.8.8.8\n");
     return RESOLV_FALLBACK_PUBLIC;
 }

@@ -19,13 +19,11 @@
 # arch-dispatched wrapper (sys_socket / sys_connect / sys_write / sys_recvfrom /
 # sys_setsockopt / sys_close / sys_read / sys_open / sys_getrandom), which
 # resolves to the right number for whichever syscalls_<arch>_linux.cyr the build
-# selected. Two calls have no wrapper and no named constant anywhere in the
-# stdlib — clock_gettime and nanosleep — and clock_gettime is spelled as an
-# arch-guarded LITERAL below, for the reason lib/bench.cyr documents: the
-# macOS/Windows reroute for syscall(228) is keyed on a compile-time const-fold,
-# so a `var` holding the number silently defeats it. The old table was `var`s.
-# (nanosleep left with platform_sleep_ms at 0.3.8 — it had no callers, and a
-# dead function holding a raw arch-specific number is a loaded gun.)
+# selected. The monotonic clock is lib/chrono.cyr's clock_now_ns (0.5.2), which
+# replaced the last arch-guarded syscall LITERAL in this file (clock_gettime as
+# 113 / 228), kept until then because the stdlib had no clock wrapper. chrono's
+# also gets macOS arm64 right, where the 228 reroute returns nanoseconds instead
+# of filling the timespec and the old literal would have read uninitialised stack.
 #
 # See roadmap.md § 0.7.x (Host-target parity) for the remaining target work.
 
@@ -34,7 +32,6 @@ var _LX_SOCK_DGRAM      = 2;
 var _LX_IPPROTO_UDP     = 17;
 var _LX_SOL_SOCKET      = 1;
 var _LX_SO_RCVTIMEO     = 20;
-var _LX_CLOCK_MONOTONIC = 1;
 var _LX_O_RDONLY        = 0;
 
 # -EAGAIN. What SO_RCVTIMEO yields from recvfrom(2) when the deadline expires —
@@ -99,10 +96,10 @@ fn _lx_fill_sockaddr(sa, packed_addr, port): i64 {
 #      out-param — any host on the path that guessed the 16-bit query ID could
 #      land a forged answer. Connected, an off-path attacker must also guess the
 #      ephemeral source port. This is the RFC 5452 §9 layering.
-#   2. Portability. The stdlib exposes no sendto wrapper and no SYS_SENDTO
-#      constant on either arch, so sendto could only be spelled as a hardcoded
-#      44 — which is precisely the aarch64 misroute this file is fixing (44 is
-#      fstatfs there). write(2) on a connected socket needs neither.
+#   2. Portability (historical). Until cyrius 6.6.5 the stdlib had no sendto
+#      wrapper, so sendto could only be spelled as a hardcoded 44, the aarch64
+#      misroute (44 is fstatfs there). `sys_sendto` exists now; reason 1 alone
+#      keeps connect-then-write, as in taar.
 #
 # Re-connecting a UDP socket to a new peer is legal and cheap, so connecting per
 # send keeps the (fd, addr, port) signature intact for the platform contract.
@@ -159,21 +156,7 @@ fn platform_random_u16(): i64 {
     return (load8(&rb) << 8) | load8(&rb + 1);
 }
 
-# CLOCK_MONOTONIC microseconds since boot.
-#
-# clock_gettime has no stdlib wrapper and no named per-arch constant, so the
-# number is an arch-guarded literal — never a `var`, per lib/bench.cyr: the
-# macOS/Windows reroute for syscall(228) only fires when the first argument
-# const-folds, and a `var` does not fold.
+# CLOCK_MONOTONIC microseconds, from the stdlib's clock_now_ns (see header).
 fn platform_now_us(): i64 {
-    var ts[16];
-    #ifdef CYRIUS_ARCH_AARCH64
-    syscall(113, _LX_CLOCK_MONOTONIC, &ts);
-    #endif
-    #ifndef CYRIUS_ARCH_AARCH64
-    syscall(228, _LX_CLOCK_MONOTONIC, &ts);
-    #endif
-    var secs = load64(&ts);
-    var nsec = load64(&ts + 8);
-    return secs * 1000000 + nsec / 1000;
+    return clock_now_ns() / 1000;
 }

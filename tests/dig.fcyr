@@ -43,8 +43,6 @@ include "src/output.cyr"
 include "src/query.cyr"
 include "src/tcp.cyr"
 
-var FZ_CAP = 512;          # DNS_MAX_UDP_PAYLOAD — the real rx buffer size
-
 # ---- deterministic LCG so every failure reproduces from its seed ----
 var _fz_state = 0;
 fn _fz_seed(s): i64 { _fz_state = s; return 0; }
@@ -94,8 +92,12 @@ fn fz_check(msg, len, label): i64 {
         assert(d == 0 || (d > probe && d <= len), label);
         var s = dns_skip_name(msg, len, probe);
         assert(s == 0 || (s > probe && s <= len), label);
-        # Both guard the same frame; neither may accept what the other
-        # rejects as OUT OF RANGE (they may disagree on name length).
+        # They must agree EXACTLY: on accept-or-reject, and on where the name
+        # ends. Since 0.3.8 both count the same 255-octet wire cap; until then
+        # they disagreed, and full output and +short printed different answers
+        # for the same bytes. (This comment said "they may disagree" until 0.5.2.)
+        assert((d == 0) == (s == 0), label);
+        assert(d == s, label);
         probe = probe + 1;
     }
 
@@ -130,6 +132,37 @@ fn fz_check(msg, len, label): i64 {
     assert(q == 0 || q == 1, label);
     assert(dns_question_matches(msg, len, "zzz.invalid", DNS_TYPE_A) == 0, label);
 
+    # EDNS: main runs these on every reply it keeps, so they must be total too.
+    var opt = dns_find_opt(msg, len);
+    assert(opt == DNS_OPT_DUP || opt == 0 || (opt >= DNS_HEADER_LEN && opt + DNS_OPT_RR_LEN <= len), label);
+    var frc = dns_full_rcode(msg, len, 1);
+    assert(frc == 0 - 1 || (frc >= 0 && frc <= 4095), label);
+    if (len >= DNS_HEADER_LEN) {
+        assert(dns_full_rcode(msg, len, 0) == dns_hdr_rcode(msg), label);
+    }
+
+    # Acceptance and commit (0.5.2): boolean, and a REJECTED reply is never
+    # written into the caller's buffer. That is the TC-fallback P1 as an
+    # invariant.
+    if (len >= 2) {
+        var acc = query_reply_acceptable(msg, len, dns_hdr_id(msg), "a.com", DNS_TYPE_A);
+        assert(acc == 0 || acc == 1, label);
+        # A stack buffer, not alloc: the bump allocator never frees, and this
+        # runs 1.5M times. Frames are at most 512 bytes.
+        var crx[520];
+        if (len > 512) { return 0; }
+        memset(&crx, 0x5A, len + 1);
+        var crl[8];
+        store64(&crl, 0 - 7);
+        var com = query_commit_reply(msg, len, dns_hdr_id(msg), "a.com", DNS_TYPE_A, &crx, len, &crl);
+        assert(com == acc, label);
+        if (com == 0) {
+            assert(load64(&crl) == 0 - 7, label);
+            assert(load8(&crx) == 0x5A, label);
+        }
+        assert(load8(&crx + len) == 0x5A, label);
+    }
+
     # Header accessors are total on any >= 12 bytes.
     if (len >= DNS_HEADER_LEN) {
         assert(dns_hdr_id(msg) >= 0, label);
@@ -150,6 +183,15 @@ fn fz_selfcheck(): i64 {
     assert(dns_parse_rr(&b, n, 23, rr) == 39, "selfcheck: RR ends at 39");
     assert(dns_rr_type(rr) == DNS_TYPE_A, "selfcheck: RR is an A record");
     assert(dns_question_matches(&b, n, "a.com", DNS_TYPE_A) == 1, "selfcheck: question matches");
+    # The OPT seed fz_opt starts from must parse too, or strategy 6 is noise.
+    var ob[64];
+    var on = fz_valid_a(&ob);
+    store8(&ob + 11, 1);
+    memset(&ob + on, 0, 11);
+    store8(&ob + on + 2, 41);
+    store8(&ob + on + 3, 0x04); store8(&ob + on + 4, 0xD0);
+    assert(dns_find_opt(&ob, on + 11) == on, "selfcheck: OPT seed is found");
+    assert(dns_full_rcode(&ob, on + 11, 1) == 0, "selfcheck: OPT seed rcode is NOERROR");
     return 0;
 }
 
@@ -202,6 +244,27 @@ fn fz_truncate(): i64 {
     return 0;
 }
 
+# Strategy 6 — an EDNS reply: the valid A plus an OPT in the additional section,
+# with random byte-flips. Uniform noise almost never forms an OPT, so without
+# this dns_find_opt / dns_full_rcode only ever saw their early-return paths.
+fn fz_opt(seed, nmut): i64 {
+    _fz_seed(seed);
+    var buf[512];
+    var n = fz_valid_a(&buf);
+    store8(&buf + 11, 1);                                  # arcount 1
+    memset(&buf + n, 0, 11);
+    store8(&buf + n + 2, 41);                              # OPT, root owner
+    store8(&buf + n + 3, 0x04); store8(&buf + n + 4, 0xD0); # payload 1232
+    n = n + 11;
+    var m = 0;
+    while (m < nmut) {
+        store8(&buf + (_fz_next() % n), _fz_next());
+        m = m + 1;
+    }
+    fz_check(&buf, n, "opt");
+    return 0;
+}
+
 # Strategy 5 — adversarial compression pointers. The hang surface.
 fn fz_pointers(seed): i64 {
     _fz_seed(seed);
@@ -233,10 +296,14 @@ fn _fz_mute(): i64 {
     return 0;
 }
 fn _fz_unmute(): i64 {
+    # stdout is buffered since 0.5.2 (output.cyr): flush what the fuzzing wrote
+    # while fd 1 is still /dev/null, so none of it reaches the real stdout.
+    _out_flush();
     sys_dup2(90, 1);
     return 0;
 }
 
+# Run every fuzz strategy with stdout muted; exit status is the failure count.
 fn main(): i64 {
     alloc_init();
     fz_selfcheck();
@@ -252,6 +319,8 @@ fn main(): i64 {
     while (seed <= 4000)  { fz_fields(seed);      seed = seed + 1; }
     seed = 1;
     while (seed <= 4000)  { fz_pointers(seed);    seed = seed + 1; }
+    seed = 1;
+    while (seed <= 4000)  { fz_opt(seed, 3);      seed = seed + 1; }
     fz_truncate();
     _fz_unmute();
 

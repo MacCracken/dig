@@ -4,6 +4,156 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-09
+
+**A P(-1) audit, with its repairs.** Five independent reviewers each took one lens over 0.5.1
+(wire parsing, protocol and spoofing, CLI and output, platform and resources, refactor and
+tests). They found **4 P1, 7 P2 and 18 P3**, all repaired here; 9 smaller items are deferred to
+the roadmap. The full record, with evidence and dispositions, is
+[`docs/audit/2026-11-08-audit.md`](docs/audit/2026-11-08-audit.md). The AGNOS backend was not
+re-audited: that review stays parked by owner direction.
+
+Nothing here is a new DNS feature, but **several CLI behaviours change to match BIND's dig**,
+which scripts may notice. They are listed first.
+
+### Changed — BIND parity (scripts may notice)
+
+- **Usage errors exit 1, as BIND's usage() does.** They exited 2. Help and version still exit 0,
+  no reply 9. Socket and entropy failures on this host now exit 10, BIND's "internal error"
+  (they exited 9).
+- **An unknown `+option` is a usage error**: `dig: invalid option: '+norec'`, exit 1. Through
+  0.5.1 it was accepted in silence, so `+norecurse` still sent RD=1, `+cd` set nothing,
+  `+trace` ran a plain query and a typo like `+shrt` gave full output, all with exit 0.
+  A flag given a value (`+short=1`) is an error too.
+- **`+retry=N` is N retries, so N + 1 tries, as in BIND.** It was N tries. New: `+tries=N`
+  (N tries in all; 0 means 1) and `+time=N` (BIND's spelling of `+timeout`). The default stays 3
+  tries.
+- **`+ignore` stops the TC=1 → TCP fallback; `+notcp` now just means UDP, the default.**
+  Through 0.5.1 `+notcp` did what BIND calls `+ignore`. `+noignore` restores the fallback.
+- **Numbers must be the whole value.** `+timeout=2junk`, `+retry=1e2` and `+bufsize=4k` are
+  usage errors; they parsed as 2, 1 and 4.
+- **`IN` is accepted as a class token**, so `dig example.com IN MX` works (it failed with
+  "unknown record type"). `CH` and `HS` are refused by name. A second type token prints BIND's
+  `;; Warning, extra type option` and the last one wins.
+- **A resolv.conf that names resolvers dig cannot use now FAILS CLOSED** (exit 9, saying why),
+  the same posture as taar 0.6.2. That covers IPv6-only, `0.0.0.0` and garbage entries, and a
+  nameserver line cut off at the 16 KiB read limit. Through 0.5.1 all of these sent the query to
+  8.8.8.8. The warned 8.8.8.8 fallback remains for a missing file or one with no nameserver line.
+- **Error messages name what they are about**, escaped: `dig: bad server '@1.2.3' ...`,
+  `dig: 'b.com' is not a record type, and a query name was already given`.
+
+### Security
+
+- **P1 — a forged TCP reply was printed as the answer.** On the TC=1 fallback the TCP read went
+  straight into the buffer holding the accepted UDP reply. When the TCP reply then failed
+  acceptance (wrong ID, wrong question, QR clear) or was cut short, main printed it anyway,
+  against the UDP length, with exit 0. So a hostile server bypassed every RFC 5452 check. Both
+  transports now receive into private scratch, and `query_commit_reply` copies a reply into
+  place only after it is accepted. Four reviewers found this one independently.
+- **P1 — query names from argv reached the terminal raw.** The banner, the QUESTION line and the
+  illegal-name error wrote them unescaped, so `dig "$untrusted"` could emit `ESC ] 0 ; ... BEL`.
+  Every argv echo now goes through the RFC 1035 §5.1 escaper, at any length.
+- **The TCP exchange has one deadline** for connect, send and both reads. Through 0.5.1 each
+  recv got the full `+timeout` afresh, so a server dripping one byte at a time held
+  `+tcp +timeout=1` open for 41 s measured, and about 91 h in the worst case; the automatic
+  fallback reached it too. It now gives up at `+timeout`.
+- **The opcode is checked**: a reply that is not opcode QUERY is dropped. It was accepted and
+  printed as `opcode: QUERY`.
+- **Each try uses a fresh socket**, and so a fresh source port, as well as a fresh ID
+  (RFC 5452 §9.2). One socket used to serve every try.
+- **SIGPIPE is ignored**, so a TCP peer that resets the connection can no longer kill dig
+  without a message.
+- **CI supply chain**: the cyrius installer is fetched at the pinned tag rather than `main`,
+  `actions/checkout` and `softprops/action-gh-release` are SHA-pinned, and `contents: write`
+  is scoped to the release job instead of the whole workflow.
+
+### Fixed
+
+- **TC=1 with a failed TCP retry exits 9, with a warning on stderr in both modes.** It exited 0,
+  and under `+short` it was silent, so a reply truncated to nothing looked exactly like NODATA.
+  A firewall blocking TCP/53 is enough to reach it. With `+ignore` the prefix is kept, warned
+  about, and the run exits 0. A TC bit on a reply that came over TCP is ignored, as in BIND.
+- **Transport failures say what happened.** A refused port prints
+  `;; communications error to 127.0.0.1#53: connection refused`, a torn TCP stream `end of
+  file`. All of them used to print "connection timed out", after zero seconds. Entropy failure
+  printed "cannot open UDP socket", even for `+tcp`.
+- **A SIGSTOP/SIGCONT no longer ends a try early.** With a receive timeout set, Linux returns
+  EINTR, which ended a 5 s try at 1.5 s. It is retried within the remaining budget, on UDP and
+  TCP.
+- **Error replies without a question section are reported.** A FORMERR or REFUSED with
+  QDCOUNT=0 was dropped, and the run timed out after every try. It is accepted only as that bare
+  shape (RCODE set, no answer, no authority), with a warning.
+- **UDP replies are read whole.** The receive capacity was the ADVERTISED EDNS size (512 under
+  `+noedns`), so the kernel cut a larger datagram and dig blamed the message ("truncated after 2
+  of 4 records", exit 9). It is now 64 KiB, as in BIND.
+- **The "truncated after k of N" warning is entirely on stderr.** Its two numbers went to
+  stdout, so `+short` read `1.2.3.4\n13`.
+- **A malformed record under `+short` leaves no blank line on stdout**, and a TXT record with
+  RDLENGTH 0 counts as malformed (RFC 1035 §3.3.14). It printed a blank line with exit 0.
+- **EDNS edge cases.** Two OPT records make the reply malformed (RFC 6891 §6.1.1); the first
+  used to win silently. An OPT in the reply to a `+noedns` query is ignored (§7) instead of
+  having its extended RCODE folded in. BADVERS through BADCOOKIE print by name instead of
+  `RESERVED16` and up. `+edns` no longer resets a `+bufsize` already given.
+- **resolv.conf straddle.** A file over 16 KiB with a nameserver line crossing the read limit
+  queried a different address (10.0.0.53 became 10.0.0.5). The partial line is now dropped.
+- **A latent test bug that crashed the suite on aarch64.** `test_cli_edns_flags` parsed `ac=2`
+  with `av[1]` uninitialized: zero by luck on x86_64, garbage on aarch64 once the frame layout
+  changed.
+
+### Changed — internals
+
+- **Buffered stdout.** Every stdout byte goes through one 4 KiB buffer, flushed before any
+  stderr write and at exit, so the two streams keep their order. A normal answer is one
+  write(2): `dig example.com` went 27 → 2 syscalls (one is the query), a TXT answer 110 → 2, and
+  `-h` 48 → 1. Unknown-type rdata was one write per byte.
+- **Dead-code elimination on every build** (`[build] dce = true`, as agnosai, goonj and
+  commandress do). x86_64 went 241,056 → 103,032 B and AGNOS 257,904 → 107,608 B. aarch64
+  NOP-fills dead code rather than compacting it, so its file size does not shrink.
+- **`platform_now_us` uses the stdlib's `clock_now_ns`**, replacing the last arch-guarded syscall
+  literal (`clock_gettime` as 113 / 228). `chrono` joins `[deps].stdlib`.
+- **One answer-printing loop instead of two; one rdata name helper instead of seven copies; one
+  case-insensitive compare instead of two.** The TCP frame read is split out (`tcp_read_frame`)
+  so it can be tested. All of these were shown byte-identical in output on 91 fixtures, across
+  stdout, stderr, the combined stream and the exit code.
+- **Stale comments corrected throughout src/**, including two "dig does not parse OPT yet",
+  "/dev/urandom", "no sendto wrapper" and doc blocks sitting above the wrong function. The
+  `output_print_footer` comment now carries the real diagnosis of the 0.4.0 "stack-slot"
+  mystery: it was not a miscompile. The pre-6.6.18 stdlib `fmt_int_buf` always wrote 24 bytes
+  (CYRIUS-2026-0028), overrunning a 16-byte buffer into the next stack slot.
+- **`cyrius.lock` re-pinned.** It kept the commit lines of the four tags superseded at 0.4.2 to
+  0.5.1, and each printed a `note:` on every resolve. It was deleted and re-resolved, so it now
+  holds only cmdit 1.5.1 and taar 0.6.2. File rows and binary are unchanged.
+
+### Tests
+
+| | 0.5.1 | 0.5.2 |
+|---|---|---|
+| Unit assertions | 260 | **400**, on x86_64 and on aarch64 under qemu |
+| Fuzz assertions | 1,560,376 | **3,803,350** |
+| Integration checks | none | **68** |
+| Benchmarks | a no-op | **10** |
+| `cyrius audit` | 5 lint warnings, 11 undocumented fns | fmt, lint and docs clean |
+
+- **`tests/integration/net.sh` is new**: the real binary against a scripted DNS server
+  (`fake_dns.py`) on 127.0.0.1:53, each case in its own `unshare -rnm`. It covers the
+  transport, the TC fallback, reply checks, argv escaping and resolv.conf discovery, the last
+  by bind-mounting crafted files over /etc/resolv.conf. Through 0.5.1 nothing ran `main()` at
+  all, which is how the forged-TCP-reply P1 survived. On the 0.5.1 binary 42 of the 68 checks
+  fail; on 0.5.2 all pass, on x86_64 and on aarch64. CI gains an `integration` job that probes
+  for user namespaces and warns-and-skips without them, as taar's does.
+- **Every repair was mutation-checked**: 43 mutants, all killed. Three survived at first and
+  got sharper tests. The 43 include 14 mutants of pre-existing guards that survived 0.5.1's whole
+  suite, among them NXDOMAIN-with-EDNS printing as NOERROR, OPT lookup with answers present, SOA
+  trailing rdata, and the RFC 3597 fixed-width hex.
+- **Golden renders**: buffered stdout lets tests assert the exact bytes of every rdata arm, the
+  QUESTION line and the footer. The RCODE-name test checks content, not `strlen`; swapping
+  NOERROR and REFUSED survived it before.
+- **The fuzzer runs the EDNS and acceptance paths**, which main runs on every reply. It asserts
+  that the name decoder and walker agree exactly, and that a rejected reply is never committed.
+  A new strategy fuzzes answer-plus-OPT frames.
+- **`tests/dig.bcyr` benchmarks the reply path** stage by stage (name decode 68 ns, a 59-record
+  walk 2.9 µs, rendering 59 answer lines 30 µs). Through 0.5.1 it benchmarked a no-op.
+
 ## [0.5.1] - 2026-11-08
 
 **Toolchain `6.7.9` → `6.7.18`, cmdit `1.4.0` → `1.5.1` and taar `0.6.0` → `0.6.2`: the latest

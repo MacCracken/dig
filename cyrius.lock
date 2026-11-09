@@ -1,8 +1,4 @@
-commit	c74cb7de35d66abd670d362888949f83c385fc95	cmdit	https://github.com/MacCracken/cmdit.git	1.2.6
-commit	bac07a54f99b270cfcc98ef2eaa94f11a2e31cd1	cmdit	https://github.com/MacCracken/cmdit.git	1.4.0
 commit	efffc544d4b3f740194feb2d33563eb0029f6fbd	cmdit	https://github.com/MacCracken/cmdit.git	1.5.1
-commit	74cb83c75d573555c91db3ed0711212d4241bc0b	taar	https://github.com/MacCracken/taar.git	0.5.2
-commit	2c02641ba352f1a2ab997997ce232cc3391d970f	taar	https://github.com/MacCracken/taar.git	0.6.0
 commit	d203629bf3e0aab5a6db09485ac0a0b006ce437e	taar	https://github.com/MacCracken/taar.git	0.6.2
 346716377b00f36e58eb16cf7fe1dd62dd8fe577930d0d0429f822795b35817c  lib/alloc.cyr
 5afd5bb7cba4e49fee331f6a2838f4e01d9781defaf531403f6616f42ac7151b  lib/alloc_agnos.cyr
@@ -16,6 +12,7 @@ commit	d203629bf3e0aab5a6db09485ac0a0b006ce437e	taar	https://github.com/MacCrack
 9583b938d791d35e24c3ca45c44e199a4e58197fbe6b3f32c3d9676908d69d9c  lib/assert.cyr
 23516d97b8eb5ba1c7a1b6e34a89b3b0653f68d858edca8521a7ccce5a06bce5  lib/atomic.cyr
 cd9321d9400401cd8895d1f488d969ea391a1194b327f7a1fa60b99912b73cf2  lib/bench.cyr
+2e2e802085112d781225c517fca853b4adbf29850a96b21b6ff32469f0736516  lib/chrono.cyr
 900a8c421c03b757710d15d05a587f99bb328629b118fefe074423756067a4f4  lib/cmdit.cyr
 217f7e11e89b826b5cb789f1eaef15b7acd00e9810a04a5cfa298f72612aabd3  lib/fmt.cyr
 6077a8c1cc5cec69d0680703986af142d3d1a5bec9674481288615a2c0616d87  lib/fnptr.cyr

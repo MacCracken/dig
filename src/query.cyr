@@ -4,25 +4,38 @@
 # wall-clock query time for the "Query time: N ms" footer.
 #
 # Returns:
-#   QRY_OK     0  — got a response (response in rx buf, length in *resp_len)
-#   QRY_TIMEOUT 1 — exhausted retries with no reply
-#   QRY_BAD    2  — the query could not be BUILT (name unencodable). Not a
+#   QRY_OK      0 — got an acceptable reply (in rx, length in *resp_len)
+#   QRY_TIMEOUT 1 — every try ran out of time without an acceptable reply
+#   QRY_BAD     2 — the query could not be BUILT (name unencodable). Not a
 #                   response condition: main.cyr validates the name up front, so
 #                   this is unreachable in practice and kept only as a backstop.
-#                   Real malformed-response cases have their own messages in
-#                   main.cyr and never come through here.
-#   QRY_SOCKET 3  — couldn't open the socket
+#   QRY_SOCKET  3 — a socket could not be opened or armed (an internal error)
+#   QRY_REFUSED 4 — the server's port refused us (ECONNREFUSED)
+#   QRY_NETERR  5 — another transport failure; the errno is in query_last_err
+#   QRY_ENTROPY 6 — the kernel could not supply entropy for the query ID
 #
-# rx buf: caller provides ≥ DNS_MAX_UDP_PAYLOAD bytes.
-# resp_len: out param (8-byte slot the caller allocs); we store the
-#           response length there on success.
-# query_us: out param (8-byte slot); we store the round-trip latency
-#           in microseconds.
+# Through 0.5.1 the last three all printed "connection timed out", after zero
+# seconds, and entropy failure printed "cannot open UDP socket" even for +tcp.
+#
+# rx buf: caller provides the capacity it passes as rx_cap.
+# resp_len: out param (8-byte slot the caller allocs); written ONLY on QRY_OK.
+# query_us: out param (8-byte slot); the round-trip latency in microseconds.
 
 var QRY_OK      = 0;
 var QRY_TIMEOUT = 1;
 var QRY_BAD     = 2;
 var QRY_SOCKET  = 3;
+var QRY_REFUSED = 4;
+var QRY_NETERR  = 5;
+var QRY_ENTROPY = 6;
+
+# The errno (or TCP_ERR_*) behind the last QRY_NETERR, for main's message.
+var query_last_err = 0;
+
+var DIG_ECONNREFUSED = 0 - 111;
+# -EINTR. With SO_RCVTIMEO set, Linux does not restart an interrupted recv: a
+# SIGSTOP/SIGCONT returns this, and through 0.5.1 it ended the attempt early.
+var DIG_EINTR        = 0 - 4;
 
 var DNS_PORT = 53;
 
@@ -44,54 +57,94 @@ var DNS_PORT = 53;
 # On the Linux arm the connected socket has already dropped off-peer datagrams
 # before any of this runs, and on AGNOS platform_udp_recv does the same check by
 # hand; these four are the layer above that, not a substitute for it.
+#
+# Two more since 0.5.2:
+#   5. the OPCODE must be QUERY (0), the only one dig sends. Through 0.5.1 a
+#      reply with opcode STATUS was accepted and printed as `opcode: QUERY`;
+#   6. QDCOUNT=0 is admitted in exactly ONE shape: an error (RCODE != NOERROR)
+#      carrying no answer and no authority records. A server that cannot parse
+#      a query (FORMERR) may have no question to echo, and through 0.5.1 dig
+#      dropped those replies and reported "connection timed out" after the whole
+#      retry budget; BIND accepts them. The shape carries no records, so there
+#      is nothing in it for §9.1 to protect. Anything else without a question,
+#      and any QDCOUNT > 1, is still dropped.
 fn query_reply_acceptable(rx, n, id, name, qtype): i64 {
     if (n < DNS_HEADER_LEN) { return 0; }
     if (dns_hdr_id(rx) != id) { return 0; }
-    if ((dns_hdr_flags(rx) & DNS_FLAG_QR) == 0) { return 0; }
+    var flags = dns_hdr_flags(rx);
+    if ((flags & DNS_FLAG_QR) == 0) { return 0; }
+    if (((flags >> 11) & 0xF) != 0) { return 0; }
+    if (dns_hdr_qdcount(rx) == 0) {
+        if (dns_hdr_rcode(rx) == DNS_RCODE_NOERROR) { return 0; }
+        if (dns_hdr_ancount(rx) != 0) { return 0; }
+        if (dns_hdr_nscount(rx) != 0) { return 0; }
+        return 1;
+    }
     if (dns_question_matches(rx, n, name, qtype) == 0) { return 0; }
     return 1;
 }
 
-# Build a query for `name`/`qtype`, send it to `server_addr` over UDP-53, and
-# wait for a reply — retrying up to `retry` ATTEMPTS with a `timeout_s` deadline
-# on each. On success, writes the reply into `rx` (capacity `rx_cap` bytes),
-# stores the received length through `resp_len` and the round-trip time in
-# microseconds through `query_us`.
+# Commit an ACCEPTED reply: copy `n` bytes from the receive scratch `src` into
+# the caller's `rx` (capacity `rx_cap`) and store `n` through `resp_len`.
+# Returns 1 when committed, 0 when the reply is not acceptable — and on 0 it
+# writes NOTHING, so `rx` and `*resp_len` keep whatever they held.
 #
-# Returns QRY_OK, or QRY_TIMEOUT (no reply within the budget), QRY_BAD (the
-# query could not be built from this name — not a response condition) or
-# QRY_SOCKET (the transport itself failed, including entropy failure).
+# THAT CONTRACT IS THE POINT (0.5.2). Through 0.5.1 both transports received
+# straight into the caller's `rx`, before the acceptance checks ran. On UDP that
+# was harmless only because main never read `rx` after a failure. On the TC=1
+# fallback it was not: `rx` already held the accepted UDP reply, the TCP read
+# overwrote it, and when that TCP reply was then REJECTED (wrong ID, wrong
+# question, QR clear) or cut short, main printed the rejected bytes as the
+# answer, against the UDP reply's length, with exit 0. A hostile `@server` could
+# answer a different question than the one asked and bypass every check above.
+fn query_commit_reply(src, n, id, name, qtype, rx, rx_cap, resp_len): i64 {
+    if (n > rx_cap) { return 0; }
+    if (query_reply_acceptable(src, n, id, name, qtype) == 0) { return 0; }
+    memcpy(rx, src, n);
+    store64(resp_len, n);
+    return 1;
+}
+
+# Build a query for `name`/`qtype`, send it to `server_addr` over UDP-53, and
+# wait for a reply — up to `tries` ATTEMPTS with a `timeout_s` deadline on each.
+# On success, writes the reply into `rx` (capacity `rx_cap` bytes), stores the
+# received length through `resp_len` and the round-trip time in microseconds
+# through `query_us`.
+#
+# Returns QRY_OK, or one of the failure codes in the header. When every attempt
+# fails, the LAST attempt's reason is what is reported: a refusal, another
+# transport errno (QRY_NETERR, errno in query_last_err), or a plain timeout.
 #
 # `*resp_len` is the authoritative length for every downstream parse — pass it,
 # not `rx_cap`, to `dns_parse_rr` and friends, or a short reply will be parsed
 # against stale buffer contents.
-fn query_send_recv(server_addr, name, qtype, timeout_s, retry, rx, rx_cap, resp_len, query_us, edns, do_bit): i64 {
-    var fd = platform_udp_open();
-    if (fd < 0) { return QRY_SOCKET; }
-
-    # An unchecked failure here means an unbounded recv — the process would hang
-    # with no way out but a signal. Treat it as a transport failure.
-    if (platform_set_recv_timeout_ms(fd, timeout_s * 1000) < 0) {
-        platform_close(fd);
-        return QRY_SOCKET;
-    }
-
+fn query_send_recv(server_addr, name, qtype, timeout_s, tries, rx, rx_cap, resp_len, query_us, edns, do_bit): i64 {
     var tx = alloc(DNS_MAX_UDP_PAYLOAD);
-    var tries = 0;
-    if (retry < 1) { retry = 1; }
+    # Datagrams land here, never in `rx`: see query_commit_reply.
+    var urx = alloc(rx_cap);
+    var tried = 0;
+    var last = 0;          # why the last attempt ended: 0 timeout, else an errno
+    if (tries < 1) { tries = 1; }
 
-    while (tries < retry) {
-        tries = tries + 1;
+    while (tried < tries) {
+        tried = tried + 1;
+
+        # A FRESH socket, and so a fresh ephemeral source port, per attempt, as
+        # well as a fresh ID (RFC 5452 §9.2). Through 0.5.1 one socket served
+        # every try, so a retry changed only the 16-bit ID and an off-path
+        # attacker who had learned the port kept it. BIND opens one per try too.
+        var fd = platform_udp_open();
+        if (fd < 0) { return QRY_SOCKET; }
 
         # A FRESH query ID per attempt (RFC 5452 §9). Reusing one ID across
         # retries would hand an off-path attacker a second and third guess at
-        # the same 16 bits on the same ephemeral port.
+        # the same 16 bits.
         var id = platform_random_u16();
         # Entropy failure is fatal, never fall back to a guessable ID: a
         # predictable query ID is the whole cache-poisoning problem.
         if (id < 0) {
             platform_close(fd);
-            return QRY_SOCKET;
+            return QRY_ENTROPY;
         }
 
         var tx_len = dns_build_query(tx, id, name, qtype, edns, do_bit);
@@ -102,9 +155,13 @@ fn query_send_recv(server_addr, name, qtype, timeout_s, retry, rx, rx_cap, resp_
         }
 
         var t0 = platform_now_us();
-        if (platform_udp_send_to(fd, server_addr, DNS_PORT, tx, tx_len) < 0) {
+        var sent = platform_udp_send_to(fd, server_addr, DNS_PORT, tx, tx_len);
+        if (sent < 0) {
+            last = sent;
+            platform_close(fd);
             continue;
         }
+        last = 0;
 
         # Keep reading until this attempt's deadline, rather than treating one
         # unacceptable datagram as a failed attempt. Through 0.3.6 a rejected
@@ -127,25 +184,43 @@ fn query_send_recv(server_addr, name, qtype, timeout_s, retry, rx, rx_cap, resp_
             # only a positive MICROsecond remainder, so this division can floor
             # to 0, and platform_set_recv_timeout_ms clamps 0 up to 1ms — which
             # would spin here rather than exit.
+            #
+            # An unchecked arming failure would mean an unbounded recv, so it is
+            # a socket failure, not a soft one.
             var left_ms = (deadline - platform_now_us()) / 1000;
             if (left_ms < 1) { break; }
-            if (platform_set_recv_timeout_ms(fd, left_ms) < 0) { break; }
-            var n = platform_udp_recv(fd, rx, rx_cap);
+            if (platform_set_recv_timeout_ms(fd, left_ms) < 0) {
+                platform_close(fd);
+                return QRY_SOCKET;
+            }
+            var n = platform_udp_recv(fd, urx, rx_cap);
             # Deadline expired inside the kernel — this attempt is over.
             if (n == PLATFORM_ERR_TIMEOUT) { break; }
-            # Any other transport error ends the attempt too.
-            if (n < 0) { break; }
-            if (query_reply_acceptable(rx, n, id, name, qtype) == 0) { continue; }
+            # Interrupted (stop/continue): re-arm to what is left and go on.
+            if (n == DIG_EINTR) { continue; }
+            # Any other transport error ends the attempt, and is remembered so
+            # the user hears "connection refused" rather than "timed out".
+            if (n < 0) { last = n; break; }
+            if (query_commit_reply(urx, n, id, name, qtype, rx, rx_cap, resp_len) == 0) { continue; }
 
-            store64(resp_len, n);
             store64(query_us, platform_now_us() - t0);
             platform_close(fd);
             return QRY_OK;
         }
+        platform_close(fd);
     }
 
-    platform_close(fd);
-    return QRY_TIMEOUT;
+    return query_fail_code(last);
+}
+
+# Map why the last attempt failed (0 for a timeout, else a negative errno or
+# TCP_ERR_*) to a QRY_* code, recording the errno for main's message.
+fn query_fail_code(err): i64 {
+    query_last_err = err;
+    if (err == 0) { return QRY_TIMEOUT; }
+    if (err == PLATFORM_ERR_TIMEOUT) { return QRY_TIMEOUT; }
+    if (err == DIG_ECONNREFUSED) { return QRY_REFUSED; }
+    return QRY_NETERR;
 }
 
 # Ask over TCP-53 instead of UDP. Same contract as query_send_recv, minus the
@@ -163,20 +238,25 @@ fn query_send_recv(server_addr, name, qtype, timeout_s, retry, rx, rx_cap, resp_
 # home; tcp.cyr owns framing and sockets, this owns "is this our answer".
 fn query_send_recv_tcp(server_addr, name, qtype, timeout_s, rx, rx_cap, resp_len, query_us, edns, do_bit): i64 {
     var id = platform_random_u16();
-    if (id < 0) { return QRY_SOCKET; }
+    if (id < 0) { return QRY_ENTROPY; }
 
     var tx = alloc(DNS_MAX_UDP_PAYLOAD);
     var tx_len = dns_build_query(tx, id, name, qtype, edns, do_bit);
     if (tx_len == 0) { return QRY_BAD; }
 
+    # The stream is read into private scratch and committed only once accepted.
+    # On the TC=1 fallback `rx` still holds the accepted UDP reply main falls
+    # back to printing, so this path must not touch it unless it succeeds.
+    var trx = alloc(rx_cap);
     var t0 = platform_now_us();
-    var n = tcp_query(server_addr, tx, tx_len, rx, rx_cap, timeout_s);
-    if (n < 0) { return QRY_TIMEOUT; }
+    var n = tcp_query(server_addr, tx, tx_len, trx, rx_cap, timeout_s);
+    if (n < 0) { return query_fail_code(n); }
     var t1 = platform_now_us();
 
-    if (query_reply_acceptable(rx, n, id, name, qtype) == 0) { return QRY_TIMEOUT; }
+    # A reply that arrived but is not ours is reported as no reply, as on UDP:
+    # BIND keeps waiting past an ID mismatch, and here the stream is spent.
+    if (query_commit_reply(trx, n, id, name, qtype, rx, rx_cap, resp_len) == 0) { return QRY_TIMEOUT; }
 
-    store64(resp_len, n);
     store64(query_us, t1 - t0);
     return QRY_OK;
 }

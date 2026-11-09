@@ -16,7 +16,7 @@
 #      lands". It has landed, and the answer is: adopt taar for the NEW
 #      transport, leave the hardened UDP arm where it is. Migrating UDP too
 #      would mean re-verifying the AGNOS UDP arm, which is exactly what is
-#      deferred.
+#      deferred (roadmap.md § AGNOS-arm review, PARKED).
 #   3. taar's TCP recv already distinguishes a deadline expiry from a clean
 #      close on both arms — a distinction taar 0.5.0 spent a release getting
 #      right, and one this file depends on to tell a stalled peer from a
@@ -28,9 +28,41 @@
 # dig's own — it is ~40 lines and the alternative is bending taar's API to a
 # shape only dig wants.
 
-# Spin bound for the send loop. A peer that accepts zero bytes forever would
-# otherwise hang us; a peer making genuine progress never approaches this.
-var TCP_MAX_SPINS = 1024;
+# ONE DEADLINE FOR THE WHOLE EXCHANGE (0.5.2). Through 0.5.1 the socket timeout
+# was armed once, to the whole `+timeout`, and every connect/send/recv got the
+# full budget again. That bounds when each read may START, never when the reply
+# must END, which is the UDP defect 0.3.8 fixed, back in the newer transport:
+# a peer dripping one byte just inside each timeout held `+tcp +timeout=1` open
+# for 41 s measured, and up to ~65,537 reads x the timeout in principle (about
+# 91 hours at the default 5 s). The automatic TC=1 fallback reached it too.
+#
+# Now every operation first re-arms the socket to what is LEFT before one
+# absolute deadline (`_tcp_arm`). taar bounds its own DNS path by a read count
+# because its consumers had no monotonic clock; dig does, so it bounds time.
+
+var TCP_EINPROGRESS = 0 - 115;    # how a connect bounded by SO_SNDTIMEO times out
+# Failures that are not kernel errnos. Negative, so `< 0` still means failure,
+# and far from the errno range so they cannot collide with one.
+var TCP_ERR_CLOSED  = 0 - 1001;   # the peer closed mid-message
+var TCP_ERR_FRAME   = 0 - 1002;   # a length prefix of 0, or larger than the buffer
+
+# A send that accepts 0 bytes is "no progress yet". Linux never does it on a
+# blocking socket; AGNOS sock_send#48 does, after ~8 s without ACK progress.
+# One retry, then give up — taar 0.6.2's cap, for the same reason.
+var TCP_MAX_ZERO_SENDS = 1;
+
+# Arm the socket's connect/send/recv timeout to the time left before
+# `deadline_us` (a platform_now_us() value). Returns 0, or PLATFORM_ERR_TIMEOUT
+# when the deadline has passed. A setsockopt failure is reported the same way:
+# an unarmed socket would block without bound.
+#
+# `< 1` ms, not `< 0`: taar reads a timeout of 0 as "no deadline at all".
+fn _tcp_arm(fd, deadline_us): i64 {
+    var left_ms = (deadline_us - platform_now_us()) / 1000;
+    if (left_ms < 1) { return PLATFORM_ERR_TIMEOUT; }
+    if (taar_tcp_set_timeout_ms(fd, left_ms) < 0) { return PLATFORM_ERR_TIMEOUT; }
+    return 0;
+}
 
 # Frame a query for the stream: RFC 1035 §4.2.2 prefixes every TCP DNS message
 # with its length as a big-endian u16. Writes `qlen` + 2 bytes into `out` and
@@ -46,80 +78,94 @@ fn tcp_frame(qbuf, qlen, out): i64 {
     return qlen + 2;
 }
 
-# Write all `len` bytes. TCP is a stream: a single send may accept only part of
-# the buffer, so this loops. Returns 0, or a negative errno.
-fn tcp_send_all(fd, buf, len): i64 {
+# Write all `len` bytes before `deadline_us`. TCP is a stream: a single send may
+# accept only part of the buffer, so this loops. Returns 0, or a negative value:
+# PLATFORM_ERR_TIMEOUT when the deadline passes, otherwise the kernel's errno.
+fn tcp_send_all(fd, buf, len, deadline_us): i64 {
     var sent = 0;
-    var spins = 0;
+    var zero = 0;
     while (sent < len) {
+        var a = _tcp_arm(fd, deadline_us);
+        if (a < 0) { return a; }
         var n = taar_tcp_send(fd, buf + sent, len - sent);
+        # A signal interrupted the call; the deadline still bounds the retry.
+        if (n == DIG_EINTR) { continue; }
         if (n < 0) { return n; }
         if (n == 0) {
-            spins = spins + 1;
-            if (spins > TCP_MAX_SPINS) { return 0 - 1; }
+            zero = zero + 1;
+            if (zero > TCP_MAX_ZERO_SENDS) { return PLATFORM_ERR_TIMEOUT; }
         } else {
-            spins = 0;
             sent = sent + n;
         }
     }
     return 0;
 }
 
-# Read exactly `want` bytes into `buf`. Returns the count, or a negative errno.
-# Terminates unconditionally: every pass either advances `got` or returns.
-fn tcp_read_all(fd, buf, want): i64 {
+# Read exactly `want` bytes into `buf` before `deadline_us`. Returns `want`, or
+# a negative value: PLATFORM_ERR_TIMEOUT when the deadline passes, TCP_ERR_CLOSED
+# when the peer closes first, otherwise the kernel's errno.
+#
+# A clean close (recv 0) mid-message means the peer gave up on us: a short read,
+# not a finished response. taar tells that apart from a timeout on both arms,
+# which is what lets this loop tell "stalled" from "closed".
+fn tcp_read_all(fd, buf, want, deadline_us): i64 {
     var got = 0;
     while (got < want) {
+        var a = _tcp_arm(fd, deadline_us);
+        if (a < 0) { return a; }
         var n = taar_tcp_recv(fd, buf + got, want - got);
-        # 0 is a clean close, which mid-message means the peer gave up on us —
-        # a short read, not a finished response. Negative is a timeout or error.
-        # taar distinguishes these on both arms; that is the whole reason this
-        # loop can tell "done" from "stalled".
-        if (n <= 0) { return n; }
+        if (n == DIG_EINTR) { continue; }
+        if (n == 0) { return TCP_ERR_CLOSED; }
+        if (n < 0) { return n; }
         got = got + n;
     }
     return got;
 }
 
-# Ask `server_addr` over TCP-53. Returns the response length in `rbuf`, or a
-# negative value on any failure.
+# Ask `server_addr` over TCP-53, all of it (connect, send, both reads) inside
+# `timeout_s`. Returns the response length in `rbuf`, or a negative value:
+# PLATFORM_ERR_TIMEOUT, TCP_ERR_CLOSED, TCP_ERR_FRAME, or the kernel's errno
+# (-ECONNREFUSED and friends) so the caller can say what went wrong.
 #
 # The declared response length is checked against the caller's buffer and
 # REFUSED outright if it does not fit, rather than truncated: a truncated DNS
 # message parses as a valid shorter one, so silently accepting it would hand the
 # record walker a message the responder never sent.
 fn tcp_query(server_addr, qbuf, qlen, rbuf, rmax, timeout_s): i64 {
+    var deadline = platform_now_us() + timeout_s * 1000000;
     var fd = taar_tcp_open();
     if (fd < 0) { return fd; }
-    if (taar_tcp_set_timeout_ms(fd, timeout_s * 1000) < 0) {
+    var a = _tcp_arm(fd, deadline);
+    if (a < 0) { taar_sock_close(fd); return a; }
+    var c = taar_tcp_connect(fd, server_addr, DNS_PORT);
+    if (c < 0) {
         taar_sock_close(fd);
-        return 0 - 1;
-    }
-    if (taar_tcp_connect(fd, server_addr, DNS_PORT) < 0) {
-        taar_sock_close(fd);
-        return 0 - 1;
+        if (c == TCP_EINPROGRESS) { return PLATFORM_ERR_TIMEOUT; }
+        return c;
     }
 
     var framed = alloc(qlen + 2);
     var flen = tcp_frame(qbuf, qlen, framed);
-    if (tcp_send_all(fd, framed, flen) < 0) {
-        taar_sock_close(fd);
-        return 0 - 1;
-    }
+    var s = tcp_send_all(fd, framed, flen, deadline);
+    if (s < 0) { taar_sock_close(fd); return s; }
 
-    var lenbuf[2];
-    if (tcp_read_all(fd, &lenbuf, 2) != 2) {
-        taar_sock_close(fd);
-        return 0 - 1;
-    }
-    var rlen = (load8(&lenbuf) << 8) | load8(&lenbuf + 1);
-    if (rlen == 0) { taar_sock_close(fd); return 0 - 1; }
-    if (rlen > rmax) { taar_sock_close(fd); return 0 - 1; }
-
-    if (tcp_read_all(fd, rbuf, rlen) != rlen) {
-        taar_sock_close(fd);
-        return 0 - 1;
-    }
+    var r = tcp_read_frame(fd, rbuf, rmax, deadline);
     taar_sock_close(fd);
+    return r;
+}
+
+# Read one length-prefixed DNS message (RFC 1035 §4.2.2) from `fd` into `rbuf`
+# (capacity `rmax`) before `deadline_us`. Returns its length, TCP_ERR_FRAME for
+# a length of 0 or one larger than `rmax`, or tcp_read_all's failure. Split out
+# of tcp_query (0.5.2) so the frame checks can be tested on a socketpair.
+fn tcp_read_frame(fd, rbuf, rmax, deadline_us): i64 {
+    var lenbuf[2];
+    var r = tcp_read_all(fd, &lenbuf, 2, deadline_us);
+    if (r < 0) { return r; }
+    var rlen = (load8(&lenbuf) << 8) | load8(&lenbuf + 1);
+    if (rlen == 0) { return TCP_ERR_FRAME; }
+    if (rlen > rmax) { return TCP_ERR_FRAME; }
+    r = tcp_read_all(fd, rbuf, rlen, deadline_us);
+    if (r < 0) { return r; }
     return rlen;
 }

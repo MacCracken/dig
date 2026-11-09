@@ -20,14 +20,15 @@ $ dig +short example.com AAAA
 ```
 
 **Planned, not implemented**: `+trace` (manual recursion — root → TLD → authoritative,
-printing each step) is a 0.4.x backlog item. `src/cli.cyr` does not recognize the flag;
-it is soft-accepted and ignored, so `dig +trace google.com` today performs an ordinary
-query. See [`docs/development/roadmap.md`](docs/development/roadmap.md) § 0.4.x.
+printing each step) is a 0.4.x backlog item. Like every option dig does not implement, it is
+refused (`dig: invalid option: '+trace'`, exit 1, as BIND does for an unknown option) rather
+than quietly ignored, which is what it was through 0.5.1. See
+[`docs/development/roadmap.md`](docs/development/roadmap.md) § 0.4.x.
 
 Same shape as BIND's `dig` but Cyrius-native end to end:
 
-- **Per-backend sovereignty.** The Linux backend (`src/platform_linux.cyr`) uses POSIX `socket()` / `sendto` / `recvfrom` pragmatically — same posture as `yo`. The AGNOS backend (`src/platform_agnos.cyr`) uses the sovereign `udp_bind` / `udp_send` / `udp_recv` / `udp_unbind` kernel primitives with no POSIX. The v1.0 gate enforces no-POSIX **on the AGNOS backend only**. Per [[project_agnos_kernel_growth_rules]] the kernel grows what `dig` actually needs, not POSIX emulation.
-- No `libc`, no `libresolv`, no `libbind`. RFC 1035 + RFC 3596 (AAAA) + RFC 2782 (SRV) all parsed in Cyrius. DNSSEC (RFC 4034) is **not** parsed or validated: `+dnssec` is accepted with no effect, and RRSIG / DNSKEY / DS / NSEC are recognized as type mnemonics only. The validation ladder is 0.4.x.
+- **Per-backend sovereignty.** The Linux backend (`src/platform_linux.cyr`) uses POSIX `socket()` / `connect` / `write` / `recvfrom` pragmatically — same posture as `yo`. The AGNOS backend (`src/platform_agnos.cyr`) uses the sovereign `udp_bind` / `udp_send` / `udp_recv` / `udp_unbind` kernel primitives with no POSIX. The v1.0 gate enforces no-POSIX **on the AGNOS backend only**. Per [[project_agnos_kernel_growth_rules]] the kernel grows what `dig` actually needs, not POSIX emulation.
+- No `libc`, no `libresolv`, no `libbind`. RFC 1035 + RFC 3596 (AAAA) + RFC 2782 (SRV) all parsed in Cyrius. DNSSEC (RFC 4034) is **not** validated: `+dnssec` sets the DO bit and dig prints whatever RRSIG / DNSKEY / DS / NSEC records come back (as RFC 3597 hex), with no chain check. The validation ladder is 0.4.x.
 - Reads naturally as a verb: `dig example.com`, `dig +short MX gmail.com`, `dig @1.1.1.1 +short example.com AAAA`.
 
 ## Why use it

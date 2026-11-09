@@ -2,9 +2,9 @@
 #
 # Stdlib auto-included via cyrius.cyml.
 #
-# Network paths (UDP send/recv) are exercised by the real binary
-# rather than this suite — too much variance vs. a live resolver to
-# make for reliable CI. Everything else lives here: ipv4 parsing,
+# Network paths, and main() itself, are covered by tests/integration/net.sh,
+# which runs the real binary against a scripted server (0.5.2). Everything else
+# lives here: ipv4 parsing,
 # DNS query construction, name encoding/decoding, name-compression
 # cycle detection (security-critical: malicious responses must NOT
 # lock the parser), resolv.conf line parsing, RR parsing.
@@ -27,6 +27,7 @@ fn test_name_buf_contract() {
     return 0;
 }
 
+# ipv4_parse: accepts dotted quads, rejects every malformed shape.
 fn test_ipv4() {
     test_group("ipv4");
     assert_eq(ipv4_parse("0.0.0.0"),         0x00000000, "ipv4 zeros");
@@ -73,6 +74,7 @@ fn test_dns_query_build() {
     return 0;
 }
 
+# dns_encode_name: label layout and the empty-label refusal.
 fn test_dns_name_encode() {
     test_group("dns_name_encode");
     var b[64];
@@ -240,9 +242,12 @@ fn test_resolv() {
     var a4 = resolv_parse(c4, strlen(c4));
     assert_eq(a4, 0, "no nameserver returns 0");
 
+    # A nameserver line dig cannot use is RESOLV_UNUSABLE, not "none" (0.5.2):
+    # the file chose a resolver, so discovery fails closed instead of quietly
+    # asking 8.8.8.8.
     var c5 = "nameserver 999.999.999.999\n";
     var a5 = resolv_parse(c5, strlen(c5));
-    assert_eq(a5, 0, "bad IPv4 returns 0");
+    assert_eq(a5, RESOLV_UNUSABLE, "bad IPv4 is a named-but-unusable resolver");
 
     return 0;
 }
@@ -283,8 +288,6 @@ fn test_dns_parse_a_response() {
     return 0;
 }
 
-
-
 # === RFC 1035 §5.1 presentation escaping (0.3.7) ===
 #
 # Labels and TXT character-strings are arbitrary octet runs on the wire. Before
@@ -305,6 +308,7 @@ fn _esc_eq(src, n, esc_space, want, want_len, msg) {
     return 0;
 }
 
+# RFC 1035 §5.1 escaping of every byte class, in both contexts.
 fn test_output_escaping() {
     test_group("output_escaping");
     var b[16];
@@ -378,6 +382,7 @@ fn _tq_build(msg, qdcount, qtype, qclass) {
     return 23;
 }
 
+# RFC 5452 §9.1: only the question we asked is accepted.
 fn test_dns_question_match() {
     test_group("dns_question_match");
     var msg[64];
@@ -438,15 +443,17 @@ fn test_cli_bounds() {
     assert_eq(dig_cli_parse_argv(r2, 3, &av), DIG_CLI_OK, "huge +timeout parses");
     assert_eq(dig_cli_timeout_s(r2), DIG_MAX_TIMEOUT_S, "huge +timeout clamps down");
 
+    # +retry=N is N RETRIES, so N + 1 tries (BIND; 0.5.2). Through 0.5.1 it was N
+    # tries, one fewer than BIND for the same flag.
     var r3 = dig_cli_new();
     store64(&av + 8, "+retry=0");
     assert_eq(dig_cli_parse_argv(r3, 3, &av), DIG_CLI_OK, "+retry=0 parses");
-    assert_eq(dig_cli_retry(r3), DIG_MIN_RETRY, "+retry=0 clamps up to 1 attempt");
+    assert_eq(dig_cli_tries(r3), 1, "+retry=0 is one try");
 
     var r4 = dig_cli_new();
     store64(&av + 8, "+retry=100000");
     assert_eq(dig_cli_parse_argv(r4, 3, &av), DIG_CLI_OK, "huge +retry parses");
-    assert_eq(dig_cli_retry(r4), DIG_MAX_RETRY, "huge +retry clamps down");
+    assert_eq(dig_cli_tries(r4), DIG_MAX_TRIES, "huge +retry clamps down");
 
     # In range, values pass through untouched.
     var r5 = dig_cli_new();
@@ -459,15 +466,339 @@ fn test_cli_bounds() {
     # check total.
     var r6 = dig_cli_new();
     store64(&av + 8, "+timeout=99999999999999999999");
-    assert_eq(dig_cli_parse_argv(r6, 3, &av), DIG_CLI_ERR_PARSE, "over-long digit run rejected");
+    assert_eq(dig_cli_parse_argv(r6, 3, &av), DIG_CLI_ERR_BAD_VALUE, "over-long digit run rejected");
 
     var r7 = dig_cli_new();
     store64(&av + 8, "+timeout=abc");
-    assert_eq(dig_cli_parse_argv(r7, 3, &av), DIG_CLI_ERR_PARSE, "non-numeric +timeout rejected");
+    assert_eq(dig_cli_parse_argv(r7, 3, &av), DIG_CLI_ERR_BAD_VALUE, "non-numeric +timeout rejected");
 
     var r8 = dig_cli_new();
     store64(&av + 8, "+timeout");
-    assert_eq(dig_cli_parse_argv(r8, 3, &av), DIG_CLI_ERR_PARSE, "+timeout without = rejected");
+    assert_eq(dig_cli_parse_argv(r8, 3, &av), DIG_CLI_ERR_BAD_VALUE, "+timeout without = rejected");
+    return 0;
+}
+
+# === argv echoes are escaped, at any length (0.5.2, terminal injection) ===
+fn test_argv_echo_escaped() {
+    test_group("argv_echo_escaped");
+    var fds[8];
+    assert_eq(sys_pipe(&fds), 0, "pipe");
+    var rfd = load32(&fds);
+    var wfd = load32(&fds + 4);
+
+    # ESC ] 0 ; BEL CR: what `dig $'x\e]0;PWN\a\r...'` used to write raw.
+    var src[8];
+    store8(&src, 120); store8(&src + 1, 27); store8(&src + 2, 93);
+    store8(&src + 3, 48); store8(&src + 4, 7); store8(&src + 5, 13);
+    _out_esc_fd(wfd, &src, 6, 0);
+    var got[64];
+    var n = sys_read(rfd, &got, 64);
+    assert_eq(n, 15, "6 bytes escape to 15");
+    assert_eq(memeq(&got, "x\\027]0\\007\\013", 15), 1, "control bytes rendered as \\DDD");
+
+    # 300 ESC bytes escape to 1,200: more than the 1,024-byte scratch holds in
+    # one go, so this only comes through whole if the writer chunks.
+    var big = alloc(300);
+    memset(big, 27, 300);
+    _out_esc_fd(wfd, big, 300, 0);
+    # Close the write end first, so a writer that wrote nothing reads as EOF
+    # here rather than blocking the suite on an empty pipe.
+    sys_close(wfd);
+    var out = alloc(1300);
+    var total = 0;
+    while (total < 1300) {
+        var k = sys_read(rfd, out + total, 1300 - total);
+        if (k <= 0) { break; }
+        total = total + k;
+    }
+    assert_eq(total, 1200, "300 ESC bytes escape to 1,200, across chunks");
+    assert_eq(memeq(out + 1196, "\\027", 4), 1, "the last ESC is escaped too");
+    sys_close(rfd);
+    return 0;
+}
+
+# === BIND CLI parity (0.5.2) ===
+# Parse `dig <tok> example.com` and return the result code; `r` gets the registry.
+fn _cp1(r, tok): i64 {
+    var av[32];
+    store64(&av, "dig");
+    store64(&av + 8, tok);
+    store64(&av + 16, "example.com");
+    return dig_cli_parse_argv(r, 3, &av);
+}
+
+# BIND's CLI semantics (0.5.2): options, numbers, tries, classes, types.
+fn test_cli_parity() {
+    test_group("cli_parity");
+
+    # Unknown +options are usage errors, and the token is kept for the message.
+    # Through 0.5.1 they were accepted in silence: `+norecurse` still sent RD=1.
+    var r1 = dig_cli_new();
+    assert_eq(_cp1(r1, "+norecurse"), DIG_CLI_ERR_BAD_OPTION, "+norecurse is not silently ignored");
+    assert_eq(streq(dig_cli_err_token(r1), "+norecurse"), 1, "offending token recorded");
+    var r2 = dig_cli_new();
+    assert_eq(_cp1(r2, "+shrt"), DIG_CLI_ERR_BAD_OPTION, "a typo is an error, not full output");
+    var r3 = dig_cli_new();
+    assert_eq(_cp1(r3, "+short=1"), DIG_CLI_ERR_BAD_VALUE, "a flag given a value is an error");
+
+    # +tries / +retry / +time, BIND's meanings.
+    var r4 = dig_cli_new();
+    assert_eq(_cp1(r4, "+retry=2"), DIG_CLI_OK, "+retry=2 parses");
+    assert_eq(dig_cli_tries(r4), 3, "+retry=2 is three tries");
+    var r5 = dig_cli_new();
+    assert_eq(_cp1(r5, "+tries=5"), DIG_CLI_OK, "+tries=5 parses");
+    assert_eq(dig_cli_tries(r5), 5, "+tries=5 is five tries");
+    var r6 = dig_cli_new();
+    assert_eq(_cp1(r6, "+tries=0"), DIG_CLI_OK, "+tries=0 parses");
+    assert_eq(dig_cli_tries(r6), 1, "+tries=0 is one try, as in BIND");
+    var r7 = dig_cli_new();
+    assert_eq(_cp1(r7, "+time=3"), DIG_CLI_OK, "+time=3 parses");
+    assert_eq(dig_cli_timeout_s(r7), 3, "+time is +timeout");
+    var r8 = dig_cli_new();
+    assert_eq(dig_cli_tries(r8), DIG_DEFAULT_TRIES, "default is BIND's 3 tries");
+
+    # Numbers must be the WHOLE value. Through 0.5.1 parsing stopped at the first
+    # non-digit: +timeout=2junk was 2, +retry=1e2 was 1, +bufsize=4k was 4.
+    var r9 = dig_cli_new();
+    assert_eq(_cp1(r9, "+timeout=2junk"), DIG_CLI_ERR_BAD_VALUE, "trailing junk rejected");
+    var r10 = dig_cli_new();
+    assert_eq(_cp1(r10, "+retry=1e2"), DIG_CLI_ERR_BAD_VALUE, "exponent form rejected");
+    var r11 = dig_cli_new();
+    assert_eq(_cp1(r11, "+bufsize=4k"), DIG_CLI_ERR_BAD_VALUE, "unit suffix rejected");
+    var r12 = dig_cli_new();
+    assert_eq(_cp1(r12, "+timeout=-5"), DIG_CLI_ERR_BAD_VALUE, "negative rejected");
+    assert_eq(_dig_parse_uint("0042"), 42, "leading zeros are fine");
+    assert_eq(_dig_parse_uint(""), 0 - 1, "empty is not a number");
+
+    # +edns enables EDNS without discarding a size already chosen.
+    var av[48];
+    store64(&av, "dig");
+    store64(&av + 8, "+bufsize=4096");
+    store64(&av + 16, "+edns");
+    store64(&av + 24, "example.com");
+    var r13 = dig_cli_new();
+    assert_eq(dig_cli_parse_argv(r13, 4, &av), DIG_CLI_OK, "+bufsize then +edns parses");
+    assert_eq(dig_cli_bufsize(r13), 4096, "+edns keeps the chosen size");
+    store64(&av + 8, "+noedns");
+    var r14 = dig_cli_new();
+    assert_eq(dig_cli_parse_argv(r14, 4, &av), DIG_CLI_OK, "+noedns then +edns parses");
+    assert_eq(dig_cli_bufsize(r14), DNS_EDNS_PAYLOAD, "+edns after +noedns restores the default");
+
+    # Class tokens. `dig example.com IN MX` is everyday usage.
+    store64(&av + 8, "example.com");
+    store64(&av + 16, "IN");
+    store64(&av + 24, "MX");
+    var r15 = dig_cli_new();
+    assert_eq(dig_cli_parse_argv(r15, 4, &av), DIG_CLI_OK, "IN accepted as a class");
+    assert_eq(dig_cli_qtype(r15), DNS_TYPE_MX, "type after IN still read");
+    assert_eq(streq(dig_cli_name(r15), "example.com"), 1, "IN is not taken as the name");
+    store64(&av + 16, "CH");
+    var r16 = dig_cli_new();
+    assert_eq(dig_cli_parse_argv(r16, 4, &av), DIG_CLI_ERR_BAD_CLASS, "CH is refused, not queried as IN");
+    assert_eq(streq(dig_cli_err_token(r16), "CH"), 1, "class token recorded");
+
+    # A second type: the last one wins (BIND warns on stderr).
+    store64(&av + 16, "A");
+    store64(&av + 24, "TXT");
+    var r17 = dig_cli_new();
+    assert_eq(dig_cli_parse_argv(r17, 4, &av), DIG_CLI_OK, "two types parse");
+    assert_eq(dig_cli_qtype(r17), DNS_TYPE_TXT, "the last type wins");
+
+    # Tokens recorded for the other errors too.
+    var r18 = dig_cli_new();
+    assert_eq(_cp1(r18, "@1.2.3"), DIG_CLI_ERR_BAD_SERVER, "bad server");
+    assert_eq(streq(dig_cli_err_token(r18), "@1.2.3"), 1, "bad server token recorded");
+    store64(&av + 16, "b.example");
+    var r19 = dig_cli_new();
+    assert_eq(dig_cli_parse_argv(r19, 3, &av), DIG_CLI_ERR_BAD_TYPE, "second name refused");
+    assert_eq(streq(dig_cli_err_token(r19), "b.example"), 1, "second name recorded");
+
+    # One compare helper, length-exact and case-insensitive.
+    assert_eq(_dig_ieq("TcP", 3, "tcp"), 1, "ieq folds case");
+    assert_eq(_dig_ieq("tcpx", 4, "tcp"), 0, "ieq is length-exact");
+    assert_eq(_dig_ieq("tc", 2, "tcp"), 0, "ieq rejects a prefix");
+    return 0;
+}
+
+# === 0.5.2 audit: guards that survived mutation, and golden renders ===
+#
+# The refactor review mutated guards one at a time; each block below is for one
+# that survived BOTH this suite and the fuzz harness. Render checks read the
+# exact bytes out of the stdout buffer (output.cyr, buffered since 0.5.2), so
+# they pin what is printed, not just a return code.
+
+# Hex digit value; `_hx` turns a hex string (spaces ignored) into bytes.
+fn _hxv(c): i64 {
+    if (c >= 97) { return c - 87; }
+    if (c >= 65) { return c - 55; }
+    return c - 48;
+}
+fn _hx(dst, h): i64 {
+    var i = 0;
+    var o = 0;
+    while (load8(h + i) != 0) {
+        var c = load8(h + i);
+        if (c == 32) { i = i + 1; continue; }
+        store8(dst + o, _hxv(c) * 16 + _hxv(load8(h + i + 1)));
+        o = o + 1;
+        i = i + 2;
+    }
+    return o;
+}
+
+# Drop whatever stdout holds; `_cap_is` asserts what was printed since.
+fn _cap_reset(): i64 { _out_n = 0; return 0; }
+fn _cap_is(want, msg): i64 {
+    var n = strlen(want);
+    var ok = 0;
+    if (_out_n == n) { if (memeq(_out_b, want, n) == 1) { ok = 1; } }
+    assert_eq(ok, 1, msg);
+    _out_n = 0;
+    return 0;
+}
+
+# A reply to "a.com A" whose one answer has owner `a.com` (a pointer to the
+# question), type `rtype`, class `rclass`, ttl 60, and the rdata in `rdhex`.
+fn _rr_msg(msg, rtype, rclass, rdhex): i64 {
+    _tq_build(msg, 1, DNS_TYPE_A, DNS_CLASS_IN);
+    store8(msg + 2, 0x81); store8(msg + 3, 0x80);
+    store8(msg + 7, 1);
+    store8(msg + 23, 0xC0); store8(msg + 24, 12);
+    store8(msg + 25, (rtype >> 8) & 0xFF);  store8(msg + 26, rtype & 0xFF);
+    store8(msg + 27, (rclass >> 8) & 0xFF); store8(msg + 28, rclass & 0xFF);
+    store8(msg + 29, 0); store8(msg + 30, 0); store8(msg + 31, 0); store8(msg + 32, 60);
+    var rl = _hx(msg + 35, rdhex);
+    store8(msg + 33, (rl >> 8) & 0xFF); store8(msg + 34, rl & 0xFF);
+    return 35 + rl;
+}
+
+# Render the answer line of an _rr_msg and compare it byte for byte.
+fn _ans_is(rtype, rclass, rdhex, want, msg): i64 {
+    var m[256];
+    memset(&m, 0, 256);
+    var n = _rr_msg(&m, rtype, rclass, rdhex);
+    var rr = alloc(DNS_RR_SIZE);
+    var nx = dns_parse_rr(&m, n, 23, rr);
+    _cap_reset();
+    output_print_answer_rr(&m, n, rr, nx);
+    _cap_is(want, msg);
+    return 0;
+}
+
+# Guards that survived mutation at the 0.5.2 audit, and golden renders.
+fn test_audit_gaps() {
+    test_group("audit_gaps");
+
+    # Golden answer lines, one per rdata arm.
+    _ans_is(DNS_TYPE_A, 1, "01020304", "a.com.\t60\tIN\tA\t1.2.3.4\n", "A renders");
+    _ans_is(DNS_TYPE_MX, 1, "000a 046d61696c c00c", "a.com.\t60\tIN\tMX\t10 mail.a.com.\n", "MX renders");
+    _ans_is(DNS_TYPE_NS, 1, "026e73 c00c", "a.com.\t60\tIN\tNS\tns.a.com.\n", "NS renders");
+    _ans_is(DNS_TYPE_CNAME, 1, "03777777 c00c", "a.com.\t60\tIN\tCNAME\twww.a.com.\n", "CNAME renders");
+    _ans_is(DNS_TYPE_PTR, 1, "0170 c00c", "a.com.\t60\tIN\tPTR\tp.a.com.\n", "PTR renders");
+    _ans_is(DNS_TYPE_SOA, 1, "026e73c00c 0561646d696ec00c 00000001 00000002 00000003 00000004 00000005",
+      "a.com.\t60\tIN\tSOA\tns.a.com. admin.a.com. 1 2 3 4 5\n", "SOA renders");
+    _ans_is(DNS_TYPE_SRV, 1, "0001 0002 0035 03737276 c00c", "a.com.\t60\tIN\tSRV\t1 2 53 srv.a.com.\n", "SRV renders");
+    _ans_is(DNS_TYPE_TXT, 1, "026162 0163", "a.com.\t60\tIN\tTXT\t\"ab\" \"c\"\n", "multi-string TXT renders");
+    # RFC 3597, fixed-width hex: {00 01 0a} must not render like {00 1a}.
+    _ans_is(65280, 1, "00010a", "a.com.\t60\tIN\tTYPE65280\t\\# 3 00010a\n",
+      "unknown type is \\# len + 2 hex digits a byte");
+    # The reply's own class, not a literal IN.
+    _ans_is(DNS_TYPE_A, 3, "01020304", "a.com.\t60\tCH\tA\t1.2.3.4\n", "CH class printed as CH");
+
+    # SOA: the five u32s must end the rdata exactly; a trailing byte is malformed.
+    var sm[256];
+    memset(&sm, 0, 256);
+    var soa_long = "026e73c00c 0561646d696ec00c 00000001 00000002 00000003 00000004 00000005 00";
+    var sn = _rr_msg(&sm, DNS_TYPE_SOA, 1, soa_long);
+    var srr = alloc(DNS_RR_SIZE);
+    var snx = dns_parse_rr(&sm, sn, 23, srr);
+    _cap_reset();
+    assert_eq(output_print_rdata(&sm, sn, srr, snx), 0 - 1, "SOA with trailing rdata refused");
+    _cap_is("", "  and nothing printed for it");
+
+    # Question and footer lines.
+    _cap_reset();
+    output_print_question("a.com", DNS_TYPE_MX);
+    _cap_is(";; QUESTION\n;a.com.\t\tIN\tMX\n", "question line");
+    _cap_reset();
+    output_print_footer(1500, 0x08080808, 1);
+    _cap_is(";; Query time: 2 ms · server: 8.8.8.8 · proto: tcp\n", "footer: rounding, server, proto");
+
+    # Decoded length (out_len) is exact: an off-by-one prints `\000` after names.
+    var dm[32];
+    memset(&dm, 0, 32);
+    var dl = _hx(&dm + 12, "076578616d706c6503636f6d00");
+    var dout[DNS_NAME_BUF_LEN];
+    var dnl[8];
+    assert_eq(dns_decode_name(&dm, 12 + dl, 12, &dout, &dnl), 12 + dl, "decode ends after the name");
+    assert_eq(load64(&dnl), 11, "out_len is exactly strlen(\"example.com\")");
+
+    # AAAA `::a.b.c.d` (six leading zero groups).
+    var ab[16];
+    memset(&ab, 0, 16);
+    _aaaa_set(&ab, 6, 0xC0, 0x00); _aaaa_set(&ab, 7, 0x02, 0x01);
+    _aaaa_is(&ab, "::192.0.2.1", "six zero groups then a v4 address render ::a.b.c.d");
+
+    # Encoder edges: the root is one zero byte; a 64-byte last label is refused.
+    var eb[300];
+    assert_eq(dns_encode_name(".", &eb), 1, "root encodes to one byte");
+    assert_eq(load8(&eb), 0, "  which is the zero label");
+    assert_eq(dns_encode_name(".example.com", &eb), 0, "a leading dot is not the root");
+    var l63 = alloc(80); memset(l63, 98, 70);
+    store8(l63, 97); store8(l63 + 1, 46); store8(l63 + 65, 0);    # "a." + 63 b's
+    assert_eq(dns_encode_name(l63, &eb) > 0, 1, "a 63-byte last label encodes");
+    store8(l63 + 65, 98); store8(l63 + 66, 0);                    # ... 64 b's
+    assert_eq(dns_encode_name(l63, &eb), 0, "a 64-byte last label is refused");
+
+    # The walker refuses a FORWARD pointer, as the decoder does.
+    var fm[32];
+    memset(&fm, 0, 32);
+    store8(&fm + 12, 0xC0); store8(&fm + 13, 20);
+    store8(&fm + 20, 1); store8(&fm + 21, 97); store8(&fm + 22, 0);
+    assert_eq(dns_skip_name(&fm, 32, 12), 0, "skip_name refuses a forward pointer");
+
+    # An OPT whose owner is not the root is not an OPT (RFC 6891 §6.1.2).
+    var om[128];
+    _edns_ans(&om, 0, 0, 0, 0);
+    store8(&om + 11, 1);
+    store8(&om + 39, 0xC0); store8(&om + 40, 12);               # owner: a pointer
+    store8(&om + 42, 41);                                        # TYPE OPT
+    assert_eq(dns_find_opt(&om, 52), 0, "OPT with a non-root owner is ignored");
+
+    # CLI accessors the suite never read back.
+    var av[32];
+    store64(&av, "dig");
+    store64(&av + 8, "@8.8.4.4");
+    store64(&av + 16, "+short");
+    store64(&av + 24, "example.com");
+    var cr = dig_cli_new();
+    assert_eq(dig_cli_parse_argv(cr, 4, &av), DIG_CLI_OK, "@server +short name parses");
+    assert_eq(dig_cli_server_seen(cr), 1, "@server is recorded as seen");
+    assert_eq(dig_cli_server_addr(cr), 0x08080404, "  with its address");
+    assert_eq(dig_cli_short(cr), 1, "+short is recorded");
+    assert_eq(streq(dig_cli_name(cr), "example.com"), 1, "the name is recorded");
+
+    # TCP frame checks (RFC 1035 §4.2.2) on a socketpair.
+    var fds[8];
+    assert_eq(_tcp_pair(&fds), 0, "socketpair");
+    var fa = load32(&fds);
+    var fb = load32(&fds + 4);
+    var fr[8];
+    var fw[8];
+    store8(&fw, 0); store8(&fw + 1, 3); store8(&fw + 2, 97); store8(&fw + 3, 98); store8(&fw + 4, 99);
+    sys_write(fb, &fw, 5);
+    assert_eq(tcp_read_frame(fa, &fr, 8, platform_now_us() + 1000000), 3, "a 3-byte frame reads 3");
+    assert_eq(memeq(&fr, "abc", 3), 1, "  its bytes");
+    store8(&fw, 0); store8(&fw + 1, 0);
+    sys_write(fb, &fw, 2);
+    assert_eq(tcp_read_frame(fa, &fr, 8, platform_now_us() + 1000000), TCP_ERR_FRAME, "a zero-length frame is refused");
+    store8(&fw, 0); store8(&fw + 1, 9);
+    sys_write(fb, &fw, 2);
+    assert_eq(tcp_read_frame(fa, &fr, 8, platform_now_us() + 1000000), TCP_ERR_FRAME,
+      "a frame larger than the buffer is refused");
+    sys_close(fb);
+    assert_eq(tcp_read_frame(fa, &fr, 8, platform_now_us() + 1000000), TCP_ERR_CLOSED, "no frame before close");
+    sys_close(fa);
     return 0;
 }
 
@@ -502,7 +833,6 @@ fn test_cli_bad_type() {
     assert_eq(dig_cli_qtype(r4), DNS_TYPE_A, "qtype defaults to A");
     return 0;
 }
-
 
 # === Guards that survived deletion before 0.3.8 (E2) ===
 #
@@ -645,11 +975,20 @@ fn test_resolv_038() {
     # A truncated buffer must not yield a DIFFERENT valid address.
     var c5 = "nameserver 10.0.0.53\n";
     assert_eq(resolv_parse(c5, 21), 0x0A000035, "full line parses");
-    # The 4096-byte read cut mid-octet: 10.0.0.53 becomes a perfectly valid
-    # 10.0.0.5 and nothing anywhere reports a problem. This is why the buffer
-    # grew to 16 KiB at 0.3.8 rather than the parser learning to detect it —
-    # the parser CANNOT detect it, the bytes it was handed are well-formed.
-    assert_eq(resolv_parse(c5, 19), 0x0A000005, "mid-octet cut silently yields a different valid address");
+    # A read cut mid-octet: 10.0.0.53 becomes a perfectly valid 10.0.0.5. The
+    # parser CANNOT detect it, the bytes it was handed are well-formed, which is
+    # why resolv_discover (0.5.2) reads one byte past its cap and drops the
+    # partial last line before calling it. tests/integration covers that end.
+    assert_eq(resolv_parse(c5, 19), 0x0A000005, "the parser alone cannot see a mid-octet cut");
+
+    # 0.5.2: "names resolvers, none usable" is distinct from "names none", so
+    # discovery can fail closed on the first and fall back only on the second.
+    assert_eq(resolv_parse("nameserver ::1\n", 15), RESOLV_UNUSABLE, "IPv6-only file is unusable, not empty");
+    assert_eq(resolv_parse("nameserver 0.0.0.0\n", 19), RESOLV_UNUSABLE, "0.0.0.0-only file is unusable");
+    assert_eq(resolv_parse("nameserver fe80::1\nnameserver 9.9.9.9\n", 38), 0x09090909,
+      "an unusable line does not hide a usable one");
+    assert_eq(resolv_parse("search example.com\n", 19), 0, "no nameserver line at all is 0");
+    assert_eq(resolv_parse("nameserver", 10), RESOLV_UNUSABLE, "a bare nameserver keyword names one");
     return 0;
 }
 
@@ -671,9 +1010,77 @@ fn test_reply_acceptable() {
     assert_eq(query_reply_acceptable(&msg, 11, 0x1234, "a.com", DNS_TYPE_A), 0, "runt rejected");
     store8(&msg + 2, 0);                                    # clear QR
     assert_eq(query_reply_acceptable(&msg, n, 0x1234, "a.com", DNS_TYPE_A), 0, "QR-clear rejected");
+
+    # Opcode must be QUERY (0.5.2). STATUS = 2, NOTIFY = 4, UPDATE = 5.
+    store8(&msg + 2, 0x80 | (2 << 3));
+    assert_eq(query_reply_acceptable(&msg, n, 0x1234, "a.com", DNS_TYPE_A), 0, "opcode STATUS rejected");
+    store8(&msg + 2, 0x80 | (5 << 3));
+    assert_eq(query_reply_acceptable(&msg, n, 0x1234, "a.com", DNS_TYPE_A), 0, "opcode UPDATE rejected");
+    store8(&msg + 2, 0x80);
+
+    # QDCOUNT=0 is admitted ONLY as a bare error reply (0.5.2): RCODE set, no
+    # answers, no authority. A FORMERR may have no question to echo.
+    var e[16];
+    memset(&e, 0, 16);
+    store8(&e, 0x12); store8(&e + 1, 0x34);
+    store8(&e + 2, 0x80); store8(&e + 3, 0x01);            # QR, FORMERR
+    assert_eq(query_reply_acceptable(&e, 12, 0x1234, "a.com", DNS_TYPE_A), 1, "question-less FORMERR accepted");
+    store8(&e + 3, 0x05);                                   # REFUSED
+    assert_eq(query_reply_acceptable(&e, 12, 0x1234, "a.com", DNS_TYPE_A), 1, "question-less REFUSED accepted");
+    store8(&e + 3, 0x00);                                   # NOERROR
+    assert_eq(query_reply_acceptable(&e, 12, 0x1234, "a.com", DNS_TYPE_A), 0, "question-less NOERROR rejected");
+    store8(&e + 3, 0x03); store8(&e + 7, 1);                # NXDOMAIN with an answer
+    assert_eq(query_reply_acceptable(&e, 12, 0x1234, "a.com", DNS_TYPE_A), 0,
+      "question-less reply with an answer rejected");
+    store8(&e + 7, 0); store8(&e + 9, 1);                   # ... with authority
+    assert_eq(query_reply_acceptable(&e, 12, 0x1234, "a.com", DNS_TYPE_A), 0,
+      "question-less reply with authority rejected");
+    store8(&e + 9, 0);
+    assert_eq(query_reply_acceptable(&e, 12, 0x9999, "a.com", DNS_TYPE_A), 0, "question-less reply still needs the ID");
     return 0;
 }
 
+# === Reply commit: rx is written only for an ACCEPTED reply (0.5.2, P1) ===
+#
+# Through 0.5.1 the TC=1 TCP fallback read straight into the buffer holding the
+# accepted UDP reply, so a REJECTED TCP reply was printed as the answer.
+fn _rx_all(rx, n, v): i64 {
+    var i = 0;
+    while (i < n) { if (load8(rx + i) != v) { return 0; } i = i + 1; }
+    return 1;
+}
+
+# A reply is committed to rx only once accepted (0.5.2 P1).
+fn test_reply_commit() {
+    test_group("reply_commit");
+    var good[64];
+    var n = _tq_build(&good, 1, DNS_TYPE_A, DNS_CLASS_IN);
+    store8(&good, 0x12); store8(&good + 1, 0x34);
+    store8(&good + 2, 0x80);
+    var rx[64];
+    var rl[8];
+
+    # Rejected: wrong id, wrong question, QR clear, oversize. Each must leave the
+    # previous reply AND its length exactly as they were.
+    memset(&rx, 0xAA, 64); store64(&rl, 7);
+    assert_eq(query_commit_reply(&good, n, 0x9999, "a.com", DNS_TYPE_A, &rx, 64, &rl), 0, "wrong id not committed");
+    assert_eq(query_commit_reply(&good, n, 0x1234, "b.com", DNS_TYPE_A, &rx, 64, &rl), 0,
+      "wrong question not committed");
+    assert_eq(query_commit_reply(&good, n, 0x1234, "a.com", DNS_TYPE_A, &rx, n - 1, &rl), 0,
+      "reply larger than rx not committed");
+    store8(&good + 2, 0);
+    assert_eq(query_commit_reply(&good, n, 0x1234, "a.com", DNS_TYPE_A, &rx, 64, &rl), 0, "QR-clear not committed");
+    store8(&good + 2, 0x80);
+    assert_eq(_rx_all(&rx, 64, 0xAA), 1, "rejected replies left rx untouched");
+    assert_eq(load64(&rl), 7, "rejected replies left resp_len untouched");
+
+    # Accepted: copied, and the length recorded.
+    assert_eq(query_commit_reply(&good, n, 0x1234, "a.com", DNS_TYPE_A, &rx, 64, &rl), 1, "good reply committed");
+    assert_eq(load64(&rl), n, "committed length recorded");
+    assert_eq(memeq(&rx, &good, n), 1, "committed bytes copied");
+    assert_eq(load8(&rx + n), 0xAA, "nothing written past the reply");
+    return 0;
+}
 
 # === AAAA rendering, RFC 5952 (E3) ===
 #
@@ -704,6 +1111,7 @@ fn _aaaa_set(b, i, hi, lo) {
     return 0;
 }
 
+# AAAA rendering per RFC 5952, including the v4-suffix forms.
 fn test_aaaa_rfc5952() {
     test_group("aaaa_rfc5952");
     var b[16];
@@ -769,6 +1177,7 @@ fn _rr_at(msg, off, t, rdlen) {
     return off + 11;
 }
 
+# Every rdata arm refuses malformed rdata before printing any of it.
 fn test_rdata_validation() {
     test_group("rdata_validation");
     var msg[256];
@@ -811,6 +1220,14 @@ fn test_rdata_validation() {
     var nx5 = dns_parse_rr(&msg, 256, 12, rr);
     assert_eq(output_print_rdata(&msg, 256, rr, nx5), 0 - 1, "TXT inner length overrunning rdata refused");
 
+    # A TXT with RDLENGTH 0 has no character-string at all (RFC 1035 §3.3.14
+    # requires one or more). Through 0.5.1 it returned success and `+short`
+    # printed a bare blank line with exit 0.
+    memset(&msg, 0, 256);
+    _rr_at(&msg, 12, DNS_TYPE_TXT, 0);
+    var nx5e = dns_parse_rr(&msg, 256, 12, rr);
+    assert_eq(output_print_rdata(&msg, 256, rr, nx5e), 0 - 1, "TXT with rdlength 0 refused");
+
     # THE A4 CASE. rdlen=0 for a name-bearing type: memory-safe, but the name
     # would be read out of the NEXT record's bytes and printed as this record's
     # authoritative content, returning success.
@@ -838,26 +1255,40 @@ fn test_rdata_validation() {
 # === RCODE and CLASS naming (E3 / A8 / A10) ===
 fn test_rcode_names() {
     test_group("rcode_names");
-    assert_eq(strlen(output_rcode_str(0)), 7, "NOERROR");
-    assert_eq(strlen(output_rcode_str(3)), 8, "NXDOMAIN");
-    assert_eq(strlen(output_rcode_str(5)), 7, "REFUSED");
+    # By CONTENT, not length: through 0.5.1 these asserted strlen only, so
+    # swapping NOERROR and REFUSED (both 7) survived the suite.
+    assert_eq(streq(output_rcode_str(0), "NOERROR"), 1, "NOERROR");
+    assert_eq(streq(output_rcode_str(1), "FORMERR"), 1, "FORMERR");
+    assert_eq(streq(output_rcode_str(2), "SERVFAIL"), 1, "SERVFAIL");
+    assert_eq(streq(output_rcode_str(3), "NXDOMAIN"), 1, "NXDOMAIN");
+    assert_eq(streq(output_rcode_str(4), "NOTIMP"), 1, "NOTIMP");
+    assert_eq(streq(output_rcode_str(5), "REFUSED"), 1, "REFUSED");
     # 6-10 gained mnemonics at 0.3.8; every one of them used to print `RCODE?`.
-    assert_eq(strlen(output_rcode_str(6)),  8, "YXDOMAIN");
-    assert_eq(strlen(output_rcode_str(7)),  7, "YXRRSET");
-    assert_eq(strlen(output_rcode_str(8)),  7, "NXRRSET");
-    assert_eq(strlen(output_rcode_str(9)),  7, "NOTAUTH");
-    assert_eq(strlen(output_rcode_str(10)), 7, "NOTZONE");
+    assert_eq(streq(output_rcode_str(6),  "YXDOMAIN"), 1, "YXDOMAIN");
+    assert_eq(streq(output_rcode_str(7),  "YXRRSET"), 1, "YXRRSET");
+    assert_eq(streq(output_rcode_str(8),  "NXRRSET"), 1, "NXRRSET");
+    assert_eq(streq(output_rcode_str(9),  "NOTAUTH"), 1, "NOTAUTH");
+    assert_eq(streq(output_rcode_str(10), "NOTZONE"), 1, "NOTZONE");
     # 11-15 have no mnemonic; the accessor returns 0 so the printer can format
     # RESERVED<n> rather than discarding the value in a flat "RCODE?".
     assert_eq(output_rcode_str(11), 0, "reserved rcode has no mnemonic");
     assert_eq(output_rcode_str(15), 0, "reserved rcode 15 has no mnemonic");
+    # Extended RCODEs, named since 0.5.2 (printed RESERVED<n> before).
+    assert_eq(streq(output_rcode_str(16), "BADVERS"), 1, "BADVERS");
+    assert_eq(streq(output_rcode_str(17), "BADKEY"), 1, "BADKEY");
+    assert_eq(streq(output_rcode_str(18), "BADTIME"), 1, "BADTIME");
+    assert_eq(streq(output_rcode_str(19), "BADMODE"), 1, "BADMODE");
+    assert_eq(streq(output_rcode_str(20), "BADNAME"), 1, "BADNAME");
+    assert_eq(streq(output_rcode_str(21), "BADALG"), 1, "BADALG");
+    assert_eq(streq(output_rcode_str(22), "BADTRUNC"), 1, "BADTRUNC");
+    assert_eq(streq(output_rcode_str(23), "BADCOOKIE"), 1, "BADCOOKIE");
+    assert_eq(output_rcode_str(24), 0, "unassigned extended rcode has no mnemonic");
     # Types: recognized ones resolve, unknown returns 0 so TYPE<n> can be built.
     assert_eq(strlen(output_type_str(DNS_TYPE_A)), 1, "type A");
     assert_eq(strlen(output_type_str(DNS_TYPE_AAAA)), 4, "type AAAA");
     assert_eq(output_type_str(257), 0, "unknown type has no mnemonic");
     return 0;
 }
-
 
 # === EDNS(0), RFC 6891 (0.4.0) ===
 fn test_edns_query() {
@@ -919,6 +1350,7 @@ fn _edns_resp(msg, ext_rcode, version, payload) {
     return 34;
 }
 
+# OPT parsing: payload, version, DO, and the BADVERS fold.
 fn test_edns_response() {
     test_group("edns_response");
     var msg[128];
@@ -930,7 +1362,7 @@ fn test_edns_response() {
     assert_eq(dns_opt_version(&msg, opt), 0, "responder speaks EDNS 0");
     assert_eq(dns_opt_do(&msg, opt), 0, "DO clear");
     assert_eq(dns_opt_ext_rcode(&msg, opt), 0, "extended rcode 0");
-    assert_eq(dns_full_rcode(&msg, n), 0, "full rcode is NOERROR");
+    assert_eq(dns_full_rcode(&msg, n, 1), 0, "full rcode is NOERROR");
 
     # BADVERS is 16 — and its LOW NIBBLE IS ZERO. Without folding OPT's TTL high
     # byte in, a responder rejecting our EDNS version reads as NOERROR, i.e.
@@ -938,7 +1370,7 @@ fn test_edns_response() {
     # query dig actually sends can provoke, so it is not hypothetical.
     var n2 = _edns_resp(&msg, 1, 0, 512);
     assert_eq(dns_hdr_rcode(&msg), 0, "header nibble alone says NOERROR");
-    assert_eq(dns_full_rcode(&msg, n2), 16, "full rcode is BADVERS");
+    assert_eq(dns_full_rcode(&msg, n2, 1), 16, "full rcode is BADVERS");
 
     # DO echoed back.
     var n3 = _edns_resp(&msg, 0, 0, 1232);
@@ -955,7 +1387,64 @@ fn test_edns_response() {
     store8(&msg + 16, 111); store8(&msg + 17, 109);
     store8(&msg + 18, 0); store8(&msg + 20, 1); store8(&msg + 22, 1);
     assert_eq(dns_find_opt(&msg, 23), 0, "no OPT when arcount is 0");
-    assert_eq(dns_full_rcode(&msg, 23), 0, "full rcode falls back to the header nibble");
+    assert_eq(dns_full_rcode(&msg, 23, 1), 0, "full rcode falls back to the header nibble");
+    return 0;
+}
+
+# A reply to "a.com A" with one A answer, then `nopt` OPT records whose extended
+# RCODE bytes are ext1 / ext2, and the header RCODE nibble `rcode`.
+fn _edns_ans(msg, rcode, nopt, ext1, ext2): i64 {
+    memset(msg, 0, 128);
+    store8(msg + 2, 0x81); store8(msg + 3, 0x80 | rcode);
+    store8(msg + 5, 1);                                 # qdcount 1
+    store8(msg + 7, 1);                                 # ancount 1
+    store8(msg + 11, nopt);                             # arcount
+    store8(msg + 12, 1); store8(msg + 13, 97);
+    store8(msg + 14, 3); store8(msg + 15, 99);
+    store8(msg + 16, 111); store8(msg + 17, 109);
+    store8(msg + 18, 0); store8(msg + 20, 1); store8(msg + 22, 1);
+    # Answer at 23: pointer to the question name, A IN, ttl 60, rdlen 4, 1.2.3.4.
+    store8(msg + 23, 0xC0); store8(msg + 24, 12);
+    store8(msg + 26, 1); store8(msg + 28, 1);
+    store8(msg + 32, 60); store8(msg + 34, 4);
+    store8(msg + 35, 1); store8(msg + 36, 2); store8(msg + 37, 3); store8(msg + 38, 4);
+    var off = 39;
+    var k = 0;
+    while (k < nopt) {
+        store8(msg + off, 0);                           # root owner
+        store8(msg + off + 2, 41);                      # TYPE OPT
+        store8(msg + off + 3, 0x04); store8(msg + off + 4, 0xD0);   # 1232
+        if (k == 0) { store8(msg + off + 5, ext1); } else { store8(msg + off + 5, ext2); }
+        off = off + 11;
+        k = k + 1;
+    }
+    return off;
+}
+
+# === EDNS RCODE policy (0.5.2) ===
+fn test_edns_rcode_policy() {
+    test_group("edns_rcode_policy");
+    var msg[128];
+
+    # OPT behind an ANSWER record. The 0.4.0 tests only had AN=0, so a find_opt
+    # that skipped no answers passed them all.
+    var n = _edns_ans(&msg, 0, 1, 1, 0);
+    assert_eq(dns_find_opt(&msg, n), 39, "OPT found after the answer section");
+    assert_eq(dns_full_rcode(&msg, n, 1), 16, "BADVERS behind an answer");
+
+    # The header nibble is kept: NXDOMAIN with EDNS, the normal case, is 3.
+    n = _edns_ans(&msg, 3, 1, 0, 0);
+    assert_eq(dns_full_rcode(&msg, n, 1), 3, "NXDOMAIN with an OPT stays NXDOMAIN");
+
+    # Two OPTs is a FORMERR (RFC 6891 §6.1.1): no single RCODE to report.
+    n = _edns_ans(&msg, 0, 2, 0, 1);
+    assert_eq(dns_find_opt(&msg, n), DNS_OPT_DUP, "second OPT detected");
+    assert_eq(dns_full_rcode(&msg, n, 1), 0 - 1, "two OPTs make the reply malformed");
+
+    # An OPT in the reply to a query that sent none is not ours to read
+    # (RFC 6891 §7): +noedns must not be told RESERVED16 / BADVERS.
+    n = _edns_ans(&msg, 0, 1, 1, 0);
+    assert_eq(dns_full_rcode(&msg, n, 0), 0, "OPT ignored when we sent no EDNS");
     return 0;
 }
 
@@ -982,11 +1471,74 @@ fn test_tcp_frame() {
     return 0;
 }
 
+# === TCP read/send loops: one deadline for the whole exchange (0.5.2, P2) ===
+#
+# An AF_UNIX stream socketpair stands in for the connection: taar_tcp_recv /
+# taar_tcp_send are read(2) / write(2), and SO_RCVTIMEO / SO_SNDTIMEO work on it.
+# Through 0.5.1 each read got the whole timeout afresh, so a peer that dripped
+# bytes held the query open indefinitely.
+fn _tcp_pair(fds): i64 {
+    # AF_UNIX = 1, SOCK_STREAM = 1. fds receives two 32-bit descriptors.
+    if (sys_socketpair(1, 1, 0, fds) < 0) { return 0 - 1; }
+    return 0;
+}
+
+# TCP read/send loops share one deadline (0.5.2 P2).
+fn test_tcp_loops() {
+    test_group("tcp_loops");
+    var fds[8];
+    assert_eq(_tcp_pair(&fds), 0, "socketpair");
+    var a = load32(&fds);
+    var b = load32(&fds + 4);
+    var buf[16];
+
+    # Exact read: two writes, one read_all of their total.
+    sys_write(b, "abc", 3);
+    sys_write(b, "de", 2);
+    assert_eq(tcp_read_all(a, &buf, 5, platform_now_us() + 1000000), 5, "read_all reads exactly want");
+    assert_eq(memeq(&buf, "abcde", 5), 1, "read_all bytes in order");
+
+    # The deadline bounds the WHOLE read, not each recv: 1 of 2 bytes arrives,
+    # then nothing. Must give up near 150 ms, never wait a fresh timeout.
+    sys_write(b, "x", 1);
+    var t0 = platform_now_us();
+    assert_eq(tcp_read_all(a, &buf, 2, t0 + 150000), PLATFORM_ERR_TIMEOUT, "stalled read times out");
+    var spent = platform_now_us() - t0;
+    assert_eq(spent < 1000000, 1, "stalled read gave up within the deadline");
+    assert_eq(spent >= 100000, 1, "stalled read waited for the deadline, not less");
+
+    # A deadline already in the past fails before touching the socket.
+    sys_write(b, "y", 1);
+    assert_eq(tcp_read_all(a, &buf, 1, platform_now_us() - 1), PLATFORM_ERR_TIMEOUT,
+      "expired deadline refused up front");
+    assert_eq(tcp_read_all(a, &buf, 1, platform_now_us() + 1000000), 1, "the byte was left unread");
+
+    # send_all delivers everything and honours the deadline the same way.
+    assert_eq(tcp_send_all(a, "hello", 5, platform_now_us() + 1000000), 0, "send_all sends");
+    assert_eq(tcp_read_all(b, &buf, 5, platform_now_us() + 1000000), 5, "peer got all of it");
+    assert_eq(memeq(&buf, "hello", 5), 1, "peer got the right bytes");
+    assert_eq(tcp_send_all(a, "z", 1, platform_now_us() - 1), PLATFORM_ERR_TIMEOUT,
+      "send with an expired deadline refused");
+
+    # A clean close mid-message is TCP_ERR_CLOSED, not a short count.
+    sys_write(b, "q", 1);
+    sys_close(b);
+    assert_eq(tcp_read_all(a, &buf, 4, platform_now_us() + 1000000), TCP_ERR_CLOSED, "close mid-message reported");
+    sys_close(a);
+    return 0;
+}
+
 # === EDNS / TCP CLI flags (0.4.0) ===
 fn test_cli_edns_flags() {
     test_group("cli_edns_flags");
+    # Zeroed, and the ac=2 case below gets its name in av[1]. Through 0.5.1 this
+    # passed ac=2 with only av[0] and av[2] set, so the parser read an
+    # UNINITIALIZED av[1]: zero by luck on x86_64, garbage on aarch64 once 0.5.2
+    # changed the frame layout, and a SIGSEGV under qemu-aarch64.
     var av[64];
+    memset(&av, 0, 64);
     store64(&av, "dig");
+    store64(&av + 8, "example.com");
     store64(&av + 16, "example.com");
 
     # EDNS is ON by default — dig advertises rather than silently accepting 512.
@@ -1035,23 +1587,42 @@ fn test_cli_edns_flags() {
     # dig speaks EDNS version 0 only; advertising another is a usage error, not
     # a silent downgrade.
     store64(&av + 16, "example.com");
-    # Transport is a TRI-state: two flags, three meanings. A bool cannot tell
-    # "default" from "+notcp", and the help text promises it can.
+    # Transport, BIND's way (0.5.2): `+tcp` / `+notcp` pick the transport and
+    # `+ignore` is what stops the TC=1 fallback. Through 0.5.1 `+notcp` meant
+    # "never fall back", which in BIND is `+ignore`.
     var t0 = dig_cli_new();
+    store64(&av + 8, "example.com");
     assert_eq(dig_cli_parse_argv(t0, 2, &av), DIG_CLI_OK, "no transport flag parses");
-    assert_eq(dig_cli_tcp(t0), DIG_TCP_AUTO, "default is fall-back-on-TC");
+    assert_eq(dig_cli_tcp(t0), 0, "default transport is UDP");
+    assert_eq(dig_cli_ignore_tc(t0), 0, "default falls back to TCP on TC=1");
     var t1 = dig_cli_new();
     store64(&av + 8, "+tcp");
     assert_eq(dig_cli_parse_argv(t1, 3, &av), DIG_CLI_OK, "+tcp parses");
-    assert_eq(dig_cli_tcp(t1), DIG_TCP_FORCE, "+tcp forces TCP");
+    assert_eq(dig_cli_tcp(t1), 1, "+tcp forces TCP");
     var t2 = dig_cli_new();
-    store64(&av + 8, "+notcp");
-    assert_eq(dig_cli_parse_argv(t2, 3, &av), DIG_CLI_OK, "+notcp parses");
-    assert_eq(dig_cli_tcp(t2), DIG_TCP_NEVER, "+notcp is distinct from the default");
+    store64(&av + 8, "+tcp");
+    store64(&av + 16, "+notcp");
+    store64(&av + 24, "example.com");
+    assert_eq(dig_cli_parse_argv(t2, 4, &av), DIG_CLI_OK, "+tcp +notcp parses");
+    assert_eq(dig_cli_tcp(t2), 0, "+notcp after +tcp means UDP");
+    assert_eq(dig_cli_ignore_tc(t2), 0, "+notcp does not suppress the TC fallback");
+    var t3 = dig_cli_new();
+    store64(&av + 8, "+ignore");
+    store64(&av + 16, "example.com");
+    assert_eq(dig_cli_parse_argv(t3, 3, &av), DIG_CLI_OK, "+ignore parses");
+    assert_eq(dig_cli_ignore_tc(t3), 1, "+ignore suppresses the TC fallback");
+    assert_eq(dig_cli_tcp(t3), 0, "+ignore leaves the transport UDP");
+    var t4 = dig_cli_new();
+    store64(&av + 8, "+ignore");
+    store64(&av + 16, "+noignore");
+    store64(&av + 24, "example.com");
+    assert_eq(dig_cli_parse_argv(t4, 4, &av), DIG_CLI_OK, "+ignore +noignore parses");
+    assert_eq(dig_cli_ignore_tc(t4), 0, "+noignore restores the fallback");
+    store64(&av + 16, "example.com");      # the cases below pass ac=3
 
     var r7 = dig_cli_new();
     store64(&av + 8, "+edns=1");
-    assert_eq(dig_cli_parse_argv(r7, 3, &av), DIG_CLI_ERR_PARSE, "+edns=1 rejected");
+    assert_eq(dig_cli_parse_argv(r7, 3, &av), DIG_CLI_ERR_BAD_VALUE, "+edns=1 rejected");
     var r8 = dig_cli_new();
     store64(&av + 8, "+edns=0");
     assert_eq(dig_cli_parse_argv(r8, 3, &av), DIG_CLI_OK, "+edns=0 accepted");
@@ -1074,6 +1645,7 @@ fn test_dns_truncated() {
     return 0;
 }
 
+# Run every test group; exit status is the failure count, clamped below.
 fn main() {
     alloc_init();
     test_name_buf_contract();
@@ -1091,7 +1663,9 @@ fn main() {
     test_dns_truncated();
     test_edns_query();
     test_edns_response();
+    test_edns_rcode_policy();
     test_tcp_frame();
+    test_tcp_loops();
     test_cli_edns_flags();
     test_aaaa_rfc5952();
     test_rdata_validation();
@@ -1099,10 +1673,14 @@ fn main() {
     test_surviving_guards();
     test_resolv_038();
     test_reply_acceptable();
+    test_reply_commit();
     test_output_escaping();
     test_dns_question_match();
     test_cli_bounds();
     test_cli_bad_type();
+    test_cli_parity();
+    test_argv_echo_escaped();
+    test_audit_gaps();
     return assert_summary();
 }
 

@@ -21,8 +21,83 @@
 # before that, and output.cyr is included by main.cyr, not the entry.
 var _DIG_VERSION_STR = CYRIUS_PKG_VERSION;
 
-fn _out_puts(s): i64 { sys_write(1, s, strlen(s)); return 0; }
-fn _out_eputs(s): i64 { sys_write(2, s, strlen(s)); return 0; }
+# === Buffered stdout (0.5.2) ===
+#
+# Every stdout byte goes through one 4 KiB buffer, flushed when it fills, before
+# every stderr write, and once at exit (main.cyr). Through 0.5.1 each fragment
+# was its own write(2): 44 for a plain `dig example.com`, 614 for 59 answers,
+# and one PER BYTE of an unknown-type rdata, so a 64 KiB record was 64K calls.
+# Now a normal answer is ONE write.
+#
+# The stderr rule is what keeps the two streams in the order they were
+# written: a warning printed between two answer lines still lands between them
+# in `2>&1`. The buffer is allocated on first use, so a run that prints nothing
+# to stdout costs nothing.
+var _OUT_CAP = 4096;
+var _out_b = 0;
+var _out_n = 0;
+
+# write(2) all `n` bytes to `fd`, retrying EINTR and short writes. Output
+# errors are otherwise ignored, as they always were: there is no one to report
+# a closed stdout to.
+fn _out_write_all(fd, p, n): i64 {
+    var off = 0;
+    while (off < n) {
+        var w = sys_write(fd, p + off, n - off);
+        if (w == 0 - 4) { continue; }
+        if (w <= 0) { return 0 - 1; }
+        off = off + w;
+    }
+    return 0;
+}
+
+# Write out whatever stdout holds. Called before any stderr write and at exit.
+fn _out_flush(): i64 {
+    if (_out_n > 0) {
+        _out_write_all(1, _out_b, _out_n);
+        _out_n = 0;
+    }
+    return 0;
+}
+
+# Append `n` bytes to stdout. A piece larger than the buffer goes straight out,
+# after what is already buffered.
+fn _out_write(p, n): i64 {
+    if (_out_b == 0) { _out_b = alloc(_OUT_CAP); }
+    if (_out_n + n > _OUT_CAP) {
+        _out_flush();
+        if (n > _OUT_CAP) { return _out_write_all(1, p, n); }
+    }
+    memcpy(_out_b + _out_n, p, n);
+    _out_n = _out_n + n;
+    return 0;
+}
+
+fn _out_puts(s): i64 { _out_write(s, strlen(s)); return 0; }
+
+# A signed decimal on stdout (the buffered fmt_int).
+fn _out_int(n): i64 {
+    var b[24];
+    var k = fmt_int_buf(n, &b);
+    _out_write(&b, k);
+    return 0;
+}
+
+# Two lowercase hex digits on stdout (the buffered fmt_byte).
+fn _out_hex2(v): i64 {
+    var b[2];
+    var hi = (v >> 4) & 0xF;
+    var lo = v & 0xF;
+    if (hi < 10) { store8(&b, 48 + hi); } else { store8(&b, 87 + hi); }
+    if (lo < 10) { store8(&b + 1, 48 + lo); } else { store8(&b + 1, 87 + lo); }
+    _out_write(&b, 2);
+    return 0;
+}
+
+# stderr. Flushes stdout first, so the two streams interleave as written.
+fn _out_ewrite(p, n): i64 { _out_flush(); _out_write_all(2, p, n); return 0; }
+fn _out_eputs(s): i64 { _out_ewrite(s, strlen(s)); return 0; }
+fn _out_eint(n): i64 { _out_flush(); fmt_int_fd(2, n); return 0; }
 
 # RFC 1035 §5.1 presentation escaping into a caller buffer. Returns bytes
 # written, or -1 if the result would not fit `dst_cap` (refuses, never truncates).
@@ -48,8 +123,8 @@ fn _out_eputs(s): i64 { sys_write(2, s, strlen(s)); return 0; }
 # KNOWN LIMIT: a literal 0x2E inside a label is NOT escaped as `\.`, because
 # dns_decode_name flattens labels into a dotted string and by the time bytes
 # reach here a separator dot and an in-label dot are indistinguishable. A
-# BIND-fidelity gap with no security consequence; closing it needs the
-# decoder-side rewrite parked at 0.4.x.
+# BIND-fidelity gap with no security consequence; closing it needs the decoder
+# to keep label boundaries, which no roadmap milestone schedules yet.
 fn _esc_to_buf(dst, dst_cap, src, n, esc_space): i64 {
     var o = 0;
     var i = 0;
@@ -94,7 +169,34 @@ fn _out_escaped(p, n, esc_space): i64 {
     var eb[1024];
     var w = _esc_to_buf(&eb, 1024, p, n, esc_space);
     if (w < 0) { return 0 - 1; }
-    sys_write(1, &eb, w);
+    _out_write(&eb, w);
+    return 0;
+}
+
+# Write `n` bytes from `p` to `fd`, escaped as above, in 255-byte chunks so input
+# of ANY length fits the 1024-byte scratch (255 * 4 = 1020). This is the sink for
+# text that came from argv: the query name in the banner and QUESTION line, and
+# every token a usage error names.
+#
+# Through 0.5.1 those were written raw. dns_encode_name accepts any octet but
+# '.' and NUL, so `dig $'x\e]0;PWNED\a\e[2J\rforged.example'` passed validation
+# and wrote its escape sequences to the terminal twice, banner and question,
+# while the ANSWER line beside them was already escaped. That needs only a
+# script that runs `dig "$untrusted"`. 0.5.0 adopted the same defence for
+# cmdit's argv echoes, and BIND escapes its QUESTION section.
+fn _out_esc_fd(fd, p, n, esc_space): i64 {
+    var eb[1024];
+    var off = 0;
+    while (off < n) {
+        var k = n - off;
+        if (k > 255) { k = 255; }
+        var w = _esc_to_buf(&eb, 1024, p + off, k, esc_space);
+        if (w < 0) { return 0 - 1; }
+        # stdout is buffered; any other fd is written as given, after stdout
+        # is flushed so the streams keep their order.
+        if (fd == 1) { _out_write(&eb, w); } else { _out_flush(); _out_write_all(fd, &eb, w); }
+        off = off + k;
+    }
     return 0;
 }
 
@@ -126,7 +228,7 @@ fn output_print_type(t): i64 {
     var m = output_type_str(t);
     if (m != 0) { return _out_puts(m); }
     _out_puts("TYPE");
-    fmt_int(t);
+    _out_int(t);
     return 0;
 }
 
@@ -145,18 +247,30 @@ fn output_rcode_str(r): i64 {
     if (r == DNS_RCODE_NXRRSET)  { return "NXRRSET"; }
     if (r == DNS_RCODE_NOTAUTH)  { return "NOTAUTH"; }
     if (r == DNS_RCODE_NOTZONE)  { return "NOTZONE"; }
+    # Extended RCODEs (RFC 6891 §6.1.3; IANA registry), reachable since 0.4.0
+    # folded in OPT's upper 8 bits. BIND's spellings. Through 0.5.1 these printed
+    # `RESERVED16` and so on, which says "unassigned" about assigned codes, and
+    # BADVERS is the one a query dig sends can actually provoke.
+    if (r == 16) { return "BADVERS"; }
+    if (r == 17) { return "BADKEY"; }
+    if (r == 18) { return "BADTIME"; }
+    if (r == 19) { return "BADMODE"; }
+    if (r == 20) { return "BADNAME"; }
+    if (r == 21) { return "BADALG"; }
+    if (r == 22) { return "BADTRUNC"; }
+    if (r == 23) { return "BADCOOKIE"; }
     return 0;
 }
 
-# Print the RCODE mnemonic, or BIND's `RESERVED<n>` for 11-15. A print-style
-# helper rather than a cstr-returning one because the reserved range needs the
-# number formatted in. Through 0.3.7 every code above 5 printed a flat
+# Print the RCODE mnemonic, or BIND's `RESERVED<n>` for an unassigned code. A
+# print-style helper rather than a cstr-returning one because the reserved range
+# needs the number formatted in. Through 0.3.7 every code above 5 printed a flat
 # `RCODE?`, which discards the value the operator needs.
 fn output_print_rcode(r): i64 {
     var m = output_rcode_str(r);
     if (m != 0) { return _out_puts(m); }
     _out_puts("RESERVED");
-    fmt_int(r);
+    _out_int(r);
     return 0;
 }
 
@@ -168,12 +282,10 @@ fn output_print_class(c): i64 {
     if (c == 3)            { return _out_puts("CH"); }
     if (c == 4)            { return _out_puts("HS"); }
     _out_puts("CLASS");
-    fmt_int(c);
+    _out_int(c);
     return 0;
 }
 
-# Print one RR's rdata in type-appropriate form. Returns 0 on success,
-# negative on parse error.
 # Render an AAAA as RFC 5952 §4: leading zeros suppressed, the leftmost longest
 # run of >=2 zero groups replaced by `::`, lowercase hex (fmt_hex gives all
 # three). Through 0.3.7 this printed eight fixed 4-digit groups, so EVERY
@@ -254,7 +366,7 @@ fn _aaaa_to_buf(dst, msg, rdoff): i64 {
 fn _out_aaaa(msg, rdoff): i64 {
     var b[64];
     var n = _aaaa_to_buf(&b, msg, rdoff);
-    sys_write(1, &b, n);
+    _out_write(&b, n);
     return 0;
 }
 
@@ -262,16 +374,16 @@ fn _out_aaaa(msg, rdoff): i64 {
 #
 # Through 0.3.7 this was a bare `fmt_hex` per byte, and fmt_hex is
 # VARIABLE-width — so distinct rdata collided: {00 01 0a 05}, {00 1a 05} and
-# {00 01 a5} all rendered `01a5`. The same file was already doing this correctly
-# for AAAA with the fixed-width fmt_byte. The `\# len` prefix makes the length
-# explicit and kills cross-length collisions outright.
+# {00 01 a5} all rendered `01a5`. Each byte is now exactly two hex digits
+# (_out_hex2), and the `\# len` prefix makes the length explicit, which kills
+# cross-length collisions outright.
 fn output_print_rdata_unknown(msg, rdoff, rdlen): i64 {
     _out_puts("\\# ");
-    fmt_int(rdlen);
+    _out_int(rdlen);
     var i2 = 0;
     while (i2 < rdlen) {
         if (i2 == 0) { _out_puts(" "); }
-        fmt_byte(load8(msg + rdoff + i2));
+        _out_hex2(load8(msg + rdoff + i2));
         i2 = i2 + 1;
     }
     return 0;
@@ -299,21 +411,42 @@ fn output_print_rdata_unknown(msg, rdoff, rdlen): i64 {
 #     pointers legitimately target earlier bytes outside this rdata (RFC 1035
 #     §4.1.4) and the decoder uses the same limit for both. The end-offset
 #     post-check is the correct predicate and leaves the decoder untouched.
+# An rdata name, decoded from `off` and required to END exactly at `end` — the
+# RDLENGTH bound of invariant 2 above. On success the name is in `nb` (a
+# DNS_NAME_BUF_LEN buffer) with its length in `*nl`, and the return is 1; on any
+# failure 0, and nothing has been emitted (invariant 1).
+fn _rd_name(msg, msg_len, off, end, nb, nl): i64 {
+    var e = dns_decode_name(msg, msg_len, off, nb, nl);
+    if (e == 0) { return 0; }
+    if (e != end) { return 0; }
+    return 1;
+}
+
+# Emit a decoded name in presentation form, with its trailing dot.
+fn _out_name(nb, nl): i64 {
+    _out_escaped(nb, load64(nl), 1);
+    _out_puts(".");
+    return 0;
+}
+
+# Print one RR's rdata (the two invariants above). Returns 0, or -1 if malformed for its type.
 fn output_print_rdata(msg, msg_len, rr, next_off): i64 {
     var t = dns_rr_type(rr);
     var rdoff = dns_rr_rdata_off(rr);
     var rdlen = next_off - rdoff;
     var rdend = rdoff + rdlen;
+    # Shared by every name-bearing arm; SOA needs both. Through 0.5.1 each arm
+    # declared its own, seven 256-byte buffers in one frame.
+    var nb[DNS_NAME_BUF_LEN];
+    var nl[8];
+    var nb2[DNS_NAME_BUF_LEN];
+    var nl2[8];
 
     if (t == DNS_TYPE_A) {
         if (rdlen != 4) { return 0 - 1; }
         var buf[16];
-        var packed = (load8(msg + rdoff) << 24)
-        | (load8(msg + rdoff + 1) << 16)
-        | (load8(msg + rdoff + 2) << 8)
-        |  load8(msg + rdoff + 3);
-        var n = ipv4_format_to_buf(packed, &buf);
-        sys_write(1, &buf, n);
+        var n = ipv4_format_to_buf(_dns_load_u32(msg, rdoff), &buf);
+        _out_write(&buf, n);
         return 0;
     }
     if (t == DNS_TYPE_AAAA) {
@@ -322,48 +455,23 @@ fn output_print_rdata(msg, msg_len, rr, next_off): i64 {
     }
     if (t == DNS_TYPE_MX) {
         if (rdlen < 3) { return 0 - 1; }
-        var nbuf[DNS_NAME_BUF_LEN];
-        var nl0[8];
-        var nend = dns_decode_name(msg, msg_len, rdoff + 2, &nbuf, &nl0);
-        if (nend == 0) { return 0 - 1; }
-        if (nend != rdend) { return 0 - 1; }
-        fmt_int(_dns_load_u16(msg, rdoff));
+        if (_rd_name(msg, msg_len, rdoff + 2, rdend, &nb, &nl) == 0) { return 0 - 1; }
+        _out_int(_dns_load_u16(msg, rdoff));
         _out_puts(" ");
-        _out_escaped(&nbuf, load64(&nl0), 1);
-        _out_puts(".");
+        _out_name(&nb, &nl);
         return 0;
     }
-    if (t == DNS_TYPE_NS) {
-        var nb1[DNS_NAME_BUF_LEN];
-        var nl1[8];
-        var ne1 = dns_decode_name(msg, msg_len, rdoff, &nb1, &nl1);
-        if (ne1 == 0) { return 0 - 1; }
-        if (ne1 != rdend) { return 0 - 1; }
-        _out_escaped(&nb1, load64(&nl1), 1);
-        _out_puts(".");
-        return 0;
-    }
-    if (t == DNS_TYPE_CNAME) {
-        var nb2[DNS_NAME_BUF_LEN];
-        var nl2[8];
-        var ne2 = dns_decode_name(msg, msg_len, rdoff, &nb2, &nl2);
-        if (ne2 == 0) { return 0 - 1; }
-        if (ne2 != rdend) { return 0 - 1; }
-        _out_escaped(&nb2, load64(&nl2), 1);
-        _out_puts(".");
-        return 0;
-    }
-    if (t == DNS_TYPE_PTR) {
-        var nb3[DNS_NAME_BUF_LEN];
-        var nl3[8];
-        var ne3 = dns_decode_name(msg, msg_len, rdoff, &nb3, &nl3);
-        if (ne3 == 0) { return 0 - 1; }
-        if (ne3 != rdend) { return 0 - 1; }
-        _out_escaped(&nb3, load64(&nl3), 1);
-        _out_puts(".");
+    if ((t == DNS_TYPE_NS) || (t == DNS_TYPE_CNAME) || (t == DNS_TYPE_PTR)) {
+        if (_rd_name(msg, msg_len, rdoff, rdend, &nb, &nl) == 0) { return 0 - 1; }
+        _out_name(&nb, &nl);
         return 0;
     }
     if (t == DNS_TYPE_TXT) {
+        # RFC 1035 §3.3.14: one or more character-strings. RDLENGTH 0 holds
+        # none, and BIND rejects it. Through 0.5.1 both loops below simply did
+        # not run and the arm returned success, so `+short TXT` printed a bare
+        # blank line with exit 0, the class of failure 0.3.8 fixed for A.
+        if (rdlen == 0) { return 0 - 1; }
         # Two passes. TXT cannot be reordered into validate-then-emit in one
         # sweep, because each segment is only discoverable by walking the one
         # before it — so a later overrun used to land after earlier segments had
@@ -389,36 +497,28 @@ fn output_print_rdata(msg, msg_len, rr, next_off): i64 {
         return 0;
     }
     if (t == DNS_TYPE_SOA) {
-        var nb4[DNS_NAME_BUF_LEN];
-        var nl4[8];
-        var ne4 = dns_decode_name(msg, msg_len, rdoff, &nb4, &nl4);
-        if (ne4 == 0) { return 0 - 1; }
-        var nb5[DNS_NAME_BUF_LEN];
-        var nl5[8];
-        var ne5 = dns_decode_name(msg, msg_len, ne4, &nb5, &nl5);
-        if (ne5 == 0) { return 0 - 1; }
-        if (ne5 + 20 != rdend) { return 0 - 1; }
-        _out_escaped(&nb4, load64(&nl4), 1); _out_puts(". ");
-        _out_escaped(&nb5, load64(&nl5), 1); _out_puts(". ");
-        fmt_int(_dns_load_u32(msg, ne5));       _out_puts(" ");
-        fmt_int(_dns_load_u32(msg, ne5 + 4));   _out_puts(" ");
-        fmt_int(_dns_load_u32(msg, ne5 + 8));   _out_puts(" ");
-        fmt_int(_dns_load_u32(msg, ne5 + 12));  _out_puts(" ");
-        fmt_int(_dns_load_u32(msg, ne5 + 16));
+        # MNAME ends wherever it ends; RNAME must end exactly 20 bytes (the five
+        # u32s) before the rdata does.
+        var ne = dns_decode_name(msg, msg_len, rdoff, &nb, &nl);
+        if (ne == 0) { return 0 - 1; }
+        if (_rd_name(msg, msg_len, ne, rdend - 20, &nb2, &nl2) == 0) { return 0 - 1; }
+        var f = rdend - 20;
+        _out_name(&nb, &nl);   _out_puts(" ");
+        _out_name(&nb2, &nl2); _out_puts(" ");
+        _out_int(_dns_load_u32(msg, f));       _out_puts(" ");
+        _out_int(_dns_load_u32(msg, f + 4));   _out_puts(" ");
+        _out_int(_dns_load_u32(msg, f + 8));   _out_puts(" ");
+        _out_int(_dns_load_u32(msg, f + 12));  _out_puts(" ");
+        _out_int(_dns_load_u32(msg, f + 16));
         return 0;
     }
     if (t == DNS_TYPE_SRV) {
         if (rdlen < 7) { return 0 - 1; }
-        var nb6[DNS_NAME_BUF_LEN];
-        var nl6[8];
-        var ne6 = dns_decode_name(msg, msg_len, rdoff + 6, &nb6, &nl6);
-        if (ne6 == 0) { return 0 - 1; }
-        if (ne6 != rdend) { return 0 - 1; }
-        fmt_int(_dns_load_u16(msg, rdoff));     _out_puts(" ");
-        fmt_int(_dns_load_u16(msg, rdoff + 2)); _out_puts(" ");
-        fmt_int(_dns_load_u16(msg, rdoff + 4)); _out_puts(" ");
-        _out_escaped(&nb6, load64(&nl6), 1);
-        _out_puts(".");
+        if (_rd_name(msg, msg_len, rdoff + 6, rdend, &nb, &nl) == 0) { return 0 - 1; }
+        _out_int(_dns_load_u16(msg, rdoff));     _out_puts(" ");
+        _out_int(_dns_load_u16(msg, rdoff + 2)); _out_puts(" ");
+        _out_int(_dns_load_u16(msg, rdoff + 4)); _out_puts(" ");
+        _out_name(&nb, &nl);
         return 0;
     }
     return output_print_rdata_unknown(msg, rdoff, rdlen);
@@ -429,7 +529,8 @@ fn output_print_header(name): i64 {
     _out_puts("; <<>> dig ");
     _out_puts(_DIG_VERSION_STR);
     _out_puts(" <<>> ");
-    _out_puts(name);
+    # argv text: escaped (see _out_esc_fd). Spaces stay literal, as typed.
+    _out_esc_fd(1, name, strlen(name), 0);
     _out_puts("\n");
     return 0;
 }
@@ -437,7 +538,9 @@ fn output_print_header(name): i64 {
 # Print the QUESTION section line (BIND shape).
 fn output_print_question(name, qtype): i64 {
     _out_puts(";; QUESTION\n;");
-    _out_puts(name);
+    # Presentation form, escaped like the answer's owner name (`\032` for a
+    # space), so a name from argv cannot write control bytes here either.
+    _out_esc_fd(1, name, strlen(name), 1);
     # `dig example.com.` used to print `;example.com..` — the name already ends
     # absolute, so appending another dot doubled it. The wire query was always
     # correct (dns_encode_name absorbs the trailing dot); this was display only.
@@ -461,7 +564,7 @@ fn output_print_answer_rr(msg, msg_len, rr, next_off): i64 {
     if (ne == 0) { return 0 - 1; }
     _out_escaped(&nbuf, load64(&nl7), 1);
     _out_puts(".\t");
-    fmt_int(dns_rr_ttl(rr));
+    _out_int(dns_rr_ttl(rr));
     _out_puts("\t");
     # The reply's OWN class, not a hardcoded "IN". dns_rr_class has been
     # populated since 0.3.0 and read by no production code, so a reply whose
@@ -484,8 +587,12 @@ fn output_print_short_rr(msg, msg_len, rr, next_off): i64 {
         # +short stream scripts parse. Through 0.3.7 this return was discarded
         # and the newline printed regardless, so a malformed A record emitted a
         # BARE BLANK LINE and exit 0 — `ip=$(dig +short host)` yielded "" and
-        # the caller was told it had succeeded.
+        # the caller was told it had succeeded. 0.3.8 fixed the exit code but
+        # still wrote the newline, so stdout kept a blank line (0.5.2): every
+        # arm validates before it emits, so a failed record wrote nothing, and
+        # now its line ending is not written either.
         _out_eputs(";; WARNING: malformed rdata\n");
+        return r;
     }
     _out_puts("\n");
     return r;
@@ -493,25 +600,24 @@ fn output_print_short_rr(msg, msg_len, rr, next_off): i64 {
 
 # Footer line: `;; Query time: N ms · server: A.B.C.D · proto: udp`.
 fn output_print_footer(query_us, server_addr, tcp_used): i64 {
-    # Decide the proto label BEFORE touching the address buffer.
-    #
-    # Not style: with `var buf[16]` declared first, the compiler placed it
-    # overlapping this parameter's stack slot, and `ipv4_format_to_buf` writing
-    # "8.8.8.8" into it left `tcp_used` as 0x3800000000000001 — its low byte
-    # still 1, byte 7 replaced by the ASCII '8'. So `tcp_used == 1` was false
-    # and every TCP query reported `proto: udp`. Reading the parameter into a
-    # local first sidesteps it; a minimal reproduction has NOT been isolated
-    # yet, so this is a workaround with a known symptom, not a diagnosis.
-    # Filed for cyrius in roadmap.md § upstream.
+    # The proto label is read BEFORE the address buffer is written. At 0.4.0
+    # (cyrius 6.5.35) writing "8.8.8.8" into `buf` turned `tcp_used` into
+    # 0x3800000000000001 and every TCP query reported `proto: udp`. It was filed
+    # as a stack-slot miscompile with no reproduction; the 0.5.2 audit found the
+    # real cause, a stdlib bug fixed at cyrius 6.6.18 (CYRIUS-2026-0028): the
+    # old fmt_int_buf always wrote 24 bytes, so ipv4_format_to_buf's first
+    # octet put its digit at buf+23, byte 7 of the next stack slot. The order
+    # here is harmless and kept; the A arm's `var buf[16]` was overrun the same
+    # way on every record at pins before 6.6.18.
     var proto = "udp";
     if (tcp_used == 1) { proto = "tcp"; }
 
     _out_puts(";; Query time: ");
-    fmt_int((query_us + 500) / 1000);   # us → ms, half-up
+    _out_int((query_us + 500) / 1000);   # us → ms, half-up
     _out_puts(" ms · server: ");
     var buf[16];
     var n = ipv4_format_to_buf(server_addr, &buf);
-    sys_write(1, &buf, n);
+    _out_write(&buf, n);
     _out_puts(" · proto: ");
     _out_puts(proto);
     _out_puts("\n");

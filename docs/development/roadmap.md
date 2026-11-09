@@ -1,6 +1,6 @@
 # dig — Roadmap
 
-> **Status**: Active | **Last Updated**: 2026-08-28 (0.4.0 — EDNS(0) + TCP landed)
+> **Status**: Active | **Last Updated**: 2026-11-09 (0.5.2 — P(-1) audit and repairs)
 >
 > Milestone path from scaffold (0.1.0) through v1.0 (full BIND `dig` parity + LAN-on-iron + `taar` extraction trigger fired). Per first-party-documentation roadmap shape: **Completed** / **Backlog** / **Future** / **v1.0 criteria**.
 >
@@ -12,6 +12,7 @@
 
 | Version | Landed | Items |
 |---|---|---|
+| **0.5.2** | 2026-11-09 | **P(-1) audit cut.** Five lenses over 0.5.1; 4 P1 / 7 P2 / 18 P3 repaired (a forged TCP fallback reply printed as the answer, a TC=1 failure exiting 0, unknown `+options` accepted silently, argv names echoed raw, TCP without an overall deadline, and more). CLI semantics follow BIND. New `tests/integration/net.sh` (68 checks), stdout buffered, DCE on every build (x86_64 241 → 103 KB). Record: [`../audit/2026-11-08-audit.md`](../audit/2026-11-08-audit.md). |
 | **0.1.0** | 2026-05-23 | Initial `cyrius init` scaffold. README + CLAUDE.md + LICENSE + CHANGELOG + cyrius.cyml + tests/dig.{tcyr,bcyr,fcyr} + `.github/workflows/{ci,release}.yml`. Stub `main.cyr` prints `hello from dig`. Stdlib vendored in `lib/` (81 modules incl. `net.cyr`). |
 | **0.3.0** | 2026-05-23 | **dig MVP — first end-to-end resolution.** Real UDP queries against arbitrary resolvers; A / AAAA / MX / NS / CNAME / SOA / PTR / TXT / SRV parsed; BIND-shape + `+short` output. 8 src/ modules (cli, dns, ipv4, output, platform/platform_linux, query, resolv) totaling 1410 LOC. 70 test assertions including name-compression cycle detection. Per-backend sovereignty posture: pragmatic POSIX on Linux, AGNOS backend deferred to v1.0 gate (same as yo). At the time, 0.2.x kernel UDP-53 syscall exposure was still pending (the Linux-backend-first bypass kept momentum); that surface has since landed (agnos 1.45.3, #51-54) and the AGNOS backend now resolves end-to-end. |
 | **0.4.0** | 2026-08-28 | **EDNS(0) + DNS over TCP.** First feature cut past the MVP line, after the 0.4.x hold lifted. `dig google.com TXT` returns 16 records where it returned none for eight releases. OPT pseudo-RR advertising 1232 (the Flag Day 2020 value, not 4096), `+bufsize` / `+noedns` / `+edns`, extended RCODE folded in so BADVERS stops reading as NOERROR, TCP-53 with RFC 1035 §4.2.2 length framing reached automatically on TC=1 or forced by `+tcp`, and `+dnssec` setting the DO bit. TCP is built on taar's socket primitives — the migration this roadmap parked for "when `+tcp` lands" — which brings the AGNOS arm along without touching the parked backend. Tests 198 → 260. |
@@ -57,25 +58,22 @@ answers keeping their footer. Dead code removed; every `write(2)` routed through
 replacing a stub that reported PASS while including no source at all. See
 CHANGELOG [0.3.8].
 
-### Upstream — file against cyrius, do not patch locally
+### Upstream — file against cyrius / taar, do not patch locally
 
-- **Stack slot overlapping a parameter (found 0.4.0).** In
-  `output_print_footer`, `var buf[16]` was placed such that
-  `ipv4_format_to_buf` writing into it corrupted the function's third
-  PARAMETER: `tcp_used` went from `1` to `0x3800000000000001` — low byte intact,
-  byte 7 replaced by the ASCII `'8'` that the formatter wrote. Every TCP query
-  therefore reported `proto: udp`. Worked around by reading the parameter into a
-  local before the buffer is touched. **No minimal reproduction yet** — array
-  first, and call-then-array, both behave correctly — so what distinguishes the
-  failing shape is still unknown. Reproduce from `git show` of the 0.4.0 commit
-  before the workaround.
-- **No stdlib wrapper or named constant for `sendto` / `nanosleep` /
-  `clock_gettime`** on either Linux arch, so every consumer needing a monotonic
-  clock hardcodes a number — the thing that made dig's aarch64 builds call
-  `unlinkat` for their retry backoff. `lib/chrono.cyr` has the same latent bug:
-  its non-macOS non-Windows arm is a bare `syscall(228, ...)` with no aarch64
-  arm, and 228 is not `clock_gettime` there. Also filed in taar's roadmap; two
-  first-party consumers hitting one gap independently is the threshold.
+- **taar's TCP send can raise SIGPIPE** (audit D8). `taar_tcp_send` is a plain
+  write(2), so a peer that resets the connection kills any consumer that has not
+  ignored the signal. dig ignores SIGPIPE since 0.5.2; taar should send with
+  `MSG_NOSIGNAL` (`sys_sendto(fd, buf, len, 0x4000, 0, 0)`, the stdlib's
+  `_fd_write_nosigpipe` shape) so every consumer is covered.
+- **argv depends on /proc** (audit D7). cmdit reads the command line from
+  `/proc/self/cmdline`, so with /proc absent (a chroot or a sandbox) every
+  invocation fails before dig sees its arguments. A cmdit / stdlib design point.
+
+*Closed at 0.5.2*: the 0.4.0 "stack slot overlapping a parameter" was not a
+miscompile but the pre-6.6.18 stdlib `fmt_int_buf` writing 24 bytes into a
+16-byte buffer (CYRIUS-2026-0028); and the "no sendto / nanosleep /
+clock_gettime wrapper" gap closed at cyrius 6.6.20 — dig now uses
+`clock_now_ns`. Both are in [`../audit/2026-11-08-audit.md`](../audit/2026-11-08-audit.md).
 
 ---
 
@@ -102,17 +100,26 @@ What is banked and awaiting that review:
   `sys_uptime_us()` (#95, rdtsc-based, works with interrupts disabled). Unverified
   here: it cannot be checked without executing the arm.
 - Executed coverage remains the largest untested surface in the repo.
+- **A ready answer to the frozen-clock question** (audit D9, 0.5.2): the stdlib's
+  `clock_now_ns` already reads `sys_uptime_us` (#95) on AGNOS, latching to #40
+  only where TSC calibration was refused, which is the fix this arm needs. The
+  Linux arm moved to it at 0.5.2; `platform_agnos.cyr` was left untouched, per
+  the parking.
 
 ---
 
 ### 0.4.x — Full record-type coverage + advanced flags
 
-- [ ] Additional RR types: TXT multi-string parsing, SOA (master/admin/serial/refresh/retry/expire/minimum), HINFO, RRSIG, DNSKEY, DS, NSEC, NSEC3 (the DNSSEC ladder).
+- [ ] Additional RR types: HINFO, RRSIG, DNSKEY, DS, NSEC, NSEC3 (the DNSSEC ladder), plus query types beyond the nine `cli.cyr` accepts: ANY, CAA, HTTPS, and RFC 3597 `TYPEnnn` (audit D6). (TXT multi-string and SOA rendering landed at 0.3.x.)
 - [ ] `+trace` flag — manual recursion from root servers. Walks root → TLD → authoritative chain, prints each step. Useful for diagnosing delegation issues.
 - [~] `+dnssec` flag — **DO bit landed 0.4.0**; dig requests and prints RRSIG/DNSKEY. Chain-of-trust validation against the root KSK (RFC 4034 + RFC 5155) remains. Defer the cryptographic work to a `taar.dnssec` submodule.
 - [x] **EDNS(0) support (RFC 6891) — landed 0.4.0.** OPT pseudo-RR, `+bufsize=N`, `+noedns`, extended RCODE folded in (BADVERS was reading as NOERROR without it). Advertises **1232**, not the 4096 this line originally specified — 4096 fragments on most real paths and is a reflection-amplification lever; 1232 is the DNS Flag Day 2020 consensus.
 - [x] **TCP fallback on TC=1 (RFC 1035 §4.2.2) — landed 0.4.0.** Automatic on truncation, forced by `+tcp`. Built on taar's socket primitives, which ships both arms — so AGNOS gets TCP without touching the parked backend.
 - [ ] IPv6 transport: query via `udp_send` against `2001:4860:4860::8888` (Google) etc.; AAAA queries are already in 0.3.x record-type list.
+- [ ] **Retry TCP like UDP** (audit D1): BIND applies `+tries` to TCP; dig makes one TCP attempt.
+- [ ] **Fail over across resolv.conf nameservers** (audit D2): only the first usable one is asked; BIND tries each in turn.
+- [ ] **`+bufsize=0` sends an OPT with size 0**, as BIND does (audit D3); dig treats it as `+noedns`.
+- [ ] **Names round-trip presentation form** (audit D4): `\.` and `\DDD` on input; `;`, `@`, `$`, `(` and `)` escaped on output; `\.` inside a label needs the decoder to keep label boundaries. IDN (BIND converts only on a tty).
 
 ### 0.5.x — Iron validation + parity check
 
@@ -122,6 +129,7 @@ What is banked and awaiting that review:
 - [ ] First WAN run: `dig @8.8.8.8 google.com`. Expected: A + AAAA, query time in 10-50 ms range from a US residential connection.
 - [ ] First DNSSEC run: `dig +dnssec example.com`. Expected: chain validates against the root KSK.
 - [ ] Parity benchmark vs BIND's `dig` on the same host — query latency + memory footprint + binary size. Target: ≤ 25 ms median, ≤ 5 MB RSS, ≤ 40 KB binary.
+- [ ] **Output layout parity** (audit D5): `;; QUESTION SECTION:` / `;; ANSWER SECTION:`, the `;; flags: ... QUERY: 1, ANSWER: n` line, AUTHORITY and ADDITIONAL sections, BIND's footer (`;; SERVER: X#53(X) (UDP)`), uppercase RFC 3597 hex. Scripts written against BIND parse these.
 
 ### 0.6.x — `taar` EXTRACTION (trigger FIRED 2026-06-15, ahead of slot — partially done)
 

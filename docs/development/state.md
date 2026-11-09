@@ -2,7 +2,7 @@
 
 > **⚠ NOT A LOG.** Live state with pointers — current truth only. Per-release history → [`../../CHANGELOG.md`](../../CHANGELOG.md). Milestone path → [`roadmap.md`](roadmap.md).
 >
-> **Last refresh**: 2026-11-08 (0.5.1 — toolchain 6.7.18, cmdit 1.5.1, taar 0.6.2).
+> **Last refresh**: 2026-11-09 (0.5.2 — P(-1) audit and repairs; see [`../audit/2026-11-08-audit.md`](../audit/2026-11-08-audit.md)).
 
 ---
 
@@ -10,16 +10,16 @@
 
 | Field | Value |
 |---|---|
-| Current version | **0.5.1** (toolchain 6.7.18, cmdit 1.5.1, taar 0.6.2; no dig source change. 0.4.0 remains the last feature cut) |
+| Current version | **0.5.2** (the P(-1) audit cut: 4 P1 / 7 P2 / 18 P3 repaired, CLI semantics aligned with BIND. 0.4.0 remains the last feature cut) |
 | Status | Shipping. Real DNS queries against arbitrary resolvers over **UDP and TCP**, EDNS(0) advertised by default; 9 RR types parse. |
-| Build size | 235 KB host (241,056 B), 252 KB `--agnos` (257,904 B), 331 KB `--aarch64` (339,280 B) at 6.7.18. The live image is 97,696 B under `CYRIUS_DCE=1`; the rest is unreachable stdlib and dep code (588 fns), which the DCE pass drops. aarch64's text segment is just past 256 KiB (`0x40208`), so its data segment sits at the next 64 KiB file offset: about 64 KiB of that file is alignment padding |
-| Module footprint | 9 src/ modules, 2242 lines (output 507, dns 459, cli 330, main 253, platform_linux 179, resolv 174, platform_agnos 167, query 149, platform 24) — excludes the 14-line `test.cyr` entry. Growth across 0.3.7/0.3.8 is doc comments, validation guards and RFC 5952 rendering, not features |
+| Build size | 101 KB host (103,032 B), 105 KB `--agnos` (107,608 B), 333 KB `--aarch64` (340,520 B) at 6.7.18, with `[build] dce = true` since 0.5.2 (it was 241,056 / 257,904 B). aarch64 NOP-fills dead code rather than compacting it, so its file does not shrink, and its text sits just past 256 KiB, so about 64 KiB of that file is alignment padding |
+| Module footprint | 10 src/ modules, 3031 lines (output 625, dns 597, cli 422, main 393, query 262, resolv 208, tcp 171, platform_agnos 167, platform_linux 162, platform 24), excluding the 14-line `test.cyr` entry. 0.5.2's growth is the audit's repairs and their comments, not features |
 | Cyrius pin | 6.7.18, the latest release. taar 0.6.2, cmdit 1.5.1 and yo 0.8.0 match; whirl 0.6.14 is still on 6.6.2 |
 | taar dep | `[deps.taar]` tag **0.6.2** (`dist/taar.cyr`, commit-pinned `d203629`), the latest release. dig consumes the `ipv4_*` codec and, since 0.4.0, the TCP primitives in `src/tcp.cyr`. Since 0.6.2 `taar_tcp_set_timeout_ms` also bounds connect and send, so `+tcp` to a SYN black hole gives up at `+timeout` (2.0 s at `+timeout=2`, was 135 s). `path = "../taar"` is a local-mode-only override (cyrius ≥ 6.7.6: `CYRIUS_LOCAL=1` or `--local`), so a plain build resolves the same tag CI does |
 | Transport | UDP-53 via dig's own `platform_*` arms; **TCP-53 via taar's socket primitives** (`src/tcp.cyr`) — taar ships both a POSIX and an AGNOS arm, so TCP works on AGNOS without touching the parked `platform_agnos.cyr`. taar's *DNS* layer is deliberately not adopted |
 | cmdit dep | `[deps.cmdit]` tag **1.5.1** (`dist/cmdit.cyr`, commit-pinned `efffc54`, the latest release; `path` is local-mode-only, as for taar) — adopted 0.3.7 for `--help`/`--version`/argv-materialize/exit codes. The `@server`/`+flag` tokenizer stays in `src/cli.cyr`: dig's grammar is not getopt-long, and cmdit names dig as its `cmdit_raw_argv` escape-hatch case |
-| Quality gates | `cyrius audit`: fmt clean, tests green. Lint reports 5 warnings (consecutive blank lines in `tests/dig.tcyr`) and docs reports 11 undocumented public fns, the same counts at 6.6.2, 6.6.20, 6.7.9 and 6.7.18. CI gates on deps/build/test only |
-| Tests | **260** assertions in `tests/dig.tcyr`, plus **1,560,376** in the `tests/dig.fcyr` fuzz harness. Security-critical coverage: name-compression cycle detection, RFC 5452 §9.1 question matching and its use, RFC 1035 §5.1 presentation escaping, rdata RDLENGTH bounds, name wire-length caps, EDNS OPT wire layout, TCP length framing. Every repair and feature since 0.3.7 is mutation-checked |
+| Quality gates | `cyrius audit` clean on all four dimensions (fmt / lint / docs / tests) since 0.5.2; through 0.5.1 lint reported 5 warnings and docs 11 undocumented fns. CI runs deps/build/test plus the `integration` job (`tests/integration/net.sh`, skipped with a warning where user namespaces are forbidden) |
+| Tests | **400** assertions in `tests/dig.tcyr` (x86_64, and aarch64 under qemu), **3,803,350** in the `tests/dig.fcyr` fuzz harness, **68** checks in `tests/integration/net.sh` (the real binary against a scripted server: transport, TC fallback, forged replies, argv escaping, resolv.conf), and 10 benchmarks in `tests/dig.bcyr`. Every repair since 0.3.7 is mutation-checked; 0.5.2 ran 43 mutants, all killed |
 | Iron-validation host | archaemenid (Beelink SER, AMD) — same machine as the agnosticos iron-burn surface |
 | Family position | Second entry in network-tools family (after yo) — **`taar` extraction trigger FIRED 2026-06-15** (shared `ipv4` codec folded at dig 0.3.3 / yo 0.5.5) |
 
@@ -31,12 +31,14 @@
 
 Before that, **0.3.7 and 0.3.8 were audit cuts.** An eight-lens sweep over 0.3.6 confirmed 61 findings against adversarial refutation (0 refuted); 0.3.7 took both P1s (aarch64 was building binaries that called the wrong syscalls; any zone owner could write raw terminal control bytes to a looker-up's screen) and 0.3.8 closed the remaining 23. That backlog is empty.
 
+**0.5.2 (2026-11-09) is the third audit cut**, a five-lens P(-1) sweep over 0.5.1 (wire, protocol, CLI/output, platform, refactor/tests); the AGNOS arm stayed out, parked. 4 P1 / 7 P2 / 18 P3 were repaired, including a forged TCP fallback reply printed as the answer, a TC=1 failure that exited 0, unknown `+options` accepted silently, and argv names echoed raw. CLI semantics now follow BIND (exit 1, `+retry`/`+tries`/`+time`, `+ignore`), and a resolv.conf naming only unusable resolvers fails closed. 9 smaller items are deferred: the record is [`../audit/2026-11-08-audit.md`](../audit/2026-11-08-audit.md) § Deferred, mirrored in `roadmap.md`.
+
 Next bite per `roadmap.md`: the rest of **0.4.x** — `+trace` (the recursive walk from root, unblocked by 0.3.8's NOERROR/ANCOUNT=0 exit-0 fix, since every delegation hop is exactly that shape), then the DNSSEC validation ladder (RRSIG/DNSKEY/DS/NSEC/NSEC3 parse + chain validation against the root KSK). IPv6 transport once the platform layer grows an AAAA sockaddr.
 
 ## Dependencies (current — `cyrius.cyml [deps].stdlib`)
 
 ```
-string fmt alloc io vec str syscalls assert bench args
+string fmt alloc io vec str syscalls assert bench args chrono
 ```
 
 Plus two first-party distlib deps: **`taar` 0.6.2** (ipv4 codec + TCP primitives) and **`cmdit` 1.5.1** (CLI scaffolding, adopted 0.3.7). Both are the latest published releases, and both pin cyrius 6.7.18.
@@ -50,7 +52,7 @@ Plus two first-party distlib deps: **`taar` 0.6.2** (ipv4 codec + TCP primitives
 
 Same posture as yo: pragmatic POSIX `socket()` on the Linux backend; the AGNOS backend (`src/platform_agnos.cyr`) uses the sovereign `udp_bind`/`udp_send`/`udp_recv`/`udp_unbind` kernel primitives (#51-54, landed agnos 1.45.3, via the cyrius ≥ 6.2.6 peer) and resolves real names end-to-end on agnos. The v1.0 release gate enforces **no-POSIX on the AGNOS backend only**. (Both the roadmap § 0.2.x kernel-exposure block and the r8169 RX dependency are cleared — r8169 RX solved 2026-05-25.)
 
-**Neither backend hardcodes an arch-specific syscall table** as of 0.3.7. `platform_linux.cyr`'s private `_LX_SYS_*` table — x86_64 numbers used on every non-AGNOS target, including aarch64 — is gone in favour of the stdlib's arch-dispatched wrappers. Two calls (`clock_gettime`, `nanosleep`) have no wrapper and no named constant anywhere in the stdlib and remain arch-guarded literals; that gap is worth filing upstream.
+**Neither backend hardcodes an arch-specific syscall table** as of 0.3.7. `platform_linux.cyr`'s private `_LX_SYS_*` table — x86_64 numbers used on every non-AGNOS target, including aarch64 — is gone in favour of the stdlib's arch-dispatched wrappers. Since 0.5.2 there are no arch-guarded syscall literals left either: the last, `clock_gettime` as 113 / 228, became the stdlib's `clock_now_ns` (`chrono`, which joined `[deps].stdlib`). `nanosleep` left with its only caller at 0.3.8.
 
 **No raw syscall literals remain on the AGNOS backend** as of 0.3.6. The last one — `syscall(61, 3)` for the DHCP-leased resolver — became `sys_net_dns_server()` when cyrius 6.5.35 shipped the `sys_net_config` peer wrappers. Every AGNOS-side call now goes through a named stdlib wrapper. `src/platform_linux.cyr` still uses raw numbered syscalls by design: that is the pragmatic-POSIX arm, and the sovereignty gate does not cover it.
 

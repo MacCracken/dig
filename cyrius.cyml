@@ -10,6 +10,12 @@ cyrius = "6.7.18"
 entry = "src/main.cyr"
 test = "src/test.cyr"
 output = "dig"
+# Dead-code elimination on every build (0.5.2). dig links far more than it
+# reaches: about 160 KB of its 263 KB x86_64 image was unreachable stdlib and
+# dep code (600-odd fns), carried because DCE was opt-in. agnosai, goonj and
+# commandress already build this way. aarch64 NOP-fills rather than compacts,
+# so its file size does not shrink yet; the code is still dropped.
+dce = true
 
 [deps]
 # "flags" was declared at 0.3.0 for "CLI parsing" and never referenced by a
@@ -17,7 +23,7 @@ output = "dig"
 # --long grammar does not fit BIND's `@server` / `+flag` shape. Dropped at 0.3.7
 # when [deps.cmdit] took over the getopt-shaped surface, same move kii made at
 # its v1.1.0. "args" stays: cmdit_argv / cmdit_parse call args_init/argc/argv.
-stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "args"]
+stdlib = ["string", "fmt", "alloc", "io", "vec", "str", "syscalls", "assert", "bench", "args", "chrono"]
 
 # Network-probe substrate — the IPv4 codec dig shared byte-identically
 # with yo, extracted at the 0.3.3 / yo-0.5.5 fold. dig consumes taar only

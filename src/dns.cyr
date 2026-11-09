@@ -59,9 +59,8 @@ var DNS_RCODE_YXRRSET  = 7;
 var DNS_RCODE_NXRRSET  = 8;
 var DNS_RCODE_NOTAUTH  = 9;
 var DNS_RCODE_NOTZONE  = 10;
-# 16 (BADVERS) is deliberately absent: dns_hdr_rcode masks to 4 bits, and the
-# extended RCODE lives in the OPT pseudo-RR's TTL high byte, which dig does not
-# parse until 0.4.x. An arm for it here would be unreachable.
+# These are the 4-bit header codes. The extended ones (16 BADVERS and up) need
+# OPT's TTL high byte, which dns_full_rcode folds in; output_rcode_str names them.
 
 # === Limits ===
 var DNS_HEADER_LEN          = 12;
@@ -292,7 +291,8 @@ fn dns_skip_name(msg, msg_len, off): i64 {
 
 # Every accessor below reads a big-endian u16 out of the fixed 12-byte header.
 # NONE of them bounds-check: the caller must have already established that at
-# least 12 bytes were received. `query_send_recv` is the only caller and does.
+# least 12 bytes were received. query_reply_acceptable establishes it for every
+# reply dig keeps, and checks it before reading any of these.
 
 # Query ID (bytes 0-1). Echoed by the responder; the RFC 5452 anti-spoof match.
 fn dns_hdr_id(msg):       i64 { return (load8(msg) << 8) | load8(msg + 1); }
@@ -308,8 +308,8 @@ fn dns_hdr_nscount(msg):  i64 { return (load8(msg + 8) << 8) | load8(msg + 9); }
 # ARCOUNT (bytes 10-11) — additional records. Same caveat as ANCOUNT.
 fn dns_hdr_arcount(msg):  i64 { return (load8(msg + 10) << 8) | load8(msg + 11); }
 # RCODE — the low 4 bits of FLAGS (RFC 1035 §4.1.1). EDNS extended RCODEs live
-# in the OPT pseudo-RR's TTL field and are NOT folded in here; dig does not
-# parse OPT yet, so a response using them reports only its low nibble.
+# in the OPT pseudo-RR's TTL field and are NOT folded in here: dns_full_rcode
+# does that, and is what the status line reports.
 fn dns_hdr_rcode(msg):    i64 { return dns_hdr_flags(msg) & 0x000F; }
 # 1 if the TC (truncation) bit is set, else 0. A TC=1 reply is a PREFIX of the
 # real answer, not a whole one — the caller must not parse it as complete.
@@ -331,12 +331,12 @@ fn _dns_load_u32(buf, off): i64 {
 
 # Construct a DNS query. Writes the full message to `buf` and returns
 # bytes written, or 0 on encoding failure. Buf must hold at least
-# DNS_HEADER_LEN + DNS_MAX_NAME_LEN + 2 + 4 = ~273 bytes.
+# DNS_HEADER_LEN + DNS_MAX_NAME_LEN + 4 + DNS_OPT_RR_LEN = 282 bytes (the OPT
+# only when `edns_payload` > 0).
 #
-# Sets: ID = supplied (caller picks; we don't have a kernel RNG yet
-# so the platform layer reads /dev/urandom and passes it in). QR=0,
-# Opcode=0, AA=0, TC=0, RD=1, RA=0, Z=0, RCODE=0. QDCOUNT=1,
-# ANCOUNT=NSCOUNT=ARCOUNT=0.
+# Sets: ID = supplied (the caller draws it from getrandom; platform_random_u16).
+# QR=0, Opcode=0, AA=0, TC=0, RD=1, RA=0, Z=0, RCODE=0. QDCOUNT=1,
+# ANCOUNT=NSCOUNT=0, and ARCOUNT=1 when an OPT is appended, else 0.
 fn dns_build_query(buf, id, name, qtype, edns_payload, do_bit): i64 {
     _dns_store_u16(buf, 0, id);
     _dns_store_u16(buf, 2, DNS_FLAG_RD);
@@ -383,9 +383,6 @@ fn dns_skip_question(msg, msg_len, off): i64 {
     return p + 4;
 }
 
-# Walk to the start of the answer section. Handles arbitrary QDCOUNT
-# (it's almost always 1, but RFC doesn't forbid more). Returns 0 on
-# parse error.
 # ASCII-lowercase one byte. DNS names compare case-INSENSITIVELY (RFC 4343),
 # and a resolver may echo the question in any case — 0x20-encoding servers
 # deliberately randomize it — so the question match must fold case.
@@ -440,12 +437,19 @@ fn dns_skip_rrs(msg, msg_len, off, count): i64 {
     return cur;
 }
 
-# Offset of the OPT pseudo-RR in the ADDITIONAL section, or 0 if the responder
-# sent none (which is how a non-EDNS server answers, and is not an error).
+# Returned by dns_find_opt when the additional section holds MORE than one OPT,
+# which RFC 6891 §6.1.1 makes a FORMERR. Negative so it can never be an offset.
+var DNS_OPT_DUP = 0 - 1;
+
+# Offset of the OPT pseudo-RR in the ADDITIONAL section, 0 if the responder sent
+# none (which is how a non-EDNS server answers, and is not an error), or
+# DNS_OPT_DUP if it sent more than one.
 #
 # Walking there means stepping over every answer and authority record first, so
 # this is only worth calling once per response. Returns the offset of the RR's
-# NAME, so the accessors below index from there.
+# NAME, so the accessors below index from there. The WHOLE additional section is
+# walked: through 0.5.1 the first OPT won, so a second one, with a different
+# extended RCODE, passed unremarked.
 fn dns_find_opt(msg, msg_len): i64 {
     if (dns_hdr_arcount(msg) == 0) { return 0; }
     var off = dns_answer_section_start(msg, msg_len);
@@ -456,20 +460,24 @@ fn dns_find_opt(msg, msg_len): i64 {
     if (off == 0) { return 0; }
     var rr = alloc(DNS_RR_SIZE);
     var k = 0;
+    var found = 0;
     var arcount = dns_hdr_arcount(msg);
     while (k < arcount) {
         var start = off;
         var nx = dns_parse_rr(msg, msg_len, off, rr);
-        if (nx == 0) { return 0; }
+        if (nx == 0) { return found; }
         # OPT's NAME must be the root — a single zero byte. Anything else is not
         # a well-formed OPT and we decline to read transport meaning out of it.
         if (dns_rr_type(rr) == DNS_TYPE_OPT) {
-            if (load8(msg + dns_rr_name_off(rr)) == 0) { return start; }
+            if (load8(msg + dns_rr_name_off(rr)) == 0) {
+                if (found != 0) { return DNS_OPT_DUP; }
+                found = start;
+            }
         }
         off = nx;
         k = k + 1;
     }
-    return 0;
+    return found;
 }
 
 # The UDP payload size the RESPONDER advertised, from OPT's repurposed CLASS
@@ -501,9 +509,17 @@ fn dns_opt_do(msg, opt_off): i64 {
 # extended code a query dig actually sends can provoke, so folding it in is not
 # hypothetical: it is the difference between "your EDNS version was rejected"
 # and "everything is fine, here are no records".
-fn dns_full_rcode(msg, msg_len): i64 {
+#
+# `edns_sent` is whether OUR query carried an OPT. RFC 6891 §7 forbids an OPT in
+# the reply to a query without one, so its extended RCODE is not ours to fold
+# in: through 0.5.1 a `+noedns` query could be answered "RESERVED16" that way.
+# Returns -1 when the reply carries more than one OPT (RFC 6891 §6.1.1): the
+# message is malformed and there is no single RCODE to report.
+fn dns_full_rcode(msg, msg_len, edns_sent): i64 {
     var base = dns_hdr_rcode(msg);
+    if (edns_sent == 0) { return base; }
     var opt = dns_find_opt(msg, msg_len);
+    if (opt == DNS_OPT_DUP) { return 0 - 1; }
     if (opt == 0) { return base; }
     return (dns_opt_ext_rcode(msg, opt) << 4) | base;
 }

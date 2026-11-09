@@ -11,8 +11,26 @@ include "src/output.cyr"
 include "src/query.cyr"
 include "src/tcp.cyr"
 
-# Write a cstr to stderr.
-fn _eputs(s): i64 { sys_write(2, s, strlen(s)); return 0; }
+# `;; communications error to A.B.C.D#53: <reason>` on stderr — BIND's wording,
+# for a transport failure that is not a timeout. `qr` is QRY_REFUSED or
+# QRY_NETERR; for the latter the errno is in query_last_err.
+fn _dig_comm_error(server, qr): i64 {
+    var ab[24];
+    var an = ipv4_format_to_buf(server, &ab);
+    _out_eputs(";; communications error to ");
+    _out_ewrite(&ab, an);
+    _out_eputs("#53: ");
+    var e = query_last_err;
+    if (qr == QRY_REFUSED)          { _out_eputs("connection refused"); }
+    elif (e == 0 - 101)             { _out_eputs("network unreachable"); }
+    elif (e == 0 - 113)             { _out_eputs("host unreachable"); }
+    elif (e == 0 - 104)             { _out_eputs("connection reset"); }
+    elif (e == TCP_ERR_CLOSED)      { _out_eputs("end of file"); }
+    elif (e == TCP_ERR_FRAME)       { _out_eputs("malformed TCP length prefix"); }
+    else                            { _out_eputs("error "); _out_eint(e); }
+    _out_eputs("\n");
+    return 0;
+}
 
 # Print the version line, same shape and same source of truth as the query
 # banner (`; <<>> dig X.Y.Z <<>>`) — both read _DIG_VERSION_STR, which is
@@ -28,16 +46,85 @@ fn _dig_print_version(): i64 {
 # resolves the server to query, sends it and prints the answer.
 #
 # Returns the process exit status directly, following BIND's dig rather than the
-# 0/1/2 AGNOS userland convention, because matching upstream matters more here
-# than matching the family — scripts written against BIND's dig check these:
+# 0/1/2 AGNOS userland convention, because scripts written against BIND's dig
+# check these:
 #   0  success (also --help and --version)
-#   2  usage error — bad flag, bad @server, unknown record type, no name
-#   9  no usable answer — timed out, transport failed, or the response could not
-#      be parsed. BIND spells this "no reply from server".
-# cmdit's CMDIT_EXIT_OK / CMDIT_EXIT_USAGE name the first two; 9 has no cmdit
-# constant because it is not part of that convention.
+#   1  usage error — bad flag or option, bad @server, unknown type or class,
+#      no name, illegal name. BIND's usage() exits 1. Through 0.5.1 dig exited
+#      2 here, under a comment claiming to follow BIND.
+#   9  no usable answer — timed out, refused, transport failed, or the response
+#      could not be parsed. BIND spells this "no reply from server".
+#   10 internal error — no socket, no entropy for the query ID.
+var DIG_EXIT_USAGE = 1;
+
+# A usage error naming the argv token it is about: `<pre>'<token>'<post>` on
+# stderr, the token escaped (see _out_esc_fd), then the usage line if asked.
+# Returns DIG_EXIT_USAGE so callers can `return` it.
+fn _dig_usage_err(pre, tok, post, with_usage): i64 {
+    _out_eputs(pre);
+    if (tok != 0) {
+        _out_eputs("'");
+        _out_esc_fd(2, tok, strlen(tok), 0);
+        _out_eputs("'");
+    }
+    _out_eputs(post);
+    if (with_usage == 1) { dig_cli_print_usage(2); }
+    return DIG_EXIT_USAGE;
+}
+
+# What _dig_print_answers found, as bits.
+var DIG_ANS_TRUNC      = 1;   # the walk stopped short of ANCOUNT
+var DIG_ANS_MALFORMED  = 2;   # a record's rdata did not validate
+var DIG_ANS_BADSECTION = 4;   # the question section could not be skipped
+
+# Walk the answer section and print every record: rdata lines under `+short`
+# (short = 1), full answer lines otherwise. Returns DIG_ANS_* bits; with
+# DIG_ANS_BADSECTION nothing was printed.
+#
+# One loop for both modes (0.5.2); through 0.5.1 main carried two copies of it.
+# Every answer RR prints, with no qtype filter — the same as BIND. Filtering
+# would hide exactly the record an operator debugging a hostile resolver needs.
+#
+# A record that fails to parse STOPS the walk rather than returning from main:
+# returning skipped the footer, so the user got N good records, one stderr line,
+# no `;; Query time` line and exit 9, with no way to tell how many were missing.
+# The warning is stderr only, its numbers included: through 0.5.1 they went
+# through fmt_int to STDOUT, so `+short` stdout read `1.2.3.4\n13` (a bogus
+# token for `for ip in $(dig +short ...)`) and stderr read "after  of  records".
+fn _dig_print_answers(rx, resp_len, ancount, short): i64 {
+    var off = dns_answer_section_start(rx, resp_len);
+    if (off == 0) { return DIG_ANS_BADSECTION; }
+    var rr = alloc(DNS_RR_SIZE);
+    var st = 0;
+    var k = 0;
+    while (k < ancount) {
+        var next = dns_parse_rr(rx, resp_len, off, rr);
+        if (next == 0) {
+            _out_eputs(";; WARNING: message truncated after ");
+            _out_eint(k);
+            _out_eputs(" of ");
+            _out_eint(ancount);
+            _out_eputs(" records\n");
+            return st | DIG_ANS_TRUNC;
+        }
+        var r = 0;
+        if (short == 1) { r = output_print_short_rr(rx, resp_len, rr, next); }
+        else            { r = output_print_answer_rr(rx, resp_len, rr, next); }
+        if (r < 0) { st = st | DIG_ANS_MALFORMED; }
+        off = next;
+        k = k + 1;
+    }
+    return st;
+}
+
+# Program entry: parse argv, pick the resolver, query, print. Returns the exit status (codes above).
 fn main() {
     alloc_init();
+    # A TCP write to a peer that has reset the connection raises SIGPIPE, and
+    # neither taar's sender nor dig's suppresses it: a hostile server could kill
+    # dig with no message and a signal status instead of exit 9. BIND ignores
+    # SIGPIPE too. Output errors are already ignored, so stdout loses nothing.
+    signal_ignore(SIGPIPE);
 
     # cmdit owns the boilerplate AROUND dig's grammar, not the grammar itself:
     # --help/-h and --version/-V are registered for free and short-circuit here,
@@ -53,29 +140,30 @@ fn main() {
     if (cr == CMDIT_RESULT_ERR) {
         cmdit_print_error(h);
         dig_cli_print_usage(2);
-        return CMDIT_EXIT_USAGE;
+        return DIG_EXIT_USAGE;
     }
 
     var reg = dig_cli_new();
     var rc = dig_cli_parse_argv(reg, cmdit_raw_argc(h), cmdit_raw_argv(h));
+    var et = dig_cli_err_token(reg);
 
-    if (rc == DIG_CLI_HELP)            { dig_cli_print_help(); return CMDIT_EXIT_OK; }
-    if (rc == DIG_CLI_ERR_PARSE) {
-        _eputs("dig: parse error\n");
-        dig_cli_print_usage(2);
-        return CMDIT_EXIT_USAGE;
-    }
+    if (rc == DIG_CLI_HELP)           { dig_cli_print_help(); return CMDIT_EXIT_OK; }
+    if (rc == DIG_CLI_ERR_PARSE)      { return _dig_usage_err("dig: unknown option ", et, "\n", 1); }
+    if (rc == DIG_CLI_ERR_BAD_OPTION) { return _dig_usage_err("dig: invalid option: ", et, "\n", 1); }
+    if (rc == DIG_CLI_ERR_BAD_VALUE)  { return _dig_usage_err("dig: bad or missing value in ", et, "\n", 1); }
     if (rc == DIG_CLI_ERR_BAD_SERVER) {
-        _eputs("dig: bad @server (need dotted-quad IPv4)\n");
-        return CMDIT_EXIT_USAGE;
+        return _dig_usage_err("dig: bad server ", et, " (need @ and a dotted-quad IPv4 address)\n", 0);
     }
-    if (rc == DIG_CLI_ERR_BAD_TYPE)    { _eputs("dig: unknown record type\n");   return CMDIT_EXIT_USAGE; }
+    if (rc == DIG_CLI_ERR_BAD_TYPE) {
+        return _dig_usage_err("dig: ", et, " is not a record type, and a query name was already given\n", 0);
+    }
+    if (rc == DIG_CLI_ERR_BAD_CLASS) {
+        return _dig_usage_err("dig: class ", et, " is not supported; dig queries class IN only\n", 0);
+    }
 
     var name = dig_cli_name(reg);
     if (name == 0) {
-        _eputs("dig: missing query name\n");
-        dig_cli_print_usage(2);
-        return CMDIT_EXIT_USAGE;
+        return _dig_usage_err("dig: missing query name\n", 0, "", 1);
     }
 
     # Validate the name HERE, by the same encoder that will put it on the wire.
@@ -87,10 +175,7 @@ fn main() {
     # cli.cyr is deliberate: a second copy of those rules would drift.
     var nchk[256];
     if (dns_encode_name(name, &nchk) == 0) {
-        _eputs("dig: '");
-        _eputs(name);
-        _eputs("' is not a legal domain name\n");
-        return CMDIT_EXIT_USAGE;
+        return _dig_usage_err("dig: ", name, " is not a legal domain name\n", 0);
     }
 
     # Resolver: explicit @server beats /etc/resolv.conf beats fallback.
@@ -103,6 +188,8 @@ fn main() {
     var server = dig_cli_server_addr(reg);
     if (dig_cli_server_seen(reg) == 0) {
         server = resolv_discover();
+        # Failed closed: resolv.conf names resolvers, none usable. It has said why.
+        if (server == RESOLV_NONE) { return 9; }
     }
 
     var qtype = dig_cli_qtype(reg);
@@ -110,15 +197,15 @@ fn main() {
     var edns = dig_cli_bufsize(reg);
     var do_bit = dig_cli_dnssec(reg);
 
-    # The receive buffer must be able to hold what we ADVERTISE we can hold, or
-    # the advertisement is a lie the responder will act on. With +noedns it
-    # falls back to the classic 512. TCP can carry up to 65535, so the buffer is
-    # sized for that whenever TCP is reachable — which is always, since TC=1
-    # fallback is automatic.
+    # One 64 KiB receive buffer for both transports. TCP can carry up to 65535,
+    # and so can a UDP datagram: the advertised EDNS size is what we ask a
+    # responder to stay under, not a promise it keeps. Through 0.5.1 a UDP reply
+    # was read into the ADVERTISED size (512 under +noedns), so the kernel cut a
+    # larger datagram silently and dig then blamed the message: "truncated after
+    # 2 of 4 records", exit 9, and an OPT past the cut took its extended RCODE
+    # with it. BIND reads into 64 KiB too.
     var rx_cap = DNS_MAX_TCP_PAYLOAD;
     var rx = alloc(rx_cap);
-    var udp_cap = DNS_MAX_UDP_PAYLOAD;
-    if (edns > 0) { udp_cap = edns; }
     var resp_len_slot = alloc(8);
     var query_us_slot = alloc(8);
     store64(resp_len_slot, 0);
@@ -126,8 +213,11 @@ fn main() {
 
     var used_tcp = 0;
     var qr = QRY_TIMEOUT;
+    # What became of a TC=1 UDP reply: 0 none, 1 kept under `+ignore`, 2 kept
+    # because the TCP retry failed. Only the last makes the run a failure.
+    var tc_kept = 0;
 
-    if (dig_cli_tcp(reg) == DIG_TCP_FORCE) {
+    if (dig_cli_tcp(reg) == 1) {
         # `+tcp` forces TCP from the start — no UDP attempt at all, matching BIND.
         qr = query_send_recv_tcp(server, name, qtype, dig_cli_timeout_s(reg),
           rx, rx_cap, resp_len_slot, query_us_slot,
@@ -137,8 +227,8 @@ fn main() {
         qr = query_send_recv(
           server, name, qtype,
           dig_cli_timeout_s(reg),
-          dig_cli_retry(reg),
-          rx, udp_cap,
+          dig_cli_tries(reg),
+          rx, rx_cap,
           resp_len_slot, query_us_slot,
           edns, do_bit
           );
@@ -147,9 +237,11 @@ fn main() {
         # whole one. Through 0.3.8 dig printed the prefix with a warning and
         # called it an answer — which is how `dig TXT` silently lost records for
         # eight releases. Now it re-asks over TCP, which has no 512-byte ceiling.
-        if (qr == QRY_OK) {
-            # `+notcp` means exactly that: stay on UDP and live with the prefix.
-            if ((dns_hdr_truncated(rx) == 1) && (dig_cli_tcp(reg) != DIG_TCP_NEVER)) {
+        if ((qr == QRY_OK) && (dns_hdr_truncated(rx) == 1)) {
+            if (dig_cli_ignore_tc(reg) == 1) {
+                # `+ignore`: the user asked for the prefix. BIND's spelling.
+                tc_kept = 1;
+            } else {
                 var tcp_us = alloc(8);
                 store64(tcp_us, 0);
                 var tqr = query_send_recv_tcp(server, name, qtype,
@@ -161,37 +253,61 @@ fn main() {
                     # included — that is what the user waited.
                     store64(query_us_slot, load64(query_us_slot) + load64(tcp_us));
                     used_tcp = 1;
+                } else {
+                    # query_send_recv_tcp writes rx only on success, so the
+                    # accepted UDP prefix is still there to show. Showing it
+                    # beats discarding it, but the run FAILED: exit 9 below.
+                    tc_kept = 2;
                 }
-                # A failed TCP retry leaves the truncated UDP reply in place and
-                # the TC warning below still fires, which is strictly better
-                # than discarding the partial answer we already have.
             }
         }
     }
 
+    # Failures. 9 is BIND's "no reply from server"; 10 is its "internal error",
+    # which is what a socket or entropy failure on THIS host is. Through 0.5.1 a
+    # refused port, an unreachable network and a torn TCP stream all printed
+    # "connection timed out" (after zero seconds), and entropy failure printed
+    # "cannot open UDP socket", even for +tcp.
     if (qr == QRY_SOCKET) {
-        _eputs("dig: cannot open UDP socket\n");
-        return 9;
+        _out_eputs("dig: cannot open a socket\n");
+        return 10;
     }
-    if (qr == QRY_TIMEOUT) {
-        if (dig_cli_short(reg) == 0) {
-            output_print_header(name);
-            _out_eputs(";; connection timed out; no servers could be reached\n");
-        } else {
-            _out_eputs(";; connection timed out; no servers could be reached\n");
-        }
-        return 9;
+    if (qr == QRY_ENTROPY) {
+        _out_eputs("dig: the kernel could not supply entropy for the query ID; not sending a guessable one\n");
+        return 10;
     }
     if (qr == QRY_BAD) {
-        _eputs("dig: malformed response\n");
+        # Unreachable: the name was validated by the same encoder above.
+        _out_eputs("dig: internal error: the query could not be built\n");
+        return 10;
+    }
+    if (qr != QRY_OK) {
+        if (dig_cli_short(reg) == 0) { output_print_header(name); }
+        if (qr == QRY_TIMEOUT) {
+            _out_eputs(";; connection timed out; no servers could be reached\n");
+        } else {
+            _dig_comm_error(server, qr);
+        }
         return 9;
     }
 
     var resp_len = load64(resp_len_slot);
     var query_us = load64(query_us_slot);
 
-    var rcode = dns_full_rcode(rx, resp_len);
+    var edns_sent = 0;
+    if (edns > 0) { edns_sent = 1; }
+    var rcode = dns_full_rcode(rx, resp_len, edns_sent);
+    if (rcode < 0) {
+        # BIND: "Got bad packet: FORMERR". There is no single RCODE to show.
+        _out_eputs("dig: malformed response: more than one OPT record (RFC 6891 6.1.1)\n");
+        return 9;
+    }
     var ancount = dns_hdr_ancount(rx);
+    # An error reply may legitimately omit the question (query_reply_acceptable
+    # admits exactly that shape and nothing else). Say so: BIND warns too.
+    if (dns_hdr_qdcount(rx) == 0) {
+        _out_eputs(";; WARNING: the reply has no question section\n");
+    }
 
     # Sticky status flags. Set by the record loops below, folded into the exit
     # code at the very end so a problem never costs the user the rest of the
@@ -199,39 +315,37 @@ fn main() {
     var trunc = 0;
     var malformed = 0;
 
+    # A kept TC=1 reply is a PREFIX of the answer. Say so on STDERR, in both
+    # modes, before any of it prints. Through 0.5.1 the warning went to stdout
+    # in full mode only and the run exited 0, so under `+short` a failed TCP
+    # retry was SILENT: a reply truncated to no records printed nothing and
+    # exited 0, indistinguishable from NODATA, and one truncated to 1 of N
+    # records printed that one as if it were the whole answer. A firewall that
+    # blocks TCP/53 is enough to reach it. BIND exits 9 here too.
+    #
+    # A TC bit on a reply that came over TCP is ignored, as BIND does: TCP has
+    # no 512-byte ceiling to truncate against, and there is nowhere to retry.
+    if (tc_kept == 1) {
+        _out_eputs(";; WARNING: response truncated (TC=1); +ignore kept this PREFIX of the answer\n");
+    }
+    if (tc_kept == 2) {
+        _out_eputs(";; WARNING: response truncated (TC=1) and the TCP retry failed; this answer is a PREFIX\n");
+    }
+
     # +short: just rdata. Skip everything else.
     if (dig_cli_short(reg) == 1) {
-        var off = dns_answer_section_start(rx, resp_len);
-        if (off == 0) {
-            _eputs("dig: response section parse failure\n");
-            return 9;
-        }
-        var rr = alloc(DNS_RR_SIZE);
-        var k = 0;
-        var short_trunc = 0;
-        while (k < ancount) {
-            var next = dns_parse_rr(rx, resp_len, off, rr);
-            if (next == 0) {
-                _out_eputs(";; WARNING: message truncated after ");
-                fmt_int(k);
-                _out_eputs(" of ");
-                fmt_int(ancount);
-                _out_eputs(" records\n");
-                short_trunc = 1;
-                k = ancount;
-            } else {
-                # Every answer RR's rdata prints, with no qtype filter — the
-                # same as BIND. (Through 0.3.7 the comment here promised a
-                # type/CNAME-chain filter that did not exist and never had.
-                # Filtering would hide exactly the record an operator debugging
-                # a hostile resolver needs to see.)
-                if (output_print_short_rr(rx, resp_len, rr, next) < 0) { malformed = 1; }
-                off = next;
-                k = k + 1;
+        if (ancount > 0) {
+            var sst = _dig_print_answers(rx, resp_len, ancount, 1);
+            if ((sst & DIG_ANS_BADSECTION) != 0) {
+                _out_eputs("dig: response section parse failure\n");
+                return 9;
             }
+            if ((sst & DIG_ANS_TRUNC) != 0)     { trunc = 1; }
+            if ((sst & DIG_ANS_MALFORMED) != 0) { malformed = 1; }
         }
-        if (short_trunc == 1) { return 9; }
-        if (malformed == 1)   { return 9; }
+        if (trunc == 1)     { return 9; }
+        if (malformed == 1) { return 9; }
+        if (tc_kept == 2)   { return 9; }
         return 0;
     }
 
@@ -240,54 +354,19 @@ fn main() {
     _out_puts(";; ->>HEADER<<- opcode: QUERY, status: ");
     output_print_rcode(rcode);
     _out_puts(", id: ");
-    fmt_int(dns_hdr_id(rx));
+    _out_int(dns_hdr_id(rx));
     _out_puts("\n");
     output_print_question(name, qtype);
 
-    if (dns_hdr_truncated(rx) == 1) {
-        # Only reachable when no TCP answer replaced this one — a successful
-        # fallback swaps rx for the untruncated reply. Say WHICH of the two
-        # reasons applies: "the retry failed" is a different problem from "you
-        # told me not to retry", and reporting the first for the second sends
-        # the reader hunting a network fault they do not have.
-        _out_puts(";; WARNING: response truncated (TC=1) — this answer is a PREFIX");
-        if (dig_cli_tcp(reg) == DIG_TCP_NEVER) {
-            _out_puts(", and +notcp forbade the TCP retry\n");
-        } else {
-            _out_puts(", and the TCP retry failed\n");
-        }
-    }
     if (ancount > 0) {
         _out_puts(";; ANSWER\n");
-        var off2 = dns_answer_section_start(rx, resp_len);
-        if (off2 == 0) {
-            _eputs("dig: response section parse failure\n");
+        var st = _dig_print_answers(rx, resp_len, ancount, 0);
+        if ((st & DIG_ANS_BADSECTION) != 0) {
+            _out_eputs("dig: response section parse failure\n");
             return 9;
         }
-        var rr2 = alloc(DNS_RR_SIZE);
-        var k2 = 0;
-        while (k2 < ancount) {
-            var next2 = dns_parse_rr(rx, resp_len, off2, rr2);
-            if (next2 == 0) {
-                # Break, do not return. Returning here skipped the footer
-                # entirely, so the user got N good records, one stderr line, no
-                # `;; Query time` line and exit 9 — with no way to tell whether
-                # the N shown were valid or how many were missing. Reachable
-                # with no lie at all: the 512-byte UDP cap cuts a larger reply
-                # mid-record.
-                _out_eputs(";; WARNING: message truncated after ");
-                fmt_int(k2);
-                _out_eputs(" of ");
-                fmt_int(ancount);
-                _out_eputs(" records\n");
-                trunc = 1;
-                k2 = ancount;
-            } else {
-                if (output_print_answer_rr(rx, resp_len, rr2, next2) < 0) { malformed = 1; }
-                off2 = next2;
-                k2 = k2 + 1;
-            }
-        }
+        if ((st & DIG_ANS_TRUNC) != 0)     { trunc = 1; }
+        if ((st & DIG_ANS_MALFORMED) != 0) { malformed = 1; }
     } else {
         _out_puts(";; (no answer)\n");
     }
@@ -304,8 +383,11 @@ fn main() {
     # 9 is retained for QRY_SOCKET / QRY_TIMEOUT above, which is what it means.
     if (trunc == 1)     { return 9; }
     if (malformed == 1) { return 9; }
+    if (tc_kept == 2)   { return 9; }
     return 0;
 }
 
 var r = main();
+# Buffered stdout (output.cyr) goes out here, on every path, before the exit.
+_out_flush();
 syscall(SYS_EXIT, r);
