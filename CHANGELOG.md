@@ -4,6 +4,89 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-08
+
+**Toolchain `6.6.20` → `6.7.9` (the 6.7 language minor), cmdit `1.2.6` → `1.4.0` and taar
+`0.5.2` → `0.6.0`, the last tags of each pinned to 6.7.9.** dig's own source is unchanged. Two
+CLI behaviours change, both arriving with cmdit. 260/260 assertions and 1,560,376/1,560,376 fuzz
+cases pass. The x86_64, `--agnos` and `--aarch64` builds are clean, and live queries (UDP, EDNS
+TXT, `+noedns` TC→TCP fallback, `+tcp`, resolv.conf discovery) answer.
+
+### Changed (user-visible, from cmdit 1.3.x)
+
+- **`--help=x` and `--version=1` are usage errors (exit 2).** Through 0.4.2 cmdit ignored the
+  value, so dig printed help or the version and exited 0. They now print
+  `dig: --help: option takes no value (got 'x')` and the usage line. This came in with
+  cmdit 1.3.1. Plain `--help` / `-h` / `--version` / `-V` are unchanged.
+- **Unknown-flag errors name the token.** `dig --bogus` printed `dig: unknown flag`. It now
+  prints `dig: unknown flag: --bogus`. This came in with cmdit 1.3.3. Every argv byte cmdit
+  echoes is escaped: a control byte or DEL becomes `?`, so a hostile token cannot put terminal
+  escape sequences on screen. That is the same defence dig gave zone data at 0.3.7. Checked
+  with `ESC`, `BEL` and `\x01` in the token.
+
+### Changed
+
+- **Toolchain pin `6.6.20` → `6.7.9`.** CI reads it from `cyrius.cyml`, so no workflow edit.
+  Each of taar 0.6.0's 6.7.x migration checks was run against dig's `src/` and `tests/`:
+  - no lone `!` (before 6.7.3 the lexer dropped it, so `!x` meant `x`);
+  - no unary `-` / `~` on a constant followed by an operator and a literal. 6.7.9 fixed a fold
+    that made `-K + 10` read as 15 on 6.6.10–6.7.8, which includes 0.4.2's 6.6.20;
+  - no identifier that 6.7.x reserved (`trait`, `const`, `true`, `false`, `do`, `dyn`, `impl`,
+    `bool`).
+
+  None of the three occurs, so 0.4.2's arithmetic was not affected by the fold bug.
+- **`[deps.cmdit]` `1.2.6` → `1.4.0`.** 1.3.0–1.3.7 are append-only additions plus the two
+  behaviours above and an audit sweep (1.3.2). 1.4.0 is an internal refactor whose output is
+  byte-identical, with buffered output (one write per renderer call) and tables that grow on
+  demand. dig calls `cmdit_new`, `cmdit_parse`, `cmdit_print_error`, `cmdit_raw_argc` /
+  `cmdit_raw_argv`, `cmdit_argv` and the `CMDIT_*` result/exit constants. None of them changed
+  signature.
+- **`[deps.taar]` `0.5.2` → `0.6.0`.** Toolchain only: the bundle differs from 0.5.2 in its
+  version line alone.
+- **`path = "../cmdit"` / `path = "../taar"` restored.** From cyrius 6.7.6 `path` is a dev
+  override, read only in local mode (`CYRIUS_LOCAL=1`, `CYRIUS_LOCAL=<dep,…>` or `--local`).
+  A plain resolve builds the tag and prints
+  `hint: 2 deps have local checkouts not in use (cmdit, taar)`. That removes the reason 0.4.2
+  commented the lines out. Local mode was checked: it reports
+  `local: cmdit <- ../cmdit @efffc54, 5 commits past 1.4.0 — CI builds 1.4.0`, builds from
+  `build/local-deps/`, and leaves `lib/` and `cyrius.lock` byte-identical. The `cyrius.cyml`
+  comment that said "`path` drives local dev resolution" is rewritten to match. This acts on
+  the roadmap note cyrius 6.7.6 recorded for this pin move, and that note is removed.
+- **`lib/` re-vendored from the 6.7.9 snapshot.** All 27 stdlib files are byte-identical to
+  `6.7.9/lib`. The first resolve refused `atomic` and `fnptr` (the pin-move gotcha 0.4.2 also
+  hit). Both rows were checked byte-for-byte against `6.6.20/lib` before `cyrius deps --relock`.
+  `cyrius deps --verify` passes 29/29, and `cyrius deps --locked` reports
+  "lib/ and cyrius.lock are exactly what the tags resolve". The lock commit-pins cmdit 1.4.0 =
+  `bac07a5` and taar 0.6.0 = `2c02641`. As designed since 6.6.20 (CVE-83), it keeps the 1.2.6
+  and 0.5.2 lines too, which fails closed against a repointed old tag. A CI-faithful run
+  (tracked tree only, no `lib/`, no siblings) wrote an identical lock and a sha256-identical
+  binary.
+
+### Binary size: +21.5 KB, from cmdit
+
+| build | host | `--agnos` | live (`CYRIUS_DCE=1`) |
+|---|---|---|---|
+| 0.4.2 (6.6.20, cmdit 1.2.6, taar 0.5.2) | 206,664 | 223,376 | 82,880 |
+| 6.7.9, old deps | 206,672 | — | 83,792 |
+| **0.5.0** (6.7.9, cmdit 1.4.0, taar 0.6.0) | **228,192** | **244,912** | **93,024** |
+
+The toolchain move alone is +8 B (+912 B live). The rest is cmdit. Its bundle grew 88 → 149
+fns. Most of the new code is unreachable from dig and DCE drops it: the 15 introspection
+functions and the per-verb completion paths, for example. The live +9.2 KB is the code dig does
+reach, where reachable cmdit fns went 28 → 50:
+- the output session (`_cmdit_out_begin` / `_end`, `_cmdit_flush`, `_cmdit_write_all`);
+- table growth (`_cmdit_grow`);
+- the escaping, token-naming error path (`_cmdit_print_esc`, `_cmdit_eprint_quoted`);
+- the unified flag path (`_cmdit_take_flag`).
+
+aarch64 went 272,120 → 273,160 B (it has no DCE compaction yet).
+
+### Not changed
+
+- `cyrius audit` still reports 5 lint warnings (consecutive blank lines in `tests/dig.tcyr`)
+  and 11 undocumented public fns, the same as at 6.6.2 and 6.6.20. CI gates on deps/build/test
+  only.
+
 ## [0.4.2] - 2026-11-08
 
 **Maintenance: toolchain `6.6.2` → `6.6.20`, both first-party deps moved to their 6.6.20-pinned
