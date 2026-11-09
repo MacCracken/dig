@@ -4,6 +4,106 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-08
+
+**Toolchain `6.7.9` → `6.7.18`, cmdit `1.4.0` → `1.5.1` and taar `0.6.0` → `0.6.2`: the latest
+release of all three.** dig's own source is unchanged. The user-visible change is that `+tcp` to
+a server that drops SYNs now gives up at `+timeout`, where before it waited out the kernel's SYN
+retries. 260/260 assertions pass on x86_64, and on aarch64 under `qemu-aarch64`. 1,560,376/1,560,376
+fuzz cases pass. The x86_64, `--agnos` and `--aarch64` builds are clean, and live queries (UDP,
+EDNS TXT, `+noedns` TC→TCP fallback, `+tcp`, resolv.conf discovery) answer on x86_64. On
+aarch64 under qemu, UDP and the TCP fallback were checked.
+
+### Fixed (from taar 0.6.2)
+
+- **`+tcp` honours `+timeout` during connect.** `taar_tcp_set_timeout_ms` set only
+  `SO_RCVTIMEO`, so a connect to a host whose SYNs were dropped blocked through Linux's SYN
+  retries whatever `+timeout` said. Since taar 0.6.2 it sets `SO_SNDTIMEO` too, which bounds
+  connect and send. Measured against `192.0.2.1` (TEST-NET-1) with `+tcp +timeout=2 +retry=0`:
+  0.5.0 took **135.0 s**, 0.5.1 takes **2.0 s**. Both exit 9 with
+  `connection timed out; no servers could be reached`. `src/tcp.cyr` already treated any
+  negative connect or send result as failure, so the new `-EINPROGRESS` on a timed-out connect
+  and `_TAAR_ERR_TIMEOUT` (-11) on a send that writes nothing need no change.
+
+  Other taar 0.6.2 changes don't reach dig:
+  - The resolver no longer falls back silently to 8.8.8.8, and it accepts only class-IN A
+    records. dig doesn't use taar's resolver: `taar_resolve_ipv4` appears only in a
+    `src/tcp.cyr` comment.
+  - On AGNOS, timeout 0 now means "no deadline" and a negative timeout is refused. dig clamps
+    `+timeout` to 1–3600 s, so it never passes either.
+  - UDP peer filtering and the UDP send count. dig's UDP goes through its own `platform_*` arms.
+
+### Changed
+
+- **Toolchain pin `6.7.9` → `6.7.18`.** CI reads it from `cyrius.cyml`, so no workflow edit.
+  The 6.7.10–6.7.18 sections of cyrius's `ecosystem-migration.md` were checked against dig, and
+  none changes what dig's code does on Linux.
+  - **Compiler:** all five programs (main, test, tcyr, fcyr, bcyr) were built with both
+    compilers for x86_64, `--aarch64` and `--agnos`. Diagnostics are identical, and the
+    test and fuzz output is byte-identical.
+  - **Language and codegen:** dig has no struct, generic, trait, closure, f64 or typed-pointer
+    code for those lanes to reach. Every entry point exits explicitly (6.7.11's `fn main`
+    epilogue). No global is declared twice in one program (6.7.12–6.7.16 redeclaration
+    rules); `PLATFORM_ERR_TIMEOUT` appears twice, but in mutually exclusive `#ifdef` arms.
+  - **Stdlib:** the bodies of the 105 functions dig, cmdit and taar reach were diffed. The
+    only behaviour delta is `args_init` (6.7.12), which reads `/proc/self/cmdline` to EOF; see
+    cmdit 1.4.2 below. The aarch64 `syscall(113, ..)` in `platform_linux.cyr` (clock_gettime)
+    draws no renumber warning.
+  - **Lint:** 6.7.11's new `var a[N]` constant-overrun rule (extended at 6.7.12 to const and
+    enum sizes) reports nothing on any file. It was also run with the src includes inlined,
+    so `DNS_NAME_BUF_LEN` is visible to it.
+- **`[deps.cmdit]` `1.4.0` → `1.5.1`.** For dig, two things change:
+  - **The error escaper also stops C1 controls (1.5.1).** U+0080–U+009F, which include CSI as
+    one character (`C2 9B`), now print as `?`, alongside the C0 and DEL bytes 0.5.0 already
+    escaped. The check walks UTF-8 a character at a time, so real non-ASCII names pass.
+    Checked: `dig $'--\xc2\x9b31mX'` prints `dig: unknown flag: --?31mX`.
+  - **A command line over 2 MiB is read whole (1.4.2, with the 6.7.12+ stdlib).** Only a
+    length of exactly 2,097,152 bytes is still refused as possibly cut.
+
+  The rest is completion-script fixes (1.5.0, 1.5.1) and the opt-in `cmdit_continue_on_error`,
+  none of which dig uses.
+- **`[deps.taar]` `0.6.0` → `0.6.2`.** See *Fixed*. 0.6.1 was toolchain-only.
+- **`lib/` re-vendored from the 6.7.18 snapshot**, and every stdlib file is byte-identical to
+  `6.7.18/lib`. The pin-move gotcha 0.4.2 and 0.5.0 hit is gone. At 6.7.18, `cyrius deps` on
+  its own detects the pin move from the lock's `cyrius` trailer and re-vendors and relocks every
+  row, transitive ones included. It needed no `--relock`, and no row was refused. A scoped
+  `cyrius lib sync` now refuses the move instead: it names `fnptr` and `result`, which sit
+  outside the declared subset, and points to `--full`. It writes nothing. dig's CI does not run
+  `lib sync`, so `cyrius deps` is the whole procedure. `cyrius deps --verify` passes 29/29, and
+  `--locked` reports "lib/ and cyrius.lock are exactly what the tags resolve". The lock
+  commit-pins cmdit 1.5.1 = `efffc54` and taar 0.6.2 = `d203629`, the same commits the sibling
+  checkouts are on. It also keeps the 1.2.6/1.4.0 and 0.5.2/0.6.0 lines, fail-closed, and every
+  resolve prints a `note:` for each. A CI-faithful run (tracked tree only, no `lib/`, no
+  siblings) wrote an identical lock and a sha256-identical binary.
+
+### Binary size
+
+| build | host | `--agnos` | `--aarch64` | live (`CYRIUS_DCE=1`) |
+|---|---|---|---|---|
+| 0.5.0 (6.7.9, cmdit 1.4.0, taar 0.6.0) | 228,192 | 244,912 | 273,160 | 93,024 |
+| 6.7.18, old deps | 232,312 | 249,144 | 273,192 | 93,048 |
+| **0.5.1** (6.7.18, cmdit 1.5.1, taar 0.6.2) | **241,056** | **257,904** | **339,280** | **97,696** |
+
+The toolchain adds +4.1 KB on x86_64, all of it unreachable (+24 B live). The deps add +8.7 KB,
++4.6 KB of it live. Reachable dep fns went 58 → 61:
+- `_cmdit_utf8_len`, the C1-escaper's UTF-8 walk;
+- `_cmdit_resume`, continue-mode plumbing that the parse core reaches even with the mode off;
+- `_taar_set_sock_timeout`, the connect/send-timeout fix.
+
+The rest is growth inside fns that were already reachable.
+
+**aarch64's +66 KB is mostly alignment padding.** Its text segment grew 8,296 B, in line with
+x86_64, but that took it from `0x3e1a0` to `0x40208`, just past 256 KiB. The data segment is
+64 KiB-aligned, so its file offset moved from `0x40000` to `0x50000`, and about 64 KiB of the
+file is now zero padding. Neither dep crosses the line alone (cmdit 1.5.1 only: 273,712 B; taar
+0.6.2 only: 273,224 B). aarch64 still has no DCE compaction, which would pull the text back
+under 256 KiB.
+
+### Not changed
+
+- `cyrius audit` still reports 5 lint warnings (consecutive blank lines in `tests/dig.tcyr`)
+  and 11 undocumented public fns, the same as every pin since 6.6.2.
+
 ## [0.5.0] - 2026-11-08
 
 **Toolchain `6.6.20` → `6.7.9` (the 6.7 language minor), cmdit `1.2.6` → `1.4.0` and taar

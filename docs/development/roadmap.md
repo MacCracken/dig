@@ -195,7 +195,7 @@ Deliberate exclusions — keeps future contributors from adding to v1.0 by accid
 
 ## Cross-references
 
-- **Substrate (extracted via dig)**: [taar — scaffolded 2026-06-15, now 0.6.2; dig pins 0.6.0 and consumes its ipv4 codec and TCP primitives](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/shared-crates.md).
+- **Substrate (extracted via dig)**: [taar — scaffolded 2026-06-15, now 0.6.2; dig pins 0.6.2 and consumes its ipv4 codec and TCP primitives](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/shared-crates.md).
 - **Sibling tools**: [yo — 0.8.0, consumes taar](https://github.com/MacCracken/yo), [whirl — 0.6.14 shipping, the third taar consumer](https://github.com/MacCracken/agnosticos/blob/main/docs/development/planning/shared-crates.md).
 - **Iron dependency**: [agnos r8169 RX-path 5-part bundle](https://github.com/MacCracken/agnosticos/blob/main/docs/development/r8169-rx-path-audit.md) — **cleared** (r8169 RX solved 2026-05-25, 1.32.7, iron-validated). The LAN-on-iron path is unblocked; what remains is the actual archaemenid dig run.
 - **Kernel-growth posture**: AGNOS `state.md` + memory [[project_agnos_kernel_growth_rules]].
